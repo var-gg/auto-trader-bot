@@ -1,0 +1,66 @@
+# Python virtual environments
+venv/
+ENV/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*service-account*.json
+*credentials*.json
+
+# Local/editor/runtime artifacts
+.vscode/
+.cursor/
+.cursor-cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Build / dependency caches
+dist/
+build/
+node_modules/
+
+# Runtime / ops state that should never go public
+runtime.json
+_logs_*.json
+ops/
+
+# Local/editor/workbench files
+.vscode/
+AGENTS.md
+blog/
+prompt_sample/
+app's features/
+env.cloud-code.example
+
+# Broad doc exclusions for public-safe code review repo
+API_ENDPOINTS.md
+CLOUD_CODE_DEPLOYMENT.md
+CLOUD_SQL_ENDPOINT_MAP.md
+PROJECT_SUMMARY.md
+RUNBOOK.md
+INTRADAY_FLOW.md
+PM_SIGNAL_CALCULATION.md
+app/features/**/*.md
+
+# High-risk source files with embedded sample identifiers / ops defaults
+app/features/kis_test/controllers/kis_test_controller.py
+app/features/portfolio/controllers/trade_realized_pnl_controller.py
+
+# OS cruft
+.DS_Store
+Thumbs.db

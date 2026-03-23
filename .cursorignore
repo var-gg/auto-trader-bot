@@ -1,0 +1,15 @@
+# Cursor AI 인덱싱에서 제외할 파일들
+# 하지만 .env 파일은 포함하고 싶으므로 여기에 추가하지 않음
+
+# 대용량 파일들은 제외
+*.log
+*.tmp
+node_modules/
+.git/
+venv/
+ENV/
+.venv/
+__pycache__/
+*.pyc
+
+# .env 파일은 의도적으로 제외하지 않음 (인덱싱 허용)

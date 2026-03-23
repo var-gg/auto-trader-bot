@@ -1,0 +1,43 @@
+# Explicit Cloud Run source deploy ignore rules
+
+# secrets / local env must never be uploaded
+.env
+.env.*
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*service-account*.json
+*credentials*.json
+
+# editor / local caches
+.vscode/
+.cursor/
+.cursor-cache/
+.pytest_cache/
+.mypy_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# local ops/runtime artifacts
+ops/
+runtime.json
+_logs_*.json
+
+# local docs not needed for runtime
+API_ENDPOINTS.md
+CLOUD_CODE_DEPLOYMENT.md
+CLOUD_SQL_ENDPOINT_MAP.md
+PROJECT_SUMMARY.md
+RUNBOOK.md
+README.md
+blog/
+prompt_sample/
+app's features/
+
+# NOTE:
+# keep start.sh in deploy context
+# keep app code, Dockerfile, requirements.txt, and alembic files

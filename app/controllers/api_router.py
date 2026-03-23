@@ -1,0 +1,109 @@
+# app/controllers/api_router.py
+
+from fastapi import APIRouter
+from app.features.earnings.controllers import earnings_controller
+from app.features.earnings.controllers.kind_test_controller import router as kind_test_router
+from app.features.earnings.controllers.estimate_perform_controller import router as estimate_perform_router
+from app.features.earnings.controllers.flutter_financial_controller import router as flutter_financial_router
+from app.features.earnings.controllers.dart_corp_code_controller import router as dart_corp_code_router
+from app.features.earnings.controllers.simple_financial_controller import router as simple_financial_router
+from app.features.news.controllers import news_controller
+from app.features.news.controllers.news_v2_controller import router as news_v2_router
+from app.features.news.controllers.news_test_controller import router as news_test_router
+from app.features.fred.controllers.macro_ingest_controller import ingest_router
+from app.features.fred.controllers.macro_prompt_controller import prompt_router
+from app.features.marketdata.controllers.us_marketdata_controller import router as us_marketdata_router
+from app.features.marketdata.controllers.marketdata_prompt_common_controller import router as marketdata_prompt_common_router
+from app.features.marketdata.controllers.us_price_detail_controller import router as us_price_detail_router
+from app.features.marketdata.controllers.korean_marketdata_controller import router as kr_marketdata_router
+from app.features.marketdata.controllers.kr_price_detail_controller import router as kr_price_detail_router
+from app.features.fundamentals.controllers.us_fundamental_controller import router as fundamental_router
+from app.features.fundamentals.controllers.kr_kis_test_controller import router as kis_test_router
+from app.features.fundamentals.controllers.kr_fundamental_collect_controller import router as fundamental_collect_router
+from app.features.fundamentals.controllers.ticker_vector_controller import router as ticker_vector_router
+from app.features.news.controllers.news_summary_controller import router as news_summary_router
+from app.features.news.controllers.news_embedding_controller import router as news_embedding_router
+from app.features.news.controllers.news_anchor_controller import router as news_anchor_router
+from app.features.news.controllers.kis_news_controller import router as kis_news_router
+from app.features.recommendation.controllers.us_recommendation_controller import router as recommendation_router
+from app.features.recommendation.controllers.us_analyst_prompt_controller import router as analyst_prompt_router
+from app.features.recommendation.controllers.us_analyst_ai_controller import router as analyst_ai_router
+from app.features.recommendation.controllers.us_batch_recommendation_controller import router as batch_recommendation_router
+from app.features.recommendation.controllers.kr_recommendation_controller import router as kr_recommendation_router
+from app.features.recommendation.controllers.kr_analyst_prompt_controller import router as kr_analyst_prompt_router
+from app.features.recommendation.controllers.kr_batch_recommendation_controller import router as kr_batch_recommendation_router
+from app.features.portfolio.controllers.us_kis_controller import router as kis_router
+from app.features.portfolio.controllers.asset_snapshot_controller import router as asset_snapshot_router
+from app.features.portfolio.controllers.kr_order_controller import router as kr_order_router
+from app.features.portfolio.controllers.kr_order_prompt_controller import router as kr_order_prompt_router
+from app.features.portfolio.controllers.kr_batch_controller import router as kr_batch_router
+from app.features.ai_test.controllers.ai_test_controller import router as ai_test_router
+from app.features.kis_test.controllers.kis_test_controller import router as kis_test_new_router
+from app.features.kis_test.controllers.token_refresh_controller import router as kis_token_refresh_router
+from app.features.kis_test.controllers.bootstrap_controller import router as kis_bootstrap_router
+from app.features.yahoo_finance_test.controllers.yahoo_finance_test_controller import router as yahoo_finance_test_router
+from app.features.yahoo_finance.controllers.yahoo_index_controller import router as yahoo_finance_router
+from app.features.portfolio.controllers.overseas_fill_collection_controller import router as overseas_fill_collection_router
+from app.features.portfolio.controllers.domestic_fill_collection_controller import router as domestic_fill_collection_router
+from app.features.portfolio.controllers.trade_realized_pnl_controller import router as trade_realized_pnl_router
+from app.features.signals.controllers.signal_controller import router as signal_router
+from app.features.signals.controllers.backtest_controller import router as backtest_router
+from app.features.trading_hybrid.controllers.trading_hybrid_controller import router as trading_hybrid_router
+from app.features.premarket.controllers.pm_signal_controller import router as premarket_router
+from app.features.premarket.controllers.pm_history_batch_controller import router as pm_history_batch_router
+from app.features.premarket.controllers.pm_risk_controller import router as pm_risk_router
+
+api_router = APIRouter()
+
+# 여기서 include 해야함
+api_router.include_router(earnings_controller.router)
+api_router.include_router(kind_test_router)
+api_router.include_router(estimate_perform_router)
+api_router.include_router(flutter_financial_router)
+api_router.include_router(dart_corp_code_router)
+api_router.include_router(simple_financial_router)
+api_router.include_router(news_controller.router)
+api_router.include_router(news_v2_router)
+api_router.include_router(news_test_router)
+api_router.include_router(ingest_router)
+api_router.include_router(prompt_router)
+api_router.include_router(us_marketdata_router)
+api_router.include_router(marketdata_prompt_common_router)
+api_router.include_router(us_price_detail_router)
+api_router.include_router(kr_marketdata_router)
+api_router.include_router(kr_price_detail_router)
+api_router.include_router(fundamental_router)
+api_router.include_router(kis_test_router)
+api_router.include_router(fundamental_collect_router)
+api_router.include_router(ticker_vector_router)
+api_router.include_router(news_summary_router)
+api_router.include_router(news_embedding_router)
+api_router.include_router(news_anchor_router)
+api_router.include_router(kis_news_router)
+api_router.include_router(recommendation_router)
+api_router.include_router(analyst_prompt_router)
+api_router.include_router(analyst_ai_router)
+api_router.include_router(batch_recommendation_router)
+api_router.include_router(kr_recommendation_router)
+api_router.include_router(kr_analyst_prompt_router)
+api_router.include_router(kr_batch_recommendation_router)
+api_router.include_router(kis_router)
+api_router.include_router(asset_snapshot_router)
+api_router.include_router(kr_order_router)
+api_router.include_router(kr_order_prompt_router)
+api_router.include_router(kr_batch_router)
+api_router.include_router(ai_test_router)
+api_router.include_router(kis_test_new_router)
+api_router.include_router(kis_token_refresh_router)
+api_router.include_router(kis_bootstrap_router)
+api_router.include_router(yahoo_finance_test_router)
+api_router.include_router(yahoo_finance_router)
+api_router.include_router(overseas_fill_collection_router)
+api_router.include_router(domestic_fill_collection_router)
+api_router.include_router(trade_realized_pnl_router)
+api_router.include_router(signal_router)
+api_router.include_router(backtest_router)
+api_router.include_router(trading_hybrid_router)
+api_router.include_router(premarket_router)
+api_router.include_router(pm_history_batch_router)
+api_router.include_router(pm_risk_router)
