@@ -1,0 +1,13 @@
+-r requirements-common.txt
+
+# Backtest / research runtime
+pandas==2.3.3
+optuna==4.5.0
+matplotlib==3.10.6
+seaborn==0.13.2
+jupyter==1.1.1
+notebook==7.4.5
+pyarrow==21.0.0
+
+# Optional analytical helpers
+scipy==1.16.2

@@ -1,0 +1,12 @@
+{
+  "regime_score": -72,
+  "risk_score": 81,
+  "confidence": 0.84,
+  "shock_type": "war",
+  "severity_band": "HIGH",
+  "ttl_minutes": 180,
+  "reason_short": "overnight oil shock",
+  "raw_response": {
+    "source": "fixture"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "config": {
+    "alpha": 0.3,
+    "beta": 0.7,
+    "tau_softmax": 1.0,
+    "threshold": 0.6
+  },
+  "q_ctx": [0.8, 0.6],
+  "up_ranked": [
+    {"symbol": "NVDA", "anchor_date": "2025-10-20", "cos": 0.93, "ctx_vec": [0.82, 0.58]},
+    {"symbol": "AAPL", "anchor_date": "2025-09-13", "cos": 0.88, "ctx_vec": [0.79, 0.61]}
+  ],
+  "dn_ranked": [
+    {"symbol": "TSLA", "anchor_date": "2025-10-03", "cos": 0.67, "ctx_vec": [0.45, 0.89]},
+    {"symbol": "AMD", "anchor_date": "2025-08-21", "cos": 0.64, "ctx_vec": [0.5, 0.86]}
+  ]
+}

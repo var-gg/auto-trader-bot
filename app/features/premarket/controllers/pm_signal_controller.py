@@ -68,9 +68,9 @@ def update_pm_signals_post(
     ```
     """
     try:
-        service = PMSignalService(db)
-        result = service.update_signals(request)
-        return result
+        ctx = RunContext(actor="http", channel="live_app.api", metadata={"route": "/api/premarket/signals/update", "method": "POST"})
+        command = UpdatePMSignalsCommand(db)
+        return command.execute(request, ctx)
     except ValueError as e:
         logger.error(f"PM signal update validation error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -124,9 +124,9 @@ def update_pm_signals_get(
     logger.info(f"Created request object - country={request.country}")
     
     try:
-        service = PMSignalService(db)
-        result = service.update_signals(request)
-        return result
+        ctx = RunContext(actor="http", channel="live_app.api", metadata={"route": "/api/premarket/signals/update", "method": "GET"})
+        command = UpdatePMSignalsCommand(db)
+        return command.execute(request, ctx)
     except ValueError as e:
         logger.error(f"PM signal update validation error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -186,14 +186,9 @@ def get_pm_signals(
     ```
     """
     try:
-        service = PMSignalService(db)
-        result = service.get_signals(
-            limit=limit,
-            min_signal=min_signal,
-            max_signal=max_signal,
-            order=order
-        )
-        return result
+        ctx = RunContext(actor="http", channel="live_app.api", metadata={"route": "/api/premarket/signals", "method": "GET"})
+        query = GetPMSignalsQuery(db)
+        return query.execute(limit=limit, min_signal=min_signal, max_signal=max_signal, order=order, ctx=ctx)
     except Exception as e:
         logger.error(f"PM signal query error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"신호 조회 중 오류가 발생했습니다: {str(e)}")
@@ -271,9 +266,9 @@ def test_pm_signal(
             use_ann=use_ann
         )
         
-        service = PMSignalService(db)
-        result = service.test_signal(request)
-        return result
+        ctx = RunContext(actor="http", channel="live_app.api", metadata={"route": "/api/premarket/signals/test", "method": "GET"})
+        query = TestPMSignalQuery(db)
+        return query.execute(request, ctx)
     except ValueError as e:
         logger.error(f"PM signal test validation error: {e}")
         raise HTTPException(status_code=400, detail=str(e))

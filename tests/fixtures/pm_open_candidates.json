@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "ticker_id": 101,
+      "symbol": "NVDA",
+      "company_name": "NVIDIA",
+      "signal_1d": 0.86,
+      "signal_strength": 0.86,
+      "best_target_id": 9001,
+      "tb_label": "UP_FIRST",
+      "iae_1_3": -0.003,
+      "direction": "UP",
+      "current_price": 120.0,
+      "atr_pct": 0.032,
+      "reverse_breach_day": 3,
+      "has_long_recommendation": true
+    },
+    {
+      "ticker_id": 102,
+      "symbol": "AAPL",
+      "company_name": "Apple",
+      "signal_1d": 0.71,
+      "signal_strength": 0.71,
+      "best_target_id": 9002,
+      "tb_label": "DOWN_FIRST",
+      "iae_1_3": -0.041,
+      "direction": "UP",
+      "current_price": 210.0,
+      "atr_pct": 0.025,
+      "reverse_breach_day": 4,
+      "has_long_recommendation": false
+    }
+  ],
+  "ladder_params": {
+    "buy": {
+      "MIN_TICK_GAP": 1,
+      "ADAPTIVE_BASE_LEGS": 2,
+      "ADAPTIVE_LEG_BOOST": 1.0,
+      "MIN_TOTAL_SPREAD_PCT": 0.01,
+      "ADAPTIVE_STRENGTH_SCALE": 0.1,
+      "FIRST_LEG_BASE_PCT": 0.012,
+      "FIRST_LEG_MIN_PCT": 0.006,
+      "FIRST_LEG_MAX_PCT": 0.05,
+      "FIRST_LEG_GAIN_WEIGHT": 0.6,
+      "FIRST_LEG_ATR_WEIGHT": 0.5,
+      "FIRST_LEG_REQ_FLOOR_PCT": 0.012,
+      "ADAPTIVE_MAX_STEP_PCT": 0.06,
+      "ADAPTIVE_FRAC_ALPHA": 1.25,
+      "ADAPTIVE_GAIN_SCALE": 0.1,
+      "MIN_LOT_QTY": 1
+    },
+    "sell": {
+      "MIN_TICK_GAP": 2,
+      "ADAPTIVE_BASE_LEGS": 3,
+      "ADAPTIVE_LEG_BOOST": 1.0,
+      "MIN_TOTAL_SPREAD_PCT": 0.012,
+      "ADAPTIVE_STRENGTH_SCALE": 0.19,
+      "FIRST_LEG_BASE_PCT": 0.015,
+      "FIRST_LEG_MIN_PCT": 0.01,
+      "FIRST_LEG_MAX_PCT": 0.06,
+      "FIRST_LEG_GAIN_WEIGHT": 0.6,
+      "FIRST_LEG_ATR_WEIGHT": 0.5,
+      "FIRST_LEG_REQ_FLOOR_PCT": 0.0,
+      "ADAPTIVE_MAX_STEP_PCT": 0.06,
+      "ADAPTIVE_FRAC_ALPHA": 1.25,
+      "ADAPTIVE_GAIN_SCALE": 0.1,
+      "MIN_LOT_QTY": 1
+    }
+  },
+  "account": {
+    "buying_power_ccy": 10000,
+    "total_equity_ccy": 12000
+  },
+  "caps": {
+    "swing_ratio": 0.7,
+    "intraday_ratio": 0.25,
+    "cash_buffer_ratio": 0.12,
+    "bp": 10000,
+    "equity": 12000,
+    "swing_cap_cash": 7000,
+    "intraday_cap_cash": 2500
+  }
+}

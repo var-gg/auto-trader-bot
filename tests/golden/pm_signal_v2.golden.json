@@ -1,0 +1,12 @@
+{
+  "signal_1d": 0.53464944,
+  "best_target": {
+    "anchor_date": "2025-10-20",
+    "direction": "UP",
+    "score": 0.97872794,
+    "symbol": "NVDA"
+  },
+  "reason": "TOO_FEW",
+  "up_count": 2,
+  "down_count": 2
+}

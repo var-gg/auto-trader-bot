@@ -1,0 +1,41 @@
+name: cutover-gates
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'live_app/**'
+      - 'backtest_app/**'
+      - 'shared/**'
+      - 'tests/**'
+      - '.github/workflows/cutover-gates.yml'
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        suite: [live, backtest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ matrix.suite }}" = "live" ]; then
+            pip install -r requirements-live.txt pytest
+          else
+            pip install -r requirements-backtest.txt pytest
+          fi
+      - name: Run cutover gate suite
+        run: |
+          if [ "${{ matrix.suite }}" = "live" ]; then
+            pytest -q tests/golden/test_pure_decision_engine.py
+          else
+            pytest -q tests/golden/test_backtest_execution_model.py
+            pytest -q tests/parity/test_live_backtest_parity.py
+            pytest -q tests/golden/test_optuna_backtest_runtime.py
+          fi

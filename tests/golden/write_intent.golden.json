@@ -1,0 +1,22 @@
+{
+  "batch_modes": ["BUY", "SELL"],
+  "batch_meta_phase": "OPEN_GREEDY_PM",
+  "buy_count": 1,
+  "sell_count": 1,
+  "skip_count": 1,
+  "buy_plan_shape": {
+    "ticker_id": 101,
+    "legs": 2,
+    "note": "[PM BUY] signal=0.86 riskM=1.20"
+  },
+  "sell_plan_shape": {
+    "ticker_id": 102,
+    "legs": 1,
+    "note": "[PM SELL] maturity=future"
+  },
+  "submitted_leg_count": 3,
+  "reject_reason_example": {
+    "code": "OPSQ2001",
+    "message": "주문가능수량이 부족합니다."
+  }
+}

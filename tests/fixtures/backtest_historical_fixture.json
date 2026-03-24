@@ -1,0 +1,70 @@
+{
+  "market_snapshot": {
+    "market": "US",
+    "as_of": "2026-03-24T00:00:00+00:00",
+    "session_label": "open",
+    "is_open": true,
+    "reference_price": 120.0,
+    "last_close_price": 118.0,
+    "volatility_pct": 0.03,
+    "macro_state": {},
+    "news_state": {},
+    "tags": []
+  },
+  "bars_by_symbol": {
+    "NVDA": [
+      {"symbol": "NVDA", "timestamp": "2026-03-24T13:30:00+00:00", "open": 120.0, "high": 121.0, "low": 115.0, "close": 119.0, "volume": 1000000}
+    ],
+    "AAPL": [
+      {"symbol": "AAPL", "timestamp": "2026-03-24T13:30:00+00:00", "open": 210.0, "high": 211.0, "low": 200.0, "close": 205.0, "volume": 800000}
+    ]
+  },
+  "candidates": [
+    {
+      "symbol": "NVDA",
+      "ticker_id": 101,
+      "market": "US",
+      "side_bias": "BUY",
+      "signal_strength": 0.86,
+      "confidence": null,
+      "anchor_date": null,
+      "reference_date": null,
+      "current_price": 120.0,
+      "atr_pct": 0.032,
+      "target_return_pct": null,
+      "max_reverse_pct": null,
+      "expected_horizon_days": null,
+      "outcome_label": "UP_FIRST",
+      "reverse_breach_day": 3,
+      "provenance": {"has_long_recommendation": true},
+      "diagnostics": {"iae_1_3": -0.003},
+      "notes": []
+    },
+    {
+      "symbol": "AAPL",
+      "ticker_id": 102,
+      "market": "US",
+      "side_bias": "BUY",
+      "signal_strength": 0.71,
+      "confidence": null,
+      "anchor_date": null,
+      "reference_date": null,
+      "current_price": 210.0,
+      "atr_pct": 0.025,
+      "target_return_pct": null,
+      "max_reverse_pct": null,
+      "expected_horizon_days": null,
+      "outcome_label": "DOWN_FIRST",
+      "reverse_breach_day": 4,
+      "provenance": {"has_long_recommendation": false},
+      "diagnostics": {"iae_1_3": -0.041},
+      "notes": []
+    }
+  ],
+  "external_factors": {
+    "breadth": 0.4,
+    "macro_delta": -0.1,
+    "risk_score": 0.2
+  },
+  "metadata": {"fixture": "basic-backtest"}
+}

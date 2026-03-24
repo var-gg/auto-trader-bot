@@ -1,14 +1,11 @@
-# app/features/kis_test/controllers/bootstrap_controller.py
-
 from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.orm import Session
-from app.core.db import get_db
-from app.features.kis_test.models.kis_test_models import (
-    BootstrapRequest,
-    BootstrapResponse,
-)
-from app.features.kis_test.services.bootstrap_service import BootstrapService
 import logging
+
+from app.core.db import get_db
+from app.features.kis_test.models.kis_test_models import BootstrapRequest, BootstrapResponse
+from live_app.application.bootstrap_commands import RunBootstrapCommand
+from live_app.application.context import RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -27,45 +24,8 @@ async def run_bootstrap(
     yahoo_period: str = Query("1mo", description="Yahoo Finance 데이터 수집 기간"),
     db: Session = Depends(get_db),
 ):
-    """
-    장전 기초데이터 일괄 갱신
-
-    장전(pre-market)에 필요한 모든 기초 데이터를 순차적으로 갱신합니다.
-    **인자 없이 호출하면 모든 단계를 디폴트 설정으로 실행합니다.**
-
-    **실행 순서:**
-    1. **KIS 토큰 갱신** (`/kis-test/token/refresh`)
-       - 만료 임박 토큰을 자동으로 갱신
-       - 기본값: 24시간 이내 만료 예정 토큰
-
-    2. **FRED 매크로 데이터 수집** (`/macro/ingest/fred/bootstrap`)
-       - 미국 경제 지표 수집 (인플레이션, 노동, 성장, 금리 등)
-       - 기본값: 최근 30일치 데이터
-
-    3. **Yahoo Finance 데이터 수집** (`/yahoo-finance/ingest`)
-       - S&P 500 티커들의 시세 데이터 수집
-       - 기본값: 최근 1개월(1mo) 데이터
-
-    4. **프리마켓 리스크 스냅샷 갱신** (`/api/premarket/risk/refresh` 내부 서비스 호출)
-       - KR/US 헤드라인 리스크 snapshot 생성
-       - PM BUY discount / PM SELL markup 계산 근거 갱신
-
-    5. **프리마켓 시그널 갱신** (`/api/premarket/signals/update` 내부 서비스 호출)
-       - 최신 데이터 기반 매매 시그널 생성
-       - 미국/한국 전체 종목 처리
-
-    **Query Parameters (모두 선택사항):**
-    - skip_token_refresh: 토큰 갱신 단계 스킵 (기본값: false)
-    - skip_fred_ingest: FRED 데이터 수집 단계 스킵 (기본값: false)
-    - skip_yahoo_ingest: Yahoo Finance 데이터 수집 단계 스킵 (기본값: false)
-    - skip_risk_refresh: 프리마켓 리스크 스냅샷 갱신 단계 스킵 (기본값: false)
-    - skip_signal_update: 시그널 갱신 단계 스킵 (기본값: false)
-    - token_threshold_hours: 토큰 갱신 임계 시간 (기본값: 24시간)
-    - fred_lookback_days: FRED 데이터 수집 기간 (기본값: 30일)
-    - yahoo_period: Yahoo Finance 데이터 수집 기간 (기본값: 1mo)
-    """
     try:
-        bootstrap_request = BootstrapRequest(
+        request = BootstrapRequest(
             skip_token_refresh=skip_token_refresh,
             skip_fred_ingest=skip_fred_ingest,
             skip_yahoo_ingest=skip_yahoo_ingest,
@@ -75,39 +35,24 @@ async def run_bootstrap(
             fred_lookback_days=fred_lookback_days,
             yahoo_period=yahoo_period,
         )
-
+        ctx = RunContext(
+            actor="http",
+            channel="live_app.api",
+            metadata={
+                "route": "/kis-test/bootstrap",
+                "slot": "US_PREOPEN",
+                "strategy_version": "pm-core-v2",
+            },
+        )
         logger.info("🚀 장전 기초데이터 일괄 갱신 요청 수신")
-        logger.info(f"  - 토큰 갱신: {'스킵' if skip_token_refresh else '실행'}")
-        logger.info(f"  - FRED 수집: {'스킵' if skip_fred_ingest else f'{fred_lookback_days}일'}")
-        logger.info(f"  - Yahoo 수집: {'스킵' if skip_yahoo_ingest else yahoo_period}")
-        logger.info(f"  - 리스크 갱신: {'스킵' if skip_risk_refresh else '실행'}")
-        logger.info(f"  - 시그널 갱신: {'스킵' if skip_signal_update else '실행'}")
-
-        service = BootstrapService(db)
-        response = await service.run_bootstrap(bootstrap_request)
-
-        if response.overall_success:
-            logger.info(
-                f"✅ 장전 기초데이터 일괄 갱신 완료 - 성공: {response.successful_steps}, "
-                f"실패: {response.failed_steps}, 스킵: {response.skipped_steps}, "
-                f"소요시간: {response.total_duration_seconds:.2f}초"
-            )
-        else:
-            logger.warning(
-                f"⚠️ 장전 기초데이터 일괄 갱신 완료 (일부 실패) - 성공: {response.successful_steps}, "
-                f"실패: {response.failed_steps}, 스킵: {response.skipped_steps}"
-            )
-
-        return response
-
+        return await RunBootstrapCommand(db).execute(request, ctx)
     except Exception as e:
-        logger.error(f"❌ 장전 기초데이터 일괄 갱신 중 오류: {str(e)}")
+        logger.error(f"❌ 장전 기초데이터 일괄 갱신 중 오류: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Bootstrap 실행 중 오류가 발생했습니다: {str(e)}")
 
 
 @router.get("/health", summary="Bootstrap 서비스 상태 확인")
 async def health_check():
-    """Bootstrap 서비스 상태 확인"""
     return {
         "status": "healthy",
         "service": "bootstrap",

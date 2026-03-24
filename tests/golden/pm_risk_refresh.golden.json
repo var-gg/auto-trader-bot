@@ -1,0 +1,11 @@
+{
+  "risk_score": 81,
+  "regime_score": -72,
+  "confidence": 0.84,
+  "shock_type": "war",
+  "severity_band": "HIGH",
+  "discount_multiplier": 2.364,
+  "sell_markup_multiplier": 1.0,
+  "ttl_minutes": 180,
+  "reason_short": "overnight oil shock"
+}

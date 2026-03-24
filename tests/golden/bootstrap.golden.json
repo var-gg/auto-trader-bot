@@ -1,0 +1,20 @@
+{
+  "overall_success": true,
+  "step_order": [
+    "token_refresh",
+    "fred_ingest",
+    "yahoo_ingest",
+    "risk_refresh",
+    "signal_update"
+  ],
+  "successful_steps": 5,
+  "failed_steps": 0,
+  "skipped_steps": 0,
+  "step_summaries": {
+    "token_refresh": {"total_tokens": 2, "success_count": 2, "failure_count": 0},
+    "fred_ingest": {"status": "completed", "series_count": 3, "rows_upserted": 42},
+    "yahoo_ingest": {"status": "completed", "total_symbols": 5, "successful_symbols": 5, "failed_symbols": 0},
+    "risk_refresh": {"status": "completed", "scope": "GLOBAL", "snapshot_id": 7001},
+    "signal_update": {"status": "completed", "total": 12, "success": 12, "failed": 0, "up_count": 8, "down_count": 4}
+  }
+}

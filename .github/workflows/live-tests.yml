@@ -1,0 +1,54 @@
+name: live-tests
+
+on:
+  push:
+    paths:
+      - 'app/**'
+      - 'live_app/**'
+      - 'shared/**'
+      - 'requirements-live.txt'
+      - 'requirements-common.txt'
+      - 'Dockerfile.live'
+      - '.github/workflows/live-tests.yml'
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'live_app/**'
+      - 'shared/**'
+      - 'requirements-live.txt'
+      - 'requirements-common.txt'
+      - 'Dockerfile.live'
+      - '.github/workflows/live-tests.yml'
+
+jobs:
+  live-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install live dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-live.txt pytest
+      - name: Import live boundary modules
+        run: |
+          python - <<'PY'
+          import importlib
+          mods = [
+            'app.features.kis_test.controllers.bootstrap_controller',
+            'app.features.premarket.controllers.pm_signal_controller',
+            'app.features.premarket.controllers.pm_risk_controller',
+            'app.features.premarket.controllers.pm_history_batch_controller',
+            'app.features.trading_hybrid.controllers.trading_hybrid_controller',
+            'live_app.application.planning_commands',
+            'live_app.application.schedule_slots',
+            'live_app.observability.structured_logging',
+          ]
+          for m in mods:
+            importlib.import_module(m)
+            print('OK', m)
+          PY
+      - name: Run pure decision golden tests
+        run: pytest -q tests/golden/test_pure_decision_engine.py

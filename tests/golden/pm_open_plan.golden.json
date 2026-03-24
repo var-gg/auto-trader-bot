@@ -1,0 +1,11 @@
+{
+  "selected_symbols": ["NVDA", "AAPL"],
+  "budget_map": {
+    "101": 2100.0,
+    "102": 2100.0
+  },
+  "ladder_shapes": {
+    "NVDA": {"legs": 2, "quantities": [13, 4], "prices": [118.78, 115.17]},
+    "AAPL": {"legs": 2, "quantities": [7, 3], "prices": [207.37, 201.07]}
+  }
+}

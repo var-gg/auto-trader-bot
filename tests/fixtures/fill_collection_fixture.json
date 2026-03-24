@@ -1,0 +1,6 @@
+{
+  "market": "US",
+  "pnl_result": {"total_saved": 3},
+  "snapshot_result": {"snapshot_id": 444},
+  "fill_result": {"processed_count": 7, "upserted_count": 6}
+}

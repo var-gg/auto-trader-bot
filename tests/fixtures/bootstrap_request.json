@@ -1,0 +1,10 @@
+{
+  "skip_token_refresh": false,
+  "skip_fred_ingest": false,
+  "skip_yahoo_ingest": false,
+  "skip_risk_refresh": false,
+  "skip_signal_update": false,
+  "token_threshold_hours": 24,
+  "fred_lookback_days": 30,
+  "yahoo_period": "1mo"
+}

@@ -1,0 +1,37 @@
+{
+  "preds": {
+    "NVDA": {
+      "ticker_id": 101,
+      "current_price": 120.0,
+      "p_up": 0.72,
+      "p_down": 0.28,
+      "exp_up": 0.031,
+      "exp_down": 0.012,
+      "atr5m_pct": 0.008
+    },
+    "AAPL": {
+      "ticker_id": 102,
+      "current_price": 210.0,
+      "p_up": 0.40,
+      "p_down": 0.60,
+      "exp_up": 0.011,
+      "exp_down": 0.026,
+      "atr5m_pct": 0.007
+    }
+  },
+  "account": {
+    "buying_power_ccy": 9000
+  },
+  "caps": {
+    "intraday_ratio": 0.25
+  },
+  "positions": [
+    {
+      "symbol": "AAPL",
+      "ticker_id": 102,
+      "qty": 12,
+      "orderable_qty": 12,
+      "avg_cost_ccy": 200.0
+    }
+  ]
+}

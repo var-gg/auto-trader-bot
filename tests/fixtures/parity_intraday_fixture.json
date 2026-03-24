@@ -1,0 +1,38 @@
+{
+  "market": "US",
+  "generated_at": "2026-03-24T14:05:00+00:00",
+  "side": "BUY",
+  "budget": 2500.0,
+  "candidate": {
+    "ticker_id": 301,
+    "symbol": "MSFT",
+    "signal_strength": 0.44,
+    "current_price": 330.0,
+    "atr_pct": 0.012,
+    "tb_label": "TIMEOUT",
+    "iae_1_3": -0.004,
+    "reverse_breach_day": 1,
+    "has_long_recommendation": false,
+    "policy_version": "intraday-core-v1",
+    "source": "fixture:intraday"
+  },
+  "tuning": {
+    "MIN_TICK_GAP": 1,
+    "ADAPTIVE_BASE_LEGS": 3,
+    "ADAPTIVE_LEG_BOOST": 1.0,
+    "MIN_TOTAL_SPREAD_PCT": 0.008,
+    "ADAPTIVE_STRENGTH_SCALE": 0.1,
+    "FIRST_LEG_BASE_PCT": 0.008,
+    "FIRST_LEG_MIN_PCT": 0.004,
+    "FIRST_LEG_MAX_PCT": 0.03,
+    "FIRST_LEG_GAIN_WEIGHT": 0.6,
+    "FIRST_LEG_ATR_WEIGHT": 0.5,
+    "FIRST_LEG_REQ_FLOOR_PCT": 0.004,
+    "MIN_FIRST_LEG_GAP_PCT": 0.015,
+    "STRICT_MIN_FIRST_GAP": true,
+    "ADAPTIVE_MAX_STEP_PCT": 0.04,
+    "ADAPTIVE_FRAC_ALPHA": 1.5,
+    "ADAPTIVE_GAIN_SCALE": 0.1,
+    "MIN_LOT_QTY": 1
+  }
+}

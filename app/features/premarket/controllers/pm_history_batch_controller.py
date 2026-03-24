@@ -9,7 +9,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.features.premarket.services.pm_history_batch_service import PMHistoryBatchService
+from live_app.application.context import RunContext
+from live_app.application.history_commands import BackfillUnfilledReasonsCommand, ComputeOutcomesCommand, RunHistoryPostprocessCommand
+from live_app.observability.structured_logging import build_live_run_log
 
 logger = logging.getLogger(__name__)
 
@@ -40,21 +42,18 @@ def require_internal_scheduler_auth(
     x_scheduler_token: str | None = Header(default=None, alias="X-Scheduler-Token"),
     authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> None:
-    """Scheduler internal endpoint guard (shared-token style)."""
     configured = os.getenv("SCHEDULER_INTERNAL_TOKEN") or os.getenv("INTERNAL_API_TOKEN")
-
     if not configured:
         logger.error("Scheduler auth token is not configured")
         raise HTTPException(status_code=503, detail="scheduler auth is not configured")
-
-    bearer = None
-    if authorization and authorization.lower().startswith("bearer "):
-        bearer = authorization[7:].strip()
-
+    bearer = authorization[7:].strip() if authorization and authorization.lower().startswith("bearer ") else None
     provided = x_scheduler_token or bearer
-
     if not provided or not hmac.compare_digest(str(provided), str(configured)):
         raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _ctx(command: str) -> RunContext:
+    return RunContext(actor="scheduler", channel="internal", metadata={"slot": "HOUSEKEEPING", "command": command, "strategy_version": "pm-core-v2"})
 
 
 @router.post("/backfill-unfilled-reasons")
@@ -64,17 +63,15 @@ def backfill_unfilled_reasons(
     db: Session = Depends(get_db),
 ):
     try:
-        svc = PMHistoryBatchService(db)
-        summary = svc.backfill_unfilled_reasons(
-            lookback_days=request.lookback_days,
-            limit=request.limit,
+        summary = BackfillUnfilledReasonsCommand(db).execute(lookback_days=request.lookback_days, limit=request.limit, ctx=_ctx("history.backfill_unfilled"))
+        build_live_run_log(
+            run_id="housekeeping-backfill",
+            slot="HOUSEKEEPING",
+            command="history.backfill_unfilled",
+            strategy_version="pm-core-v2",
+            decision_summary={"processed": summary.scanned, "updated": summary.updated, "skipped": summary.unresolved},
         )
-        return {
-            "processed": summary.scanned,
-            "updated": summary.updated,
-            "skipped": summary.unresolved,
-            "errors": 0,
-        }
+        return {"processed": summary.scanned, "updated": summary.updated, "skipped": summary.unresolved, "errors": 0}
     except HTTPException:
         raise
     except Exception as e:
@@ -89,17 +86,15 @@ def compute_outcomes(
     db: Session = Depends(get_db),
 ):
     try:
-        svc = PMHistoryBatchService(db)
-        summary = svc.compute_tplus_outcomes(
-            lookback_days=request.lookback_days,
-            limit=request.limit,
+        summary = ComputeOutcomesCommand(db).execute(lookback_days=request.lookback_days, limit=request.limit, ctx=_ctx("history.compute_outcomes"))
+        build_live_run_log(
+            run_id="housekeeping-outcomes",
+            slot="HOUSEKEEPING",
+            command="history.compute_outcomes",
+            strategy_version="pm-core-v2",
+            decision_summary={"processed": summary.scanned, "updated": summary.upserted, "skipped": summary.skipped_missing_price},
         )
-        return {
-            "processed": summary.scanned,
-            "updated": summary.upserted,
-            "skipped": summary.skipped_missing_price,
-            "errors": 0,
-        }
+        return {"processed": summary.scanned, "updated": summary.upserted, "skipped": summary.skipped_missing_price, "errors": 0}
     except HTTPException:
         raise
     except Exception as e:
@@ -114,25 +109,29 @@ def run_postprocess(
     db: Session = Depends(get_db),
 ):
     try:
-        svc = PMHistoryBatchService(db)
-        summary = svc.run_postprocess(
+        summary = RunHistoryPostprocessCommand(db).execute(
             backfill_lookback_days=request.backfill_lookback_days,
             backfill_limit=request.backfill_limit,
             outcome_lookback_days=request.outcome_lookback_days,
             outcome_limit=request.outcome_limit,
+            ctx=_ctx("history.postprocess"),
+        )
+        build_live_run_log(
+            run_id="housekeeping-postprocess",
+            slot="HOUSEKEEPING",
+            command="history.postprocess",
+            strategy_version="pm-core-v2",
+            decision_summary={
+                "unfilled_processed": summary.unfilled.scanned,
+                "unfilled_updated": summary.unfilled.updated,
+                "outcomes_processed": summary.outcomes.scanned,
+                "outcomes_updated": summary.outcomes.upserted,
+            },
         )
         return {
             "ok": True,
-            "unfilled": {
-                "processed": summary.unfilled.scanned,
-                "updated": summary.unfilled.updated,
-                "skipped": summary.unfilled.unresolved,
-            },
-            "outcomes": {
-                "processed": summary.outcomes.scanned,
-                "updated": summary.outcomes.upserted,
-                "skipped": summary.outcomes.skipped_missing_price,
-            },
+            "unfilled": {"processed": summary.unfilled.scanned, "updated": summary.unfilled.updated, "skipped": summary.unfilled.unresolved},
+            "outcomes": {"processed": summary.outcomes.scanned, "updated": summary.outcomes.upserted, "skipped": summary.outcomes.skipped_missing_price},
         }
     except HTTPException:
         raise

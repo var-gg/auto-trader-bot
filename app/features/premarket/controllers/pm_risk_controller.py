@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.features.premarket.controllers.pm_history_batch_controller import require_internal_scheduler_auth
-from app.features.premarket.services.headline_risk_service import HeadlineRiskService
+from live_app.application.context import RunContext
+from live_app.application.risk_commands import GetLatestRiskSnapshotQuery, RefreshRiskSnapshotCommand
 
 router = APIRouter(prefix="/api/premarket/risk", tags=["premarket"])
 
@@ -18,8 +19,8 @@ def refresh_risk_snapshot(
     db: Session = Depends(get_db),
 ):
     try:
-        svc = HeadlineRiskService(db)
-        out = svc.refresh_snapshot(scope=scope, window_minutes=window_minutes)
+        ctx = RunContext(actor="http", channel="live_app.api", metadata={"route": "/api/premarket/risk/refresh"})
+        out = RefreshRiskSnapshotCommand(db).execute(scope=scope, window_minutes=window_minutes, ctx=ctx)
         return {"ok": True, **out}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -33,6 +34,6 @@ def get_latest_risk_snapshot(
     _auth: None = Depends(require_internal_scheduler_auth),
     db: Session = Depends(get_db),
 ):
-    svc = HeadlineRiskService(db)
-    row = svc.get_latest_active_snapshot(scope=scope)
+    ctx = RunContext(actor="http", channel="live_app.api", metadata={"route": "/api/premarket/risk/latest"})
+    row = GetLatestRiskSnapshotQuery(db).execute(scope=scope, ctx=ctx)
     return {"ok": True, "scope": scope, "snapshot": row}

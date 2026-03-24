@@ -1,0 +1,80 @@
+{
+  "version": "2026-03-24",
+  "active_path": {
+    "pm_signal_update": "v2",
+    "bootstrap": "bootstrap_service -> PM signal v2",
+    "trading_open": "trading_hybrid",
+    "trading_intraday": "trading_hybrid",
+    "pm_history_postprocess": "pm_history_batch"
+  },
+  "slots": {
+    "KR_PREOPEN": {
+      "status": "active",
+      "commands": [
+        "bootstrap.refresh_core_inputs",
+        "risk.refresh_snapshot:KR",
+        "signals.update_pm_v2:KR"
+      ],
+      "ingress": ["/kis-test/bootstrap", "/api/premarket/risk/refresh", "/api/premarket/signals/update"]
+    },
+    "KR_OPEN": {
+      "status": "active",
+      "commands": [
+        "trading.sync_account:KR",
+        "trading.run_open:KR"
+      ],
+      "ingress": ["/api/trading-hybrid/kr/open"]
+    },
+    "KR_INTRADAY": {
+      "status": "active",
+      "commands": [
+        "trading.sync_account:KR",
+        "trading.run_intraday:KR"
+      ],
+      "ingress": ["/api/trading-hybrid/kr/intraday"]
+    },
+    "US_PREOPEN": {
+      "status": "active",
+      "commands": [
+        "bootstrap.refresh_core_inputs",
+        "risk.refresh_snapshot:US",
+        "signals.update_pm_v2:US"
+      ],
+      "ingress": ["/kis-test/bootstrap", "/api/premarket/risk/refresh", "/api/premarket/signals/update"]
+    },
+    "US_OPEN": {
+      "status": "active",
+      "commands": [
+        "trading.sync_account:US",
+        "trading.run_open:US"
+      ],
+      "ingress": ["/api/trading-hybrid/us/open"]
+    },
+    "HOUSEKEEPING": {
+      "status": "active",
+      "commands": [
+        "history.backfill_unfilled",
+        "history.compute_outcomes",
+        "history.postprocess"
+      ],
+      "ingress": ["/api/premarket/history/backfill-unfilled-reasons", "/api/premarket/history/compute-outcomes", "/api/premarket/history/postprocess"]
+    }
+  },
+  "lineage": {
+    "active": {
+      "pm_signal": ["v2"],
+      "bootstrap": ["bootstrap_service"],
+      "open_trading": ["trading_hybrid.run_open"],
+      "intraday_trading": ["trading_hybrid.run_intraday"],
+      "history_postprocess": ["pm_history_batch_service.run_postprocess"]
+    },
+    "deprecated": {
+      "pm_signal": ["v1 update endpoint logic"],
+      "legacy_paths": ["direct controller orchestration"]
+    },
+    "delete_candidate": {
+      "pm_signal": ["/api/premarket/signals/update/v2 ingress after default path fully switched"],
+      "legacy_services": ["inline planning logic still bypassing command seams"]
+    }
+  }
+}
