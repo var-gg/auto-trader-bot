@@ -5,7 +5,9 @@ import json
 from pathlib import Path
 
 from backtest_app.configs.models import BacktestConfig, BacktestScenario, RunnerRequest
+from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory, guard_backtest_local_only
 from backtest_app.historical_data.loader import JsonHistoricalDataLoader
+from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
 from backtest_app.reporting.summary import build_summary
 from backtest_app.results.store import JsonResultStore
 from backtest_app.simulated_broker.engine import SimulatedBroker
@@ -14,9 +16,31 @@ from shared.domain.execution import build_order_plan_from_candidate
 from shared.domain.models import ExecutionVenue, Side
 
 
-def run_backtest(request: RunnerRequest, data_path: str, *, output_dir: str | None = None) -> dict:
-    loader = JsonHistoricalDataLoader()
-    historical = loader.load(data_path)
+def run_backtest(
+    request: RunnerRequest,
+    data_path: str | None,
+    *,
+    output_dir: str | None = None,
+    data_source: str = "json",
+    scenario_id: str | None = None,
+) -> dict:
+    if data_source == "local-db":
+        cfg = LocalBacktestDbConfig.from_env()
+        guard_backtest_local_only(cfg.url)
+        session_factory = create_backtest_session_factory(cfg)
+        loader = LocalPostgresLoader(session_factory, schema=cfg.schema)
+        historical = loader.load_for_scenario(
+            scenario_id=scenario_id or request.scenario.scenario_id,
+            market=request.scenario.market,
+            start_date=request.scenario.start_date,
+            end_date=request.scenario.end_date,
+            symbols=request.scenario.symbols,
+        )
+    else:
+        if not data_path:
+            raise ValueError("data_path is required when data_source=json")
+        loader = JsonHistoricalDataLoader()
+        historical = loader.load(data_path)
 
     tuning = {
         "MIN_TICK_GAP": 1,
@@ -92,7 +116,8 @@ def main() -> int:
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--symbols", required=True, help="comma-separated")
-    parser.add_argument("--data", required=True, help="historical json fixture path")
+    parser.add_argument("--data", default="", help="historical json fixture path")
+    parser.add_argument("--data-source", choices=["json", "local-db"], default="json")
     parser.add_argument("--initial-capital", type=float, default=10000.0)
     parser.add_argument("--output", default="")
     parser.add_argument("--results-dir", default="")
@@ -109,7 +134,13 @@ def main() -> int:
         config=BacktestConfig(initial_capital=args.initial_capital),
         output_path=args.output or None,
     )
-    result = run_backtest(request, args.data, output_dir=args.results_dir or None)
+    result = run_backtest(
+        request,
+        args.data or None,
+        output_dir=args.results_dir or None,
+        data_source=args.data_source,
+        scenario_id=args.scenario_id,
+    )
     payload = json.dumps(result, ensure_ascii=False, indent=2)
     if request.output_path:
         Path(request.output_path).write_text(payload, encoding="utf-8")

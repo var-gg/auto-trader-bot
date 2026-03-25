@@ -1,0 +1,47 @@
+{
+  "fixture_id": "decision-parity-budget-skip",
+  "replay_source": "synthetic-from-live-rules",
+  "generated_at": "2026-03-25T00:00:00+00:00",
+  "market": "US",
+  "side": "BUY",
+  "budget": 20.0,
+  "candidate": {
+    "ticker_id": 99901,
+    "symbol": "SYM_SKIP",
+    "signal_strength": 0.72,
+    "current_price": 107.64,
+    "atr_pct": 0.02,
+    "tb_label": "UP_FIRST",
+    "iae_1_3": -0.002,
+    "reverse_breach_day": null,
+    "has_long_recommendation": true,
+    "policy_version": "pm-core-v2",
+    "source": "parity:budget-skip",
+    "notes": [
+      "Budget intentionally below minimum executable size"
+    ]
+  },
+  "tuning": {
+    "MIN_TICK_GAP": 1,
+    "ADAPTIVE_BASE_LEGS": 2,
+    "ADAPTIVE_LEG_BOOST": 1.0,
+    "MIN_TOTAL_SPREAD_PCT": 0.01,
+    "ADAPTIVE_STRENGTH_SCALE": 0.1,
+    "FIRST_LEG_BASE_PCT": 0.012,
+    "FIRST_LEG_MIN_PCT": 0.005,
+    "FIRST_LEG_MAX_PCT": 0.05,
+    "FIRST_LEG_GAIN_WEIGHT": 0.6,
+    "FIRST_LEG_ATR_WEIGHT": 0.5,
+    "FIRST_LEG_REQ_FLOOR_PCT": 0.0,
+    "MIN_FIRST_LEG_GAP_PCT": 0.03,
+    "STRICT_MIN_FIRST_GAP": true,
+    "ADAPTIVE_MAX_STEP_PCT": 0.06,
+    "ADAPTIVE_FRAC_ALPHA": 1.25,
+    "ADAPTIVE_GAIN_SCALE": 0.1,
+    "MIN_LOT_QTY": 1
+  },
+  "expected": {
+    "should_skip": true,
+    "skip_code": "BUDGET"
+  }
+}

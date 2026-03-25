@@ -1,0 +1,147 @@
+{
+  "case_id": "batch-7175",
+  "captured_at": "2026-03-24T16:19:42.291495Z",
+  "source_type": "trade_batch",
+  "endpoint": "/api/trading-hybrid/us/open",
+  "request": {
+    "timestamp": "2026-03-24T08:01:05.346736Z",
+    "trace": "projects/curioustore/traces/10c8b2a39a8517819c024632e90ea5fd",
+    "method": "POST",
+    "url": "https://service.example.run.app/api/trading-hybrid/us/open",
+    "status": 200,
+    "latency": "11.532459878s",
+    "responseSize": "5661",
+    "userAgent": "Google-Cloud-Scheduler"
+  },
+  "batch": {
+    "batch_id": 7175,
+    "asof_kst": "2026-03-24T08:01:11.671093+00:00",
+    "mode": "BUY",
+    "currency": "USD",
+    "notes": {
+      "phase": "OPEN_GREEDY_PM",
+      "market": "US",
+      "caps": {
+        "swing_ratio": 0.7,
+        "intraday_ratio": 0.25,
+        "cash_buffer_ratio": 0.12,
+        "bp": 339.93,
+        "equity": 2154.9,
+        "swing_cap_cash": 237.951,
+        "intraday_cap_cash": 84.9825
+      },
+      "pm_mode": true
+    }
+  },
+  "summary": {
+    "plan_count": 1,
+    "leg_count": 2,
+    "broker_order_row_count": 46,
+    "fill_row_count": 42,
+    "symbols": [
+      "SYM_1603"
+    ]
+  },
+  "correlation": {
+    "plan_ids": [
+      15365
+    ],
+    "leg_ids": [
+      19708,
+      19709
+    ],
+    "broker_order_row_ids": [
+      68161,
+      68162,
+      68239,
+      68240,
+      68241,
+      68242,
+      68243,
+      68244,
+      68245,
+      68246,
+      68247,
+      68248,
+      68249,
+      68250,
+      68251,
+      68252,
+      68253,
+      68254,
+      68255,
+      68256,
+      68257,
+      68258,
+      68259,
+      68260,
+      68261,
+      68262,
+      68263,
+      68264,
+      68265,
+      68266,
+      68269,
+      68270,
+      68275,
+      68276,
+      68279,
+      68280,
+      68285,
+      68286,
+      68289,
+      68290,
+      68293,
+      68294,
+      68297,
+      68298,
+      68311,
+      68312
+    ],
+    "broker_order_numbers_masked": [
+      "ORD#4617",
+      "ORD#4631",
+      "ORD#3634",
+      "ORD#3636",
+      "ORD#5403",
+      "ORD#5405",
+      "ORD#7886",
+      "ORD#7888",
+      "ORD#0069",
+      "ORD#0071",
+      "ORD#1456",
+      "ORD#1459"
+    ],
+    "fill_ids": [
+      7341,
+      7342,
+      7343,
+      7344,
+      7345,
+      7346,
+      7347,
+      7349,
+      7350,
+      7351,
+      7352,
+      7353,
+      7354,
+      7355,
+      7356,
+      7357,
+      7358,
+      7359,
+      7360,
+      7361
+    ]
+  },
+  "plan_preview": [
+    {
+      "plan_id": 15365,
+      "symbol_alias": "SYM_1603",
+      "action": "BUY",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM매수:cur=107.64, signal=0.689(s=0.689), TB=UP_FIRST, 📉 BUY(상승:s=+0.69, legs=2, 1st=0.5%, gain=+0.0%, qty=2, TB=🔼UP_FIRST, IAE=-0.3%)\n↳ PM 신호 기반 적응형 래더. 방향성=상승(s"
+    }
+  ]
+}

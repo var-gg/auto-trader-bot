@@ -1,0 +1,58 @@
+{
+  "fixture_id": "decision-parity-kr-open-sell",
+  "replay_source": "tests/replay_fixtures/kr_open_20260324.json",
+  "generated_at": "2026-03-23T23:31:07+00:00",
+  "market": "KR",
+  "side": "SELL",
+  "budget": 211200.0,
+  "candidate": {
+    "ticker_id": 15313,
+    "symbol": "SYM_0650",
+    "signal_strength": 0.655,
+    "current_price": 105600.0,
+    "atr_pct": 0.018,
+    "tb_label": "TIMEOUT",
+    "iae_1_3": -0.004,
+    "reverse_breach_day": null,
+    "has_long_recommendation": false,
+    "policy_version": "pm-core-v2",
+    "source": "replay:kr_open_20260324",
+    "notes": [
+      "AS-IS note excerpt: PM 희망익절 cur=105600 signal=0.655 TB=TIMEOUT legs=2 qty=2 first=2.7%"
+    ]
+  },
+  "tuning": {
+    "MIN_TICK_GAP": 1,
+    "ADAPTIVE_BASE_LEGS": 2,
+    "ADAPTIVE_LEG_BOOST": 1.0,
+    "MIN_TOTAL_SPREAD_PCT": 0.01,
+    "ADAPTIVE_STRENGTH_SCALE": 0.1,
+    "FIRST_LEG_BASE_PCT": 0.012,
+    "FIRST_LEG_MIN_PCT": 0.005,
+    "FIRST_LEG_MAX_PCT": 0.05,
+    "FIRST_LEG_GAIN_WEIGHT": 0.6,
+    "FIRST_LEG_ATR_WEIGHT": 0.5,
+    "FIRST_LEG_REQ_FLOOR_PCT": 0.01,
+    "MIN_FIRST_LEG_GAP_PCT": 0.03,
+    "STRICT_MIN_FIRST_GAP": true,
+    "ADAPTIVE_MAX_STEP_PCT": 0.06,
+    "ADAPTIVE_FRAC_ALPHA": 1.25,
+    "ADAPTIVE_GAIN_SCALE": 0.1,
+    "MIN_LOT_QTY": 1
+  },
+  "expected": {
+    "should_skip": false,
+    "symbol": "SYM_0650",
+    "side": "SELL",
+    "policy_version": "pm-core-v2",
+    "requested_quantity": 2,
+    "leg_count": 2,
+    "quantity_split": [1, 1],
+    "price_relation": "strictly_above_current",
+    "first_leg_pct_range": [0.02, 0.035],
+    "last_leg_pct_range": [0.04, 0.071],
+    "required_metadata": {
+      "reverse_breach_day": null
+    }
+  }
+}

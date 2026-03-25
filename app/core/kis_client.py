@@ -308,8 +308,9 @@ class KISClient:
         import logging
         logger = logging.getLogger(__name__)
         
+        cano = settings.KIS_VIRTUAL_CANO if settings.KIS_VIRTUAL else settings.KIS_CANO
         params = {
-            "CANO": settings.KIS_CANO,  # 종합계좌번호
+            "CANO": cano,  # 종합계좌번호
             "ACNT_PRDT_CD": settings.KIS_ACNT_PRDT_CD,  # 계좌상품코드
             "WCRC_FRCR_DVSN_CD": wcrc_frcr_dvsn_cd,  # 원화외화구분코드
             "NATN_CD": natn_cd,  # 국가코드

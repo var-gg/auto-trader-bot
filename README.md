@@ -86,8 +86,10 @@ bash start.sh
 Public-safe deployment notes are included in:
 - `DEPLOY_SECRET_MANAGER.md`
 - `DEPLOY_VALIDATION_CHECKLIST.md`
+- `docs/db-sql-first.md`
 
 These documents assume Secret Manager-backed Cloud Run deployment and post-deploy validation of startup, health, and order/fill flow behavior.
+Production schema changes must be applied explicitly from checked-in SQL files; runtime code must not create schemas/tables implicitly.
 
 ## API surface
 The repository contains feature modules such as:

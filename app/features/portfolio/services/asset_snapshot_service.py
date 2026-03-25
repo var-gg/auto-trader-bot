@@ -128,16 +128,23 @@ class AssetSnapshotService:
             if account_uid is None or account_uid == "default_account":
                 cano = settings.KIS_VIRTUAL_CANO if settings.KIS_VIRTUAL else settings.KIS_CANO
                 account_uid = f"{cano}-{settings.KIS_ACNT_PRDT_CD}"
-            
+
             self.logger.info(f"=== OVRS Account Snapshot Collection ===")
             self.logger.info(f"Account UID: {account_uid}")
+
+            cano, acnt_prdt_cd = account_uid.split('-', 1)
+            placeholder_accounts = {"", "00000000", "00000000-01"}
+            if account_uid in placeholder_accounts or cano in {"", "00000000"}:
+                raise RuntimeError("OVRS account snapshot aborted: invalid or placeholder account configuration")
             
             # 해외 체결기준잔고 조회 (008) - 해외 전용 매개변수
-            balance_result = self.kis_client.present_balance(
-                wcrc_frcr_dvsn_cd="02",  # 외화 기준 (해외 계좌용)
-                natn_cd="840",           # 미국
-                tr_mket_cd="00",         # 전체 거래시장
-                inqr_dvsn_cd="00"        # 체결기준 조회
+            balance_result = self.kis_client.overseas_present_balance_test(
+                CANO=cano,
+                ACNT_PRDT_CD=acnt_prdt_cd,
+                WCRC_FRCR_DVSN_CD="02",  # 외화 기준 (해외 계좌용)
+                NATN_CD="840",           # 미국
+                TR_MKET_CD="00",         # 전체 거래시장
+                INQR_DVSN_CD="00"        # 체결기준 조회
             )
             
             if balance_result.get("rt_cd") != "0":

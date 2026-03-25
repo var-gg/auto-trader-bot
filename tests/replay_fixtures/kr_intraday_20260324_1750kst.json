@@ -1,0 +1,110 @@
+{
+  "case_id": "batch-7181",
+  "captured_at": "2026-03-24T16:19:42.291495Z",
+  "source_type": "trade_batch",
+  "endpoint": "/api/trading-hybrid/kr/intraday",
+  "request": {
+    "timestamp": "2026-03-24T08:50:02.027199Z",
+    "trace": "projects/curioustore/traces/4e87dc1c82e4ca31d515ec831e68a842",
+    "method": "POST",
+    "url": "https://service.example.run.app/api/trading-hybrid/kr/intraday",
+    "status": 200,
+    "latency": "9.696847928s",
+    "responseSize": "2611",
+    "userAgent": "Google-Cloud-Scheduler"
+  },
+  "batch": {
+    "batch_id": 7181,
+    "asof_kst": "2026-03-24T08:50:08.029460+00:00",
+    "mode": "BUY",
+    "currency": "KRW",
+    "notes": {
+      "phase": "KR_AFTER_HOURS_07",
+      "market": "KR"
+    }
+  },
+  "summary": {
+    "plan_count": 3,
+    "leg_count": 12,
+    "broker_order_row_count": 12,
+    "fill_row_count": 0,
+    "symbols": [
+      "SYM_5295",
+      "SYM_6680",
+      "SYM_7466"
+    ]
+  },
+  "correlation": {
+    "plan_ids": [
+      15387,
+      15388,
+      15389
+    ],
+    "leg_ids": [
+      19774,
+      19775,
+      19776,
+      19777,
+      19778,
+      19779,
+      19780,
+      19781,
+      19782,
+      19783,
+      19784,
+      19785
+    ],
+    "broker_order_row_ids": [
+      68227,
+      68228,
+      68229,
+      68230,
+      68231,
+      68232,
+      68233,
+      68234,
+      68235,
+      68236,
+      68237,
+      68238
+    ],
+    "broker_order_numbers_masked": [
+      "ORD#9774",
+      "ORD#9775",
+      "ORD#9776",
+      "ORD#9777",
+      "ORD#0300",
+      "ORD#0500",
+      "ORD#0600",
+      "ORD#0800",
+      "ORD#9782",
+      "ORD#9783",
+      "ORD#9784",
+      "ORD#9785"
+    ],
+    "fill_ids": []
+  },
+  "plan_preview": [
+    {
+      "plan_id": 15387,
+      "symbol_alias": "SYM_7466",
+      "action": "BUY",
+      "decision": "EXECUTE",
+      "note_excerpt": "국장07시간외단일가:cur=4845.00, LONG추천+PM신호=0.665, TB=UP_FIRST, IAE=-0.11%, 단주=1@4845, 예산=122,166, 📉 BUY(상승:s=+0.67, legs=3, 1st=0.5%, gain=+0.0%, qty=24, TB=🔼UP_FIRST,"
+    },
+    {
+      "plan_id": 15388,
+      "symbol_alias": "SYM_5295",
+      "action": "BUY",
+      "decision": "EXECUTE",
+      "note_excerpt": "국장07시간외단일가:cur=26400.00, LONG추천+PM신호=0.659, TB=UP_FIRST, IAE=-1.22%, 단주=1@26400, 예산=163,226, 📉 BUY(상승:s=+0.66, legs=3, 1st=0.6%, gain=+0.0%, qty=5, TB=🔼UP_FIRST"
+    },
+    {
+      "plan_id": 15389,
+      "symbol_alias": "SYM_6680",
+      "action": "BUY",
+      "decision": "EXECUTE",
+      "note_excerpt": "국장07시간외단일가:cur=5040.00, LONG추천+PM신호=0.652, TB=UP_FIRST, IAE=1.89%, 단주=1@5040, 예산=120,180, 📉 BUY(상승:s=+0.65, legs=3, 1st=0.6%, gain=+0.0%, qty=23, TB=🔼UP_FIRST, "
+    }
+  ]
+}

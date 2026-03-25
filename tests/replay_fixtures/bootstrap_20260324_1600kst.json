@@ -1,0 +1,20 @@
+{
+  "case_id": "bootstrap-20260324-1600kst",
+  "captured_at": "2026-03-24T16:19:42.292494Z",
+  "source_type": "bootstrap",
+  "endpoint": "/kis-test/bootstrap",
+  "request": {
+    "timestamp": "2026-03-24T07:00:01.219381Z",
+    "trace": "projects/curioustore/traces/6ec806143bc5369f3d73faead375f55b",
+    "method": "GET",
+    "url": "https://service.example.run.app/kis-test/bootstrap",
+    "status": 200,
+    "latency": "79.154157783s",
+    "responseSize": "1350"
+  },
+  "correlation": {
+    "pm_signal_run_id": 34,
+    "pm_signal_run_key": "pm:2026-03-24:4:ADHOC:20260324070028"
+  },
+  "notes": "Bootstrap request captured from Cloud Run request log; downstream PM signal run header linked by execution window."
+}

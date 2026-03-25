@@ -49,7 +49,12 @@ def _format_pm_buy_risk_note(*, risk_multiplier: float, risk_snapshot_id: Option
 
 
 def _is_earnings_day(db: Session, symbol: str, asof_date: date) -> bool:
-    """해당 종목이 당일 실적발표일(확정/예상/legacy 포함)인지 판정."""
+    """해당 종목이 당일 실적발표일인지 판정.
+
+    현재 운영 DB의 `trading.earnings_event`는 legacy 단일일 컬럼(`report_date`)만 보유한다.
+    과거/미래 스키마의 확정/예상 구간 컬럼을 직접 참조하면 런타임에서 트랜잭션을 깨뜨리므로,
+    현재 스키마에 맞춰 안전하게 단일일 기준으로 판정한다.
+    """
     if not symbol or asof_date is None:
         return False
 
@@ -57,9 +62,7 @@ def _is_earnings_day(db: Session, symbol: str, asof_date: date) -> bool:
         SELECT 1
         FROM trading.earnings_event e
         WHERE e.ticker_symbol = :symbol
-          AND :asof_date BETWEEN
-              COALESCE(e.confirmed_report_date, e.expected_report_date_start, e.report_date)
-              AND COALESCE(e.expected_report_date_end, e.confirmed_report_date, e.expected_report_date_start, e.report_date)
+          AND e.report_date = :asof_date
         LIMIT 1
     """), {
         "symbol": symbol,
@@ -1062,9 +1065,10 @@ def plan_pm_take_profit_orders(
                 s = 0.5
                 strategy = "중립익절"
             
+            iae_text = f"{float(iae_1_3):.2%}" if iae_1_3 is not None else "n/a"
             logger.debug(
                 f"📊 [{sym}] PM 재조회: signal={signal_raw:.3f} (s={s:.3f}, {strategy}), "
-                f"TB={tb_label}, IAE={iae_1_3:.2%}, gain={gain_pct:+.2%}"
+                f"TB={tb_label}, IAE={iae_text}, gain={gain_pct:+.2%}"
             )
             
             # PM 적응형 매도 래더 생성
@@ -1163,7 +1167,7 @@ def plan_pm_take_profit_orders(
             
             logger.info(
                 f"✅ [{sym}] PM 매도 완료 ({strategy}): signal={signal_raw:.3f} (s={s:.3f}), "
-                f"TB={tb_label}, IAE={iae_1_3:.2%}, 레그={len(legs)}개, gain={gain_pct:+.2%}"
+                f"TB={tb_label}, IAE={iae_text}, 레그={len(legs)}개, gain={gain_pct:+.2%}"
             )
             
         except Exception as e:

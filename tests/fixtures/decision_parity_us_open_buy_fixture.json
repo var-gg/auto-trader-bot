@@ -1,0 +1,58 @@
+{
+  "fixture_id": "decision-parity-us-open-buy",
+  "replay_source": "tests/replay_fixtures/us_open_20260324.json",
+  "market": "US",
+  "generated_at": "2026-03-24T08:01:11+00:00",
+  "side": "BUY",
+  "budget": 237.951,
+  "candidate": {
+    "ticker_id": 15365,
+    "symbol": "SYM_1603",
+    "signal_strength": 0.689,
+    "current_price": 107.64,
+    "atr_pct": 0.02,
+    "tb_label": "UP_FIRST",
+    "iae_1_3": -0.003,
+    "reverse_breach_day": null,
+    "has_long_recommendation": true,
+    "policy_version": "pm-core-v2",
+    "source": "replay:us_open_20260324",
+    "notes": [
+      "AS-IS note excerpt: PM매수 cur=107.64 signal=0.689 TB=UP_FIRST legs=2 qty=2"
+    ]
+  },
+  "tuning": {
+    "MIN_TICK_GAP": 1,
+    "ADAPTIVE_BASE_LEGS": 2,
+    "ADAPTIVE_LEG_BOOST": 1.0,
+    "MIN_TOTAL_SPREAD_PCT": 0.01,
+    "ADAPTIVE_STRENGTH_SCALE": 0.1,
+    "FIRST_LEG_BASE_PCT": 0.012,
+    "FIRST_LEG_MIN_PCT": 0.005,
+    "FIRST_LEG_MAX_PCT": 0.05,
+    "FIRST_LEG_GAIN_WEIGHT": 0.6,
+    "FIRST_LEG_ATR_WEIGHT": 0.5,
+    "FIRST_LEG_REQ_FLOOR_PCT": 0.0,
+    "MIN_FIRST_LEG_GAP_PCT": 0.03,
+    "STRICT_MIN_FIRST_GAP": true,
+    "ADAPTIVE_MAX_STEP_PCT": 0.06,
+    "ADAPTIVE_FRAC_ALPHA": 1.25,
+    "ADAPTIVE_GAIN_SCALE": 0.1,
+    "MIN_LOT_QTY": 1
+  },
+  "expected": {
+    "should_skip": false,
+    "symbol": "SYM_1603",
+    "side": "BUY",
+    "policy_version": "pm-core-v2",
+    "requested_quantity": 2,
+    "leg_count": 2,
+    "quantity_split": [1, 1],
+    "price_relation": "strictly_below_current",
+    "first_leg_pct_range": [0.009, 0.012],
+    "last_leg_pct_range": [0.03, 0.06],
+    "required_metadata": {
+      "reverse_breach_day": null
+    }
+  }
+}

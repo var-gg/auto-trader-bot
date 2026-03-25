@@ -235,6 +235,15 @@ def test_write_intent_golden(monkeypatch):
         "buy_plan_shape": calls["plans"][0],
         "sell_plan_shape": calls["plans"][1],
         "submitted_leg_count": submitted_leg_count,
+        "correlation": response["correlation"],
+        "buy_execution_correlation": response["buy_plans"][0]["execution_correlation"],
+        "reject_reason_example": {"code": code, "message": message},
+    }
+    assert_matches_golden("write_intent.golden.json", actual)
+ummary"]["skip_count"],
+        "buy_plan_shape": calls["plans"][0],
+        "sell_plan_shape": calls["plans"][1],
+        "submitted_leg_count": submitted_leg_count,
         "reject_reason_example": {"code": code, "message": message},
     }
     assert_matches_golden("write_intent.golden.json", actual)

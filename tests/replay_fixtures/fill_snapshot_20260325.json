@@ -1,0 +1,88 @@
+{
+  "case_id": "fill-snapshot-20260325",
+  "captured_at": "2026-03-24T16:19:42.292494Z",
+  "source_type": "fill_snapshot",
+  "notes": "Scheduler endpoint for fill collection not yet identified from current inventory; fixture anchors DB truth rows for recent fills.",
+  "fills": [
+    {
+      "id": 7388,
+      "broker_order_id": 68297,
+      "fill_qty": 0,
+      "fill_price": 0.0,
+      "fee": null,
+      "liquidity_flag": null,
+      "filled_at": "2026-03-25T00:10:57+00:00",
+      "fill_status": "UNFILLED"
+    },
+    {
+      "id": 7387,
+      "broker_order_id": 68298,
+      "fill_qty": 0,
+      "fill_price": 0.0,
+      "fee": null,
+      "liquidity_flag": null,
+      "filled_at": "2026-03-25T00:10:57+00:00",
+      "fill_status": "UNFILLED"
+    },
+    {
+      "id": 7386,
+      "broker_order_id": 68293,
+      "fill_qty": 0,
+      "fill_price": 0.0,
+      "fee": null,
+      "liquidity_flag": null,
+      "filled_at": "2026-03-25T00:00:55+00:00",
+      "fill_status": "UNFILLED"
+    },
+    {
+      "id": 7385,
+      "broker_order_id": 68294,
+      "fill_qty": 0,
+      "fill_price": 0.0,
+      "fee": null,
+      "liquidity_flag": null,
+      "filled_at": "2026-03-25T00:00:55+00:00",
+      "fill_status": "UNFILLED"
+    },
+    {
+      "id": 7384,
+      "broker_order_id": 68167,
+      "fill_qty": 1,
+      "fill_price": 59.13,
+      "fee": null,
+      "liquidity_flag": null,
+      "filled_at": "2026-03-24T17:01:13+00:00",
+      "fill_status": "FULL"
+    },
+    {
+      "id": 7383,
+      "broker_order_id": 68289,
+      "fill_qty": 0,
+      "fill_price": 0.0,
+      "fee": null,
+      "liquidity_flag": null,
+      "filled_at": "2026-03-24T23:50:56+00:00",
+      "fill_status": "UNFILLED"
+    },
+    {
+      "id": 7382,
+      "broker_order_id": 68290,
+      "fill_qty": 0,
+      "fill_price": 0.0,
+      "fee": null,
+      "liquidity_flag": null,
+      "filled_at": "2026-03-24T23:50:57+00:00",
+      "fill_status": "UNFILLED"
+    },
+    {
+      "id": 7381,
+      "broker_order_id": 68285,
+      "fill_qty": 0,
+      "fill_price": 0.0,
+      "fee": null,
+      "liquidity_flag": null,
+      "filled_at": "2026-03-24T23:40:54+00:00",
+      "fill_status": "UNFILLED"
+    }
+  ]
+}

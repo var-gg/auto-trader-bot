@@ -1,0 +1,169 @@
+{
+  "case_id": "batch-7156",
+  "captured_at": "2026-03-24T16:19:42.290496Z",
+  "source_type": "trade_batch",
+  "endpoint": "/api/trading-hybrid/kr/open",
+  "request": {
+    "timestamp": "2026-03-23T23:31:01.206212Z",
+    "trace": "projects/curioustore/traces/90079d4f877bcdb651aedb17ad33934c",
+    "method": "POST",
+    "url": "https://service.example.run.app/api/trading-hybrid/kr/open",
+    "status": 200,
+    "latency": "8.603333328s",
+    "responseSize": "4540",
+    "userAgent": "Google-Cloud-Scheduler"
+  },
+  "batch": {
+    "batch_id": 7156,
+    "asof_kst": "2026-03-23T23:31:06.700089+00:00",
+    "mode": "SELL",
+    "currency": "KRW",
+    "notes": {
+      "phase": "OPEN_GREEDY_PM",
+      "market": "KR",
+      "caps": {
+        "swing_ratio": 0.7,
+        "intraday_ratio": 0.25,
+        "cash_buffer_ratio": 0.12,
+        "bp": 87034.0,
+        "equity": 3964405.0,
+        "swing_cap_cash": 60923.799999999996,
+        "intraday_cap_cash": 21758.5
+      },
+      "pm_mode": true
+    }
+  },
+  "summary": {
+    "plan_count": 10,
+    "leg_count": 12,
+    "broker_order_row_count": 12,
+    "fill_row_count": 0,
+    "symbols": [
+      "SYM_0650",
+      "SYM_0741",
+      "SYM_1120",
+      "SYM_2349",
+      "SYM_3813",
+      "SYM_5036",
+      "SYM_6773",
+      "SYM_8087",
+      "SYM_8110",
+      "SYM_8501"
+    ]
+  },
+  "correlation": {
+    "plan_ids": [
+      15309,
+      15310,
+      15311,
+      15312,
+      15313,
+      15314,
+      15315,
+      15316,
+      15317,
+      15318
+    ],
+    "leg_ids": [
+      19601,
+      19602,
+      19603,
+      19604,
+      19605,
+      19606,
+      19607,
+      19608,
+      19609,
+      19610,
+      19611,
+      19612
+    ],
+    "broker_order_row_ids": [
+      67650,
+      67651,
+      67652,
+      67653,
+      67654,
+      67655,
+      67656,
+      67657,
+      67658,
+      67659,
+      67660,
+      67661
+    ],
+    "broker_order_numbers_masked": [
+      "ORD#5400",
+      "ORD#6000",
+      "ORD#6500",
+      "ORD#7000",
+      "ORD#7400",
+      "ORD#7700",
+      "ORD#7800",
+      "ORD#8200",
+      "ORD#8300",
+      "ORD#8900",
+      "ORD#9000",
+      "ORD#9200"
+    ],
+    "fill_ids": []
+  },
+  "plan_preview": [
+    {
+      "plan_id": 15309,
+      "symbol_alias": "SYM_0741",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM만기청산:cur=20150.00, 보유=16일≥만기=12일, 출처=future, 최초매수=2026-02-26, gain=-1.29% | ⏰ 만기 도달 → 현재가 지정가로 즉시 청산"
+    },
+    {
+      "plan_id": 15310,
+      "symbol_alias": "SYM_8087",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM만기청산:cur=37750.00, 보유=25일≥만기=8일, 출처=reverse_breach_day, 최초매수=2026-02-10, gain=+0.27% | ⏰ 만기 도달 → 현재가 지정가로 즉시 청산"
+    },
+    {
+      "plan_id": 15311,
+      "symbol_alias": "SYM_6773",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM만기청산:cur=35950.00, 보유=101일≥만기=12일, 출처=future, 최초매수=2025-10-22, gain=+0.28% | ⏰ 만기 도달 → 현재가 지정가로 즉시 청산"
+    },
+    {
+      "plan_id": 15312,
+      "symbol_alias": "SYM_3813",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM만기청산:cur=17780.00, 보유=36일≥만기=12일, 출처=future, 최초매수=2026-01-26, gain=-2.11% | ⏰ 만기 도달 → 현재가 지정가로 즉시 청산"
+    },
+    {
+      "plan_id": 15313,
+      "symbol_alias": "SYM_0650",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM 희망익절(익절):cur=105600.00, signal=0.655(s=0.655), TB=TIMEOUT, 📈 SELL(상승:s=+0.65, legs=2, 1st=2.7%, gain=+0.3%, qty=2, TB=⏱️TIMEOUT, IAE=-0.4%)\n↳ PM 신호 기반 적응형 래더"
+    },
+    {
+      "plan_id": 15314,
+      "symbol_alias": "SYM_8501",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM만기청산:cur=325000.00, 보유=91일≥만기=12일, 출처=future, 최초매수=2025-11-05, gain=+0.19% | ⏰ 만기 도달 → 현재가 지정가로 즉시 청산"
+    },
+    {
+      "plan_id": 15315,
+      "symbol_alias": "SYM_1120",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM만기청산:cur=31850.00, 보유=35일≥만기=12일, 출처=future, 최초매수=2026-01-27, gain=+0.63% | ⏰ 만기 도달 → 현재가 지정가로 즉시 청산"
+    },
+    {
+      "plan_id": 15316,
+      "symbol_alias": "SYM_8110",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM만기청산:cur=49300.00, 보유=31일≥만기=12일, 출처=future, 최초매수=2026-02-02, gain=+0.20% | ⏰ 만기 도달 → 현재가 지정가로 즉시 청산"
+    }
+  ]
+}

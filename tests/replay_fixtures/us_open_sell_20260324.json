@@ -1,0 +1,196 @@
+{
+  "case_id": "batch-7176",
+  "captured_at": "2026-03-24T16:19:42.291495Z",
+  "source_type": "trade_batch",
+  "endpoint": "/api/trading-hybrid/us/open",
+  "request": {
+    "timestamp": "2026-03-24T08:01:05.346736Z",
+    "trace": "projects/curioustore/traces/10c8b2a39a8517819c024632e90ea5fd",
+    "method": "POST",
+    "url": "https://service.example.run.app/api/trading-hybrid/us/open",
+    "status": 200,
+    "latency": "11.532459878s",
+    "responseSize": "5661",
+    "userAgent": "Google-Cloud-Scheduler"
+  },
+  "batch": {
+    "batch_id": 7176,
+    "asof_kst": "2026-03-24T08:01:11.671093+00:00",
+    "mode": "SELL",
+    "currency": "USD",
+    "notes": {
+      "phase": "OPEN_GREEDY_PM",
+      "market": "US",
+      "caps": {
+        "swing_ratio": 0.7,
+        "intraday_ratio": 0.25,
+        "cash_buffer_ratio": 0.12,
+        "bp": 339.93,
+        "equity": 2154.9,
+        "swing_cap_cash": 237.951,
+        "intraday_cap_cash": 84.9825
+      },
+      "pm_mode": true
+    }
+  },
+  "summary": {
+    "plan_count": 9,
+    "leg_count": 16,
+    "broker_order_row_count": 16,
+    "fill_row_count": 20,
+    "symbols": [
+      "SYM_0381",
+      "SYM_2217",
+      "SYM_2433",
+      "SYM_2820",
+      "SYM_4193",
+      "SYM_6437",
+      "SYM_6603",
+      "SYM_8448",
+      "SYM_8760"
+    ]
+  },
+  "correlation": {
+    "plan_ids": [
+      15366,
+      15367,
+      15368,
+      15369,
+      15370,
+      15371,
+      15372,
+      15373,
+      15374
+    ],
+    "leg_ids": [
+      19710,
+      19711,
+      19712,
+      19713,
+      19714,
+      19715,
+      19716,
+      19717,
+      19718,
+      19719,
+      19720,
+      19721,
+      19722,
+      19723,
+      19724,
+      19725
+    ],
+    "broker_order_row_ids": [
+      68163,
+      68164,
+      68165,
+      68166,
+      68167,
+      68168,
+      68169,
+      68170,
+      68171,
+      68172,
+      68173,
+      68174,
+      68175,
+      68176,
+      68177,
+      68178
+    ],
+    "broker_order_numbers_masked": [
+      "ORD#4641",
+      "ORD#4652",
+      "ORD#4664",
+      "ORD#4675",
+      "ORD#4686",
+      "ORD#4695",
+      "ORD#4707",
+      "ORD#4716",
+      "ORD#4728",
+      "ORD#4743",
+      "ORD#4757",
+      "ORD#4765"
+    ],
+    "fill_ids": [
+      7325,
+      7326,
+      7327,
+      7328,
+      7329,
+      7330,
+      7331,
+      7332,
+      7333,
+      7334,
+      7335,
+      7336,
+      7337,
+      7338,
+      7339,
+      7340,
+      7371,
+      7374,
+      7375,
+      7384
+    ]
+  },
+  "plan_preview": [
+    {
+      "plan_id": 15366,
+      "symbol_alias": "SYM_2217",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM 희망익절(손절):cur=42.91, signal=0.563(s=0.563), TB=UP_FIRST, 📈 SELL(상승:s=+0.56, legs=1, 1st=1.7%, gain=-2.7%, qty=1, TB=🔼UP_FIRST, IAE=-0.6%)\n↳ PM 신호 기반 적응형 래더. 방"
+    },
+    {
+      "plan_id": 15367,
+      "symbol_alias": "SYM_2820",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM 희망익절(손절):cur=51.63, signal=0.594(s=0.594), TB=UP_FIRST, 📈 SELL(상승:s=+0.59, legs=2, 1st=2.0%, gain=-0.6%, qty=2, TB=🔼UP_FIRST, IAE=-0.8%)\n↳ PM 신호 기반 적응형 래더. 방"
+    },
+    {
+      "plan_id": 15368,
+      "symbol_alias": "SYM_2433",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM 희망익절(손절):cur=57.28, signal=0.602(s=0.602), TB=UP_FIRST, 📈 SELL(상승:s=+0.60, legs=3, 1st=2.1%, gain=-0.1%, qty=4, TB=🔼UP_FIRST, IAE=-0.2%)\n↳ PM 신호 기반 적응형 래더. 방"
+    },
+    {
+      "plan_id": 15369,
+      "symbol_alias": "SYM_6437",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM 희망익절(손절):cur=92.81, signal=0.568(s=0.568), TB=UP_FIRST, 📈 SELL(상승:s=+0.57, legs=1, 1st=2.0%, gain=-0.7%, qty=1, TB=🔼UP_FIRST, IAE=-0.7%)\n↳ PM 신호 기반 적응형 래더. 방"
+    },
+    {
+      "plan_id": 15370,
+      "symbol_alias": "SYM_8448",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM 빠른익절(익절):cur=86.40, signal=-0.524(s=0.524), TB=DOWN_FIRST, 📈 SELL(상승:s=+0.52, legs=2, 1st=2.1%, gain=+1.0%, qty=2, TB=🔽DOWN_FIRST, IAE=-2.7%)\n↳ PM 신호 기반 적응형 "
+    },
+    {
+      "plan_id": 15371,
+      "symbol_alias": "SYM_4193",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM 희망익절(손절):cur=74.65, signal=0.574(s=0.574), TB=UP_FIRST, 📈 SELL(상승:s=+0.57, legs=3, 1st=1.6%, gain=-3.5%, qty=5, TB=🔼UP_FIRST, IAE=+0.7%)\n↳ PM 신호 기반 적응형 래더. 방"
+    },
+    {
+      "plan_id": 15372,
+      "symbol_alias": "SYM_8760",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM 희망익절(손절):cur=90.24, signal=0.615(s=0.615), TB=UP_FIRST, 📈 SELL(상승:s=+0.62, legs=1, 1st=1.8%, gain=-2.4%, qty=1, TB=🔼UP_FIRST, IAE=-0.4%)\n↳ PM 신호 기반 적응형 래더. 방"
+    },
+    {
+      "plan_id": 15373,
+      "symbol_alias": "SYM_6603",
+      "action": "SELL",
+      "decision": "EXECUTE",
+      "note_excerpt": "PM 희망익절(손절):cur=81.85, signal=0.652(s=0.652), TB=DOWN_FIRST, 📈 SELL(상승:s=+0.65, legs=1, 1st=2.0%, gain=-0.8%, qty=1, TB=🔽DOWN_FIRST, IAE=-2.6%)\n↳ PM 신호 기반 적응형 래"
+    }
+  ]
+}

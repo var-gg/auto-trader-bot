@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Mapping
+from typing import Iterable, Mapping
 
 from shared.domain.models import FillOutcome, OrderPlan
 

@@ -99,6 +99,38 @@ def submit_to_broker(db, plan_id: int, test_mode: bool = False) -> None:
         _submit_leg_to_broker(db, r._mapping["id"], test_mode=test_mode)
 
 
+def get_plan_execution_correlation(db, plan_id: int) -> List[Dict[str, Any]]:
+    """Return latest broker-order correlation rows for each leg in a plan.
+
+    There is no explicit broker request/response id in the current KIS integration path.
+    We therefore use `trading.broker_order.id` as a stable local fallback correlation key,
+    and `order_number` as the broker-facing identifier when present.
+    """
+    rows = db.execute(text("""
+        WITH bo_last AS (
+            SELECT DISTINCT ON (leg_id)
+                   id, leg_id, order_number, status, submitted_at
+              FROM trading.broker_order
+             WHERE leg_id IN (
+                 SELECT id FROM trading.order_leg WHERE plan_id = :plan_id
+             )
+             ORDER BY leg_id, submitted_at DESC, id DESC
+        )
+        SELECT
+            ol.id AS leg_id,
+            ol.plan_id AS plan_id,
+            bl.id AS broker_order_id,
+            bl.order_number AS broker_order_no,
+            bl.status AS broker_status,
+            bl.submitted_at AS submitted_at
+          FROM trading.order_leg ol
+          LEFT JOIN bo_last bl ON bl.leg_id = ol.id
+         WHERE ol.plan_id = :plan_id
+         ORDER BY ol.id
+    """), {"plan_id": plan_id}).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
 # =========================
 # 브로커 연동 — 공통 유틸
 # =========================

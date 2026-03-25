@@ -1,0 +1,118 @@
+{
+  "case_id": "pm-signal-run-33",
+  "captured_at": "2026-03-24T16:19:42.291495Z",
+  "source_type": "pm_signal",
+  "endpoint": "/recommendations/kr/batch-generate",
+  "request": {
+    "timestamp": "2026-03-24T05:15:01.083342Z",
+    "trace": "projects/curioustore/traces/e1e3d2c9a3c4aac2db0d632f98e5b2ce",
+    "method": "POST",
+    "url": "https://service.example.run.app/recommendations/kr/batch-generate",
+    "status": 200,
+    "latency": "71.462498237s"
+  },
+  "run_header": {
+    "run_id": 33,
+    "run_key": "pm:2026-03-23:4:ADHOC:20260323223023",
+    "session_type": "ADHOC",
+    "anchor_date": "2026-03-23",
+    "scheduled_at": null,
+    "executed_at": "2026-03-23T22:30:23.931331+00:00",
+    "config_id": 4,
+    "policy_version": null,
+    "code_version": null,
+    "country": null,
+    "regime_code": null,
+    "regime_features": null,
+    "run_meta": null,
+    "created_at": "2026-03-23T22:30:23.918053+00:00"
+  },
+  "summary": {
+    "decision_count_captured": 12,
+    "buy_count": 10,
+    "skip_count": 2,
+    "pass_count": 10
+  },
+  "decision_preview": [
+    {
+      "decision_id": 20912,
+      "symbol_alias": "SYM_1645",
+      "passed_gate": false,
+      "excluded_reason_code": "LOW_SIGNAL",
+      "action_code": "SKIP",
+      "explanation_short": "Gate blocked: reason=LOW_CONF(p=0.541), signal=0.5405"
+    },
+    {
+      "decision_id": 20911,
+      "symbol_alias": "SYM_5036",
+      "passed_gate": true,
+      "excluded_reason_code": null,
+      "action_code": "BUY",
+      "explanation_short": "Gate passed: |signal|=0.6439 >= 0.5500"
+    },
+    {
+      "decision_id": 20910,
+      "symbol_alias": "SYM_2349",
+      "passed_gate": true,
+      "excluded_reason_code": null,
+      "action_code": "BUY",
+      "explanation_short": "Gate passed: |signal|=0.6198 >= 0.5500"
+    },
+    {
+      "decision_id": 20909,
+      "symbol_alias": "SYM_9395",
+      "passed_gate": false,
+      "excluded_reason_code": "LOW_SIGNAL",
+      "action_code": "SKIP",
+      "explanation_short": "Gate blocked: reason=LOW_CONF(p=0.546), signal=0.5456"
+    },
+    {
+      "decision_id": 20908,
+      "symbol_alias": "SYM_0049",
+      "passed_gate": true,
+      "excluded_reason_code": null,
+      "action_code": "BUY",
+      "explanation_short": "Gate passed: |signal|=0.5774 >= 0.5500"
+    },
+    {
+      "decision_id": 20907,
+      "symbol_alias": "SYM_9442",
+      "passed_gate": true,
+      "excluded_reason_code": null,
+      "action_code": "BUY",
+      "explanation_short": "Gate passed: |signal|=0.6234 >= 0.5500"
+    },
+    {
+      "decision_id": 20906,
+      "symbol_alias": "SYM_4905",
+      "passed_gate": true,
+      "excluded_reason_code": null,
+      "action_code": "BUY",
+      "explanation_short": "Gate passed: |signal|=0.6035 >= 0.5500"
+    },
+    {
+      "decision_id": 20905,
+      "symbol_alias": "SYM_2065",
+      "passed_gate": true,
+      "excluded_reason_code": null,
+      "action_code": "BUY",
+      "explanation_short": "Gate passed: |signal|=0.6001 >= 0.5500"
+    },
+    {
+      "decision_id": 20904,
+      "symbol_alias": "SYM_5952",
+      "passed_gate": true,
+      "excluded_reason_code": null,
+      "action_code": "BUY",
+      "explanation_short": "Gate passed: |signal|=0.5665 >= 0.5500"
+    },
+    {
+      "decision_id": 20903,
+      "symbol_alias": "SYM_1358",
+      "passed_gate": true,
+      "excluded_reason_code": null,
+      "action_code": "BUY",
+      "explanation_short": "Gate passed: |signal|=0.5505 >= 0.5500"
+    }
+  ]
+}

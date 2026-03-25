@@ -15,6 +15,22 @@
     "note": "[PM SELL] maturity=future"
   },
   "submitted_leg_count": 3,
+  "correlation": {
+    "order_batch_ids": ["100", "200"],
+    "order_plan_ids": ["201", "302"],
+    "broker_request_ids": ["20100", "30200"],
+    "broker_response_ids": ["ORD-201", "ORD-302"]
+  },
+  "buy_execution_correlation": [
+    {
+      "leg_id": 2010,
+      "plan_id": 201,
+      "broker_order_id": 20100,
+      "broker_order_no": "ORD-201",
+      "broker_status": "SUBMITTED",
+      "submitted_at": null
+    }
+  ],
   "reject_reason_example": {
     "code": "OPSQ2001",
     "message": "주문가능수량이 부족합니다."

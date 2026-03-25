@@ -92,9 +92,13 @@ async def _sync_profit_and_account(db: Session, market: str):
         asset_service = AssetSnapshotService(db)
         if market == "KR":
             kr_result = asset_service.collect_kr_account_snapshot(account_uid=None)
+            if not kr_result.get("success"):
+                raise RuntimeError(f"KR account snapshot failed: {kr_result.get('error') or kr_result.get('message')}")
             logger.info(f"✅ 국내 계좌 스냅샷 완료: snapshot_id={kr_result.get('snapshot_id')}")
         else:
             ovrs_result = asset_service.collect_ovrs_account_snapshot(account_uid=None)
+            if not ovrs_result.get("success"):
+                raise RuntimeError(f"OVRS account snapshot failed: {ovrs_result.get('error') or ovrs_result.get('message')}")
             logger.info(f"✅ 해외 계좌 스냅샷 완료: snapshot_id={ovrs_result.get('snapshot_id')}")
         
         # 3. 해당 시장 체결정보 수집 (async)
