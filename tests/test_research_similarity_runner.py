@@ -57,3 +57,4 @@ def test_run_backtest_supports_research_similarity_strategy(monkeypatch):
     result = cli.run_backtest(request, None, data_source="local-db", scenario_id="scn-r1", strategy_mode="research_similarity_v1")
     assert result["strategy_mode"] == "research_similarity_v1"
     assert result["diagnostics"]["AAPL"]["scores"]["abstained"] is True
+    assert "portfolio" in result

@@ -1,10 +1,10 @@
 from datetime import datetime
 
-from backtest_app.validation import build_walk_forward_splits, compute_performance_metrics, sensitivity_sweep
+from backtest_app.validation import build_cpcv_folds, build_walk_forward_splits, compute_performance_metrics, rejection_reasons, sensitivity_sweep
 from shared.domain.models import ExecutionVenue, FillOutcome, FillStatus, OrderPlan, Side
 
 
-def _plan(plan_id: str, side: Side, signal_strength: float, target: float, stop: float):
+def _plan(plan_id: str, side: Side, signal_strength: float, realized: float, regime: str = "RISK_ON"):
     return OrderPlan(
         plan_id=plan_id,
         symbol=plan_id.upper(),
@@ -17,7 +17,7 @@ def _plan(plan_id: str, side: Side, signal_strength: float, target: float, stop:
         requested_budget=1000,
         requested_quantity=10,
         legs=[],
-        metadata={"signal_strength": signal_strength, "target_return_pct": target, "max_reverse_pct": stop},
+        metadata={"signal_strength": signal_strength, "realized_return_pct": realized, "regime_code": regime},
     )
 
 
@@ -47,33 +47,54 @@ def test_walk_forward_supports_purge_and_embargo():
     assert first.test_end == 14
 
 
+def test_build_cpcv_folds_supports_purge_and_embargo():
+    folds = build_cpcv_folds(n_obs=20, n_folds=3, test_fold_size=4, purge=1, embargo=2)
+    assert len(folds) == 3
+    assert set(folds[0].train_indices).isdisjoint(set(range(0, 6)))
+
+
 def test_compute_performance_metrics_contains_required_fields():
     plans = [
-        _plan("a", Side.BUY, 0.2, 0.05, 0.01),
-        _plan("b", Side.SELL, 0.8, 0.04, 0.02),
-        _plan("c", Side.BUY, 0.5, 0.0, 0.0),
+        _plan("a", Side.BUY, 0.2, 0.05, "RISK_ON"),
+        _plan("b", Side.SELL, 0.8, -0.02, "RISK_OFF"),
+        _plan("c", Side.BUY, 0.5, 0.0, "RISK_ON"),
     ]
     fills = [_fill("a", Side.BUY), _fill("b", Side.SELL)]
     metrics = compute_performance_metrics(plans=plans, fills=fills, total_symbols=3)
     for key in (
-        "expectancy",
+        "expectancy_after_cost",
         "max_drawdown",
         "turnover",
-        "hit_rate",
+        "precision_at_k",
         "coverage",
         "no_trade_ratio",
-        "long_expectancy",
-        "short_expectancy",
-        "calibration_by_score_bucket",
+        "long_stats",
+        "short_stats",
+        "score_decile_monotonicity",
+        "calibration_error",
+        "psr",
+        "dsr",
+        "baseline_comparison",
+        "regime_breakdown",
+        "effective_sample_size",
     ):
         assert key in metrics
     assert metrics["coverage"] < 1.0
     assert metrics["no_trade_ratio"] > 0.0
     assert isinstance(metrics["calibration_by_score_bucket"], list)
+    assert "momentum_20d" in metrics["baseline_comparison"]
+
+
+def test_rejection_reasons_flags_bad_validation_profile():
+    reasons = rejection_reasons({"expectancy_after_cost": -0.01, "psr": 0.4, "score_decile_monotonicity": False, "calibration_error": 0.4})
+    assert "non_positive_expectancy" in reasons
+    assert "low_psr" in reasons
+    assert "non_monotonic_scores" in reasons
+    assert "high_calibration_error" in reasons
 
 
 def test_sensitivity_sweep_penalizes_expectancy():
-    plans = [_plan("a", Side.BUY, 0.3, 0.05, 0.01)]
+    plans = [_plan("a", Side.BUY, 0.3, 0.05)]
     fills = [_fill("a", Side.BUY)]
     sweep = sensitivity_sweep(plans=plans, fills=fills, fee_grid=[0.0, 10.0], slippage_grid=[0.0, 10.0], total_symbols=1)
     assert len(sweep) == 4

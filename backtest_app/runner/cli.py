@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 from backtest_app.configs.models import BacktestConfig, BacktestScenario, RunnerRequest
 from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory, guard_backtest_local_only
 from backtest_app.historical_data.loader import JsonHistoricalDataLoader
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
+from backtest_app.portfolio import PortfolioConfig, build_portfolio_decisions
 from backtest_app.reporting.summary import build_summary
 from backtest_app.results.store import JsonResultStore, SqlResultStore
 from backtest_app.simulated_broker.engine import SimulatedBroker
@@ -17,7 +19,7 @@ from shared.domain.execution import build_order_plan_from_candidate
 from shared.domain.models import ExecutionVenue, Side
 
 
-STRATEGY_MODES = ["legacy_event_window", "research_similarity_v1"]
+STRATEGY_MODES = ["legacy_event_window", "research_similarity_v1", "research_similarity_v2"]
 
 
 def run_backtest(
@@ -70,19 +72,30 @@ def run_backtest(
         "MIN_LOT_QTY": 1,
     }
 
+    portfolio_cfg = PortfolioConfig()
+    portfolio_decisions = build_portfolio_decisions(candidates=historical.candidates, initial_capital=request.config.initial_capital, cfg=portfolio_cfg)
     budget_per_symbol = request.config.initial_capital / max(len(request.scenario.symbols), 1)
     plans = []
     skipped = []
-    for candidate in historical.candidates:
+    selected_symbols = []
+    for decision in portfolio_decisions:
+        candidate = decision.candidate
         if candidate.symbol not in request.scenario.symbols:
             continue
+        if not decision.selected:
+            skipped.append({"symbol": candidate.symbol, "code": "PORTFOLIO", "note": str(decision.kill_reason), "strategy_mode": strategy_mode, "portfolio_diagnostics": decision.diagnostics})
+            continue
+        selected_symbols.append({"symbol": candidate.symbol, "side": decision.side.value, "size_multiplier": decision.size_multiplier, "expected_horizon_days": decision.expected_horizon_days})
+        generated_at = historical.market_snapshot.as_of
+        if strategy_mode == "research_similarity_v2" and candidate.reference_date:
+            generated_at = datetime.fromisoformat(f"{candidate.reference_date}T00:00:00")
         plan, skip = build_order_plan_from_candidate(
             candidate,
-            generated_at=historical.market_snapshot.as_of,
+            generated_at=generated_at,
             market=request.scenario.market,
-            side=candidate.side_bias if strategy_mode == "research_similarity_v1" else Side.BUY,
+            side=candidate.side_bias if strategy_mode in {"research_similarity_v1", "research_similarity_v2"} else Side.BUY,
             tuning=tuning,
-            budget=budget_per_symbol,
+            budget=max(0.0, budget_per_symbol * decision.size_multiplier),
             venue=ExecutionVenue.BACKTEST,
             rationale_prefix=f"{request.scenario.strategy_id}:{strategy_mode}",
         )
@@ -100,7 +113,12 @@ def run_backtest(
     )
     fills = []
     for plan in plans:
-        fills.extend(broker.simulate_plan(plan, historical.bars_by_symbol.get(plan.symbol, [])))
+        bars = historical.bars_by_symbol.get(plan.symbol, [])
+        if strategy_mode == "research_similarity_v2":
+            decision_day = str(plan.metadata.get("anchor_date") or "")
+            if decision_day:
+                bars = [bar for bar in bars if str(bar.timestamp)[:10] >= decision_day]
+        fills.extend(broker.simulate_plan(plan, bars))
 
     summary = build_summary(scenario_id=request.scenario.scenario_id, plans=plans, fills=fills)
     historical_metadata = getattr(historical, "metadata", {}) or {}
@@ -110,10 +128,30 @@ def run_backtest(
     result = {
         "scenario": request.scenario.scenario_id,
         "strategy_mode": strategy_mode,
+        "portfolio": {
+            "selected_symbols": selected_symbols,
+            "decisions": [
+                {
+                    "symbol": d.candidate.symbol,
+                    "selected": d.selected,
+                    "side": d.side.value,
+                    "size_multiplier": d.size_multiplier,
+                    "requested_budget": d.requested_budget,
+                    "expected_horizon_days": d.expected_horizon_days,
+                    "kill_reason": d.kill_reason,
+                    "abstain_reason": ((d.candidate.diagnostics.get("ev", {}).get("long", {}) if d.side == Side.BUY else d.candidate.diagnostics.get("ev", {}).get("short", {})).get("abstain_reasons", [])) if isinstance(d.candidate.diagnostics, dict) else [],
+                    "diagnostics": d.diagnostics,
+                }
+                for d in portfolio_decisions
+            ],
+        },
         "plans": [p.to_dict() for p in plans],
         "fills": [f.to_dict() for f in fills],
         "summary": summary.__dict__,
         "diagnostics": diagnostics,
+        "artifacts": {
+            "signal_panel": historical_metadata.get("signal_panel_artifact", []),
+        },
         "validation": {
             "walk_forward_splits": walk_forward,
             "sensitivity_sweep": sensitivity,

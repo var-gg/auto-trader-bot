@@ -14,6 +14,9 @@ class EventLabelingConfig:
     horizon_days: int
     fee_bps: float = 0.0
     slippage_bps: float = 0.0
+    flat_return_band_pct: float = 0.005
+    earnings_proximity_days: int = 0
+    event_blackout: bool = False
 
 
 @dataclass(frozen=True)
@@ -26,15 +29,39 @@ class EventLabelResult:
     mae_pct: float
     mfe_pct: float
     gross_return_pct: float
+    realized_return_pct: float
     after_cost_return_pct: float
     quality_score: float
     ambiguous: bool = False
     no_trade: bool = False
     diagnostics: dict = field(default_factory=dict)
 
+    @property
+    def path_label(self) -> str:
+        return self.label
+
+    @property
+    def side_labels(self) -> dict:
+        buy = "NO_TRADE"
+        sell = "NO_TRADE"
+        if self.label in {"UP_FIRST", "HORIZON_UP"}:
+            buy = self.label
+        elif self.label in {"DOWN_FIRST", "HORIZON_DOWN"}:
+            sell = self.label
+        return {"BUY": buy, "SELL": sell}
+
 
 def _safe_pct(x: float) -> float:
     return max(-1.0, min(1.0, float(x)))
+
+
+def _quality_score(*, realized_return_pct: float, after_cost_return_pct: float, hit_speed: float, mfe: float, mae: float) -> float:
+    pnl_component = 1.0 / (1.0 + exp(-8.0 * after_cost_return_pct))
+    excursion_raw = 0.6 * max(0.0, mfe) + 0.4 * max(0.0, 1.0 + mae)
+    excursion_component = max(0.0, min(1.0, excursion_raw))
+    realized_component = 1.0 / (1.0 + exp(-6.0 * realized_return_pct))
+    score = 0.35 * pnl_component + 0.25 * realized_component + 0.20 * excursion_component + 0.20 * hit_speed
+    return max(0.0, min(1.0, score))
 
 
 def label_event_window(bars: List[HistoricalBar], config: EventLabelingConfig) -> EventLabelResult:
@@ -48,10 +75,28 @@ def label_event_window(bars: List[HistoricalBar], config: EventLabelingConfig) -
             mae_pct=0.0,
             mfe_pct=0.0,
             gross_return_pct=0.0,
+            realized_return_pct=0.0,
             after_cost_return_pct=0.0,
             quality_score=0.0,
             no_trade=True,
             diagnostics={"reason": "missing_bars"},
+        )
+
+    if config.event_blackout:
+        return EventLabelResult(
+            label="NO_TRADE",
+            days_to_hit=None,
+            target_hit_day=None,
+            stop_hit_day=None,
+            horizon_close_day=None,
+            mae_pct=0.0,
+            mfe_pct=0.0,
+            gross_return_pct=0.0,
+            realized_return_pct=0.0,
+            after_cost_return_pct=0.0,
+            quality_score=0.0,
+            no_trade=True,
+            diagnostics={"reason": "event_blackout", "earnings_proximity_days": config.earnings_proximity_days},
         )
 
     entry = float(bars[0].open)
@@ -67,6 +112,7 @@ def label_event_window(bars: List[HistoricalBar], config: EventLabelingConfig) -
             mae_pct=0.0,
             mfe_pct=0.0,
             gross_return_pct=0.0,
+            realized_return_pct=0.0,
             after_cost_return_pct=0.0,
             quality_score=0.0,
             no_trade=True,
@@ -100,8 +146,9 @@ def label_event_window(bars: List[HistoricalBar], config: EventLabelingConfig) -
 
     last_bar = window[-1]
     gross_return = (float(last_bar.close) / entry) - 1.0
+    realized_return = gross_return
     cost_pct = (float(config.fee_bps) + float(config.slippage_bps)) / 10000.0
-    after_cost_return = gross_return - cost_pct
+    after_cost_return = realized_return - cost_pct
 
     if ambiguous:
         label = "AMBIGUOUS"
@@ -113,13 +160,19 @@ def label_event_window(bars: List[HistoricalBar], config: EventLabelingConfig) -
         label = "DOWN_FIRST"
         days_to_hit = stop_hit_day
     else:
-        label = "HORIZON_CLOSE"
         days_to_hit = None
+        if abs(after_cost_return) <= float(config.flat_return_band_pct):
+            label = "FLAT"
+        elif after_cost_return > 0:
+            label = "HORIZON_UP"
+        elif after_cost_return < 0:
+            label = "HORIZON_DOWN"
+        else:
+            label = "NO_TRADE"
 
+    no_trade = label in {"FLAT", "NO_TRADE"}
     hit_speed = 0.0 if not days_to_hit else 1.0 - min(days_to_hit - 1, horizon - 1) / max(horizon - 1, 1)
-    pnl_component = 1.0 / (1.0 + exp(-8.0 * after_cost_return))
-    excursion_component = max(0.0, min(1.0, (mfe + mae + 1.0) / 1.5))
-    quality_score = max(0.0, min(1.0, 0.45 * pnl_component + 0.35 * excursion_component + 0.20 * hit_speed))
+    quality_score = _quality_score(realized_return_pct=realized_return, after_cost_return_pct=after_cost_return, hit_speed=hit_speed, mfe=mfe, mae=mae)
 
     return EventLabelResult(
         label=label,
@@ -130,14 +183,19 @@ def label_event_window(bars: List[HistoricalBar], config: EventLabelingConfig) -
         mae_pct=_safe_pct(mae),
         mfe_pct=_safe_pct(mfe),
         gross_return_pct=_safe_pct(gross_return),
+        realized_return_pct=_safe_pct(realized_return),
         after_cost_return_pct=_safe_pct(after_cost_return),
         quality_score=quality_score,
         ambiguous=ambiguous,
-        no_trade=False,
+        no_trade=no_trade,
         diagnostics={
             "entry_price": entry,
             "target_level": target_level,
             "stop_level": stop_level,
             "observed_days": len(window),
+            "path_label": label,
+            "side_labels": {"BUY": "NO_TRADE" if label in {"DOWN_FIRST", "HORIZON_DOWN", "FLAT", "NO_TRADE", "AMBIGUOUS"} else label, "SELL": "NO_TRADE" if label in {"UP_FIRST", "HORIZON_UP", "FLAT", "NO_TRADE", "AMBIGUOUS"} else label},
+            "earnings_proximity_days": config.earnings_proximity_days,
+            "event_blackout": config.event_blackout,
         },
     )

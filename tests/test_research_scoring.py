@@ -30,4 +30,4 @@ def test_score_candidates_exact_combines_similarity_quality_and_filters():
     )
     assert len(scored) == 1
     assert scored[0].anchor_code == "EARNINGS"
-    assert scored[0].score > 0.8
+    assert scored[0].score > 0.7

@@ -172,3 +172,22 @@ def test_same_db_same_config_same_seed_same_result(temp_backtest_db, monkeypatch
     assert left["summary"] == right["summary"]
     assert left["plans"] == right["plans"]
     assert left["fills"] == right["fills"]
+
+
+def test_research_similarity_v2_actual_loader_and_runner(temp_backtest_db, monkeypatch):
+    monkeypatch.setenv("BACKTEST_DB_URL", temp_backtest_db)
+    monkeypatch.setenv("BACKTEST_DB_SCHEMA", "trading")
+    request = cli.RunnerRequest(
+        scenario=cli.BacktestScenario(
+            scenario_id="scn-it-v2",
+            market="US",
+            start_date="2026-01-01",
+            end_date="2026-01-10",
+            symbols=["AAPL"],
+        ),
+        config=cli.BacktestConfig(initial_capital=10000.0, metadata={"seed": "0"}),
+    )
+    result = cli.run_backtest(request, None, data_source="local-db", scenario_id="scn-it-v2", strategy_mode="research_similarity_v2")
+    assert result["strategy_mode"] == "research_similarity_v2"
+    assert isinstance(result["artifacts"]["signal_panel"], list)
+    assert result["diagnostics"].get("signal_panel") is not None
