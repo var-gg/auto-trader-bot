@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import time
 from pathlib import Path
 from typing import Iterable
@@ -10,6 +11,7 @@ from sqlalchemy import create_engine, text
 
 PATCH_LOG_BOOTSTRAP = Path("db/sql/bootstrap/000_meta_sql_patch_log.sql")
 VALID_ROOTS = ("bootstrap", "patches", "verify")
+ENV_DB_URL_PREFIX = "env:"
 
 
 def sha256_text(content: str) -> str:
@@ -87,9 +89,24 @@ def apply_patch(engine, path: Path, *, dry_run: bool = False) -> str:
         return f"applied {patch_name} ({elapsed_ms} ms)"
 
 
+def resolve_db_url(raw_value: str) -> str:
+    value = raw_value.strip()
+    if value.startswith(ENV_DB_URL_PREFIX):
+        env_name = value[len(ENV_DB_URL_PREFIX) :].strip()
+        if not env_name:
+            raise SystemExit("--db-url env:<NAME> requires an environment variable name")
+        resolved = os.getenv(env_name, "").strip()
+        if not resolved:
+            raise SystemExit(f"Environment variable {env_name} is empty")
+        return resolved
+    if not value:
+        raise SystemExit("--db-url is required")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Apply SQL-first bootstrap/patch/verify files to a target DB")
-    parser.add_argument("--db-url", required=True, help="Target DB URL")
+    parser.add_argument("--db-url", required=True, help="Target DB URL or env:<ENV_NAME>")
     parser.add_argument("--root", default="db/sql", help="SQL root directory")
     parser.add_argument("--groups", nargs="+", default=["bootstrap", "patches"], choices=list(VALID_ROOTS))
     parser.add_argument("--include", nargs="*", default=[], help="Specific sql files relative to root")
@@ -102,7 +119,7 @@ def main() -> int:
     if missing:
         raise SystemExit(f"Missing SQL files: {', '.join(missing)}")
 
-    engine = create_engine(args.db_url, future=True)
+    engine = create_engine(resolve_db_url(args.db_url), future=True)
     for path in files:
         print(apply_patch(engine, path, dry_run=args.dry_run))
     return 0

@@ -1,39 +1,67 @@
-# Local backtest Postgres plan
+# Local backtest Postgres
 
 ## Goal
-- Keep live Cloud SQL money path untouched.
-- Run backtest/research only against local Postgres.
-- Manage local research schema with `db/sql/*.sql` only.
-- Mirror only whitelisted live tables into local `trading` schema.
+- Keep the live Cloud SQL / money path untouched.
+- Run backtest + research against local PostgreSQL only.
+- Keep schema/bootstrap SQL-first from `db/sql/**/*.sql` only.
+- Standardize local bootstrap on **one supported path**.
 
-## New local tables
-Apply in order:
-1. `db/sql/001_local_backtest_schema.sql`
-2. `db/sql/002_local_backtest_seed.sql`
+## Official strategy
+The supported local strategy is **dump-first local trading mirror**:
+- production/proxy remains the source of truth
+- a whitelist subset is refreshed into local Postgres under the same `trading` schema name
+- backtest reads local state only
+- live order/fill/account/execution tables are intentionally excluded
 
-Tables introduced:
-- `trading.bt_mirror_ticker`
-- `trading.bt_mirror_ohlcv_daily`
-- `trading.bt_event_window`
-- `trading.bt_mirror_whitelist`
+This minimizes branching while avoiding any live-money path mutation.
 
-## Mirror flow
-1. Point `SOURCE_DB_URL` at live/proxy source.
-2. Point `BACKTEST_DB_URL` (or BACKTEST_DB_* envs) at local Postgres.
-3. Run:
-   - `python scripts/apply_local_sql.py db/sql/001_local_backtest_schema.sql db/sql/002_local_backtest_seed.sql`
-   - `python scripts/mirror_trading_whitelist.py`
-4. Load research-generated event snapshots into `trading.bt_event_window` using explicit SQL/import scripts.
+## Supported bootstrap path
+### 0) Set env
+- `SOURCE_DB_URL` -> production/proxy source DB for mirror refresh
+- `BACKTEST_DB_URL` -> local PostgreSQL target
+  - or use `BACKTEST_DB_HOST`, `BACKTEST_DB_PORT`, `BACKTEST_DB_NAME`, `BACKTEST_DB_USER`, `BACKTEST_DB_PASSWORD`
 
-## Backtest runner
-- Fixture mode remains supported:
-  - `python -m backtest_app.runner --data-source json --data tests/fixtures/backtest_historical_fixture.json ...`
-- Local DB mode:
-  - `python -m backtest_app.runner --data-source local-db --scenario-id my_scenario --market US --start-date 2026-01-01 --end-date 2026-01-31 --symbols AAPL,MSFT`
+### 1) Apply SQL-first bootstrap + patches
+```bash
+python scripts/db_apply_sql.py --db-url "env:BACKTEST_DB_URL"
+```
 
-## Safety boundaries
-- `backtest_app` uses its own `backtest_app.db.local_session` wiring, separate from live FastAPI sessions.
-- `BACKTEST_DB_URL` must point to local Postgres by default.
-- Cloud SQL socket URLs and live env markers are rejected for backtest mode.
-- Backtest sessions set `search_path=trading,bt_result,meta,public` and `default_transaction_read_only=on`.
-- Result artifacts still go to JSON files; no live DB writes are introduced.
+Default groups are:
+- `db/sql/bootstrap/*.sql`
+- `db/sql/patches/*.sql`
+
+Optional verification:
+```bash
+python scripts/db_apply_sql.py --db-url "env:BACKTEST_DB_URL" --groups verify
+```
+
+### 2) Build the first local trading mirror
+```bash
+python scripts/refresh_local_trading.py init-full
+```
+
+### 3) Normal refresh loop
+```bash
+python scripts/refresh_local_trading.py refresh-reference
+python scripts/refresh_local_trading.py refresh-market
+```
+
+### 4) Run local backtest
+```bash
+python -m backtest_app.runner --data-source local-db --scenario-id scn_001 --market US --start-date 2026-01-01 --end-date 2026-01-31 --symbols AAPL,MSFT
+```
+
+## Deprecated path
+Do **not** use these as the primary bootstrap anymore:
+- `python scripts/apply_local_sql.py ...`
+- `python scripts/mirror_trading_whitelist.py`
+- direct manual application of `db/sql/001_local_backtest_schema.sql` / `002_local_backtest_seed.sql`
+
+Those scripts now exist only as compatibility wrappers that redirect to the single supported flow.
+
+## Manual steps still required
+- provision/start local PostgreSQL
+- set `SOURCE_DB_URL`
+- set `BACKTEST_DB_URL` or `BACKTEST_DB_*`
+- load research-owned local event/anchor data if your scenario depends on it
+- run backtests explicitly; bootstrap does not auto-run research jobs

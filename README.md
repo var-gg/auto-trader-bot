@@ -13,9 +13,10 @@ No production secrets, live account credentials, or private runbooks should be c
   - earnings and fundamentals collection
   - portfolio and fill collection flows
   - trading-hybrid planning / execution logic
-- SQLAlchemy models, repositories, and Alembic migrations
+- SQLAlchemy models and repositories
 - Dockerfile and `start.sh` for containerized deployment
 - Secret Manager / Cloud Run deployment guidance
+- SQL-first local backtest path backed by local PostgreSQL
 
 ## What is intentionally excluded
 - Real `.env` files and local secrets
@@ -45,6 +46,15 @@ The app now performs fail-fast startup validation in deploy environments when re
 - `INSTANCE_CONNECTION_NAME` (Cloud Run)
 - or `DB_URL` for local fallback usage
 
+### Local backtest database
+- `BACKTEST_DB_URL`
+- or `BACKTEST_DB_HOST`
+- `BACKTEST_DB_PORT`
+- `BACKTEST_DB_NAME`
+- `BACKTEST_DB_USER`
+- `BACKTEST_DB_PASSWORD`
+- `SOURCE_DB_URL` for dump-first local mirror refresh
+
 ### Broker / execution
 - `KIS_APPKEY`
 - `KIS_APPSECRET`
@@ -58,7 +68,7 @@ The app now performs fail-fast startup validation in deploy environments when re
 - `FRED_API_KEY`
 - `DART_API_KEY` (optional in some flows)
 
-See `.env.example` and `DEPLOY_SECRET_MANAGER.md` for the public-safe setup shape.
+See `.env.example` and deployment docs for the public-safe setup shape.
 
 ## Running locally
 ### 1. Install dependencies
@@ -81,6 +91,40 @@ Or run the container entrypoint behavior with:
 ```bash
 bash start.sh
 ```
+
+## Local backtest bootstrap (official)
+Use **one supported bootstrap path** only.
+
+### 1) Apply SQL-first bootstrap/patches to local Postgres
+```bash
+python scripts/db_apply_sql.py --db-url "env:BACKTEST_DB_URL"
+```
+
+### 2) Build the dump-first local trading mirror
+```bash
+python scripts/refresh_local_trading.py init-full
+```
+
+### 3) Normal refresh loop
+```bash
+python scripts/refresh_local_trading.py refresh-reference
+python scripts/refresh_local_trading.py refresh-market
+```
+
+### 4) Run local-db backtest
+```bash
+python -m backtest_app.runner --data-source local-db --scenario-id scn_001 --market US --start-date 2026-01-01 --end-date 2026-01-31 --symbols AAPL,MSFT
+```
+
+Deprecated bootstrap helpers:
+- `python scripts/apply_local_sql.py ...`
+- `python scripts/mirror_trading_whitelist.py`
+
+See also:
+- `docs/local-backtest-postgres.md`
+- `docs/runbook-local-backtest.md`
+- `docs/local-trading-mirror.md`
+- `docs/db-sql-first.md`
 
 ## Deploying
 Public-safe deployment notes are included in:

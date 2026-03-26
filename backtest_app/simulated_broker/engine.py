@@ -11,9 +11,12 @@ from .models import SimulationRules
 
 
 def _event_time(ts: str) -> datetime:
-    if ts and "T" in ts:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    return datetime.now(timezone.utc)
+    if ts:
+        raw = ts.replace("Z", "+00:00")
+        if "T" in raw:
+            return datetime.fromisoformat(raw)
+        return datetime.fromisoformat(f"{raw}T00:00:00+00:00")
+    return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 @dataclass

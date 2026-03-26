@@ -46,6 +46,10 @@ def build_order_plan_from_candidate(
         metadata={
             "anchor_date": candidate.anchor_date.isoformat() if candidate.anchor_date else None,
             "reverse_breach_day": candidate.reverse_breach_day,
+            "target_return_pct": candidate.target_return_pct,
+            "max_reverse_pct": candidate.max_reverse_pct,
+            "signal_strength": candidate.signal_strength,
+            "strategy_side_bias": candidate.side_bias.value if hasattr(candidate.side_bias, 'value') else str(candidate.side_bias),
         },
     )
     return plan, None

@@ -9,11 +9,15 @@ from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest
 from backtest_app.historical_data.loader import JsonHistoricalDataLoader
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
 from backtest_app.reporting.summary import build_summary
-from backtest_app.results.store import JsonResultStore
+from backtest_app.results.store import JsonResultStore, SqlResultStore
 from backtest_app.simulated_broker.engine import SimulatedBroker
 from backtest_app.simulated_broker.models import SimulationRules
+from backtest_app.validation import build_walk_forward_splits, sensitivity_sweep
 from shared.domain.execution import build_order_plan_from_candidate
 from shared.domain.models import ExecutionVenue, Side
+
+
+STRATEGY_MODES = ["legacy_event_window", "research_similarity_v1"]
 
 
 def run_backtest(
@@ -21,8 +25,11 @@ def run_backtest(
     data_path: str | None,
     *,
     output_dir: str | None = None,
+    save_json: bool = True,
+    sql_db_url: str | None = None,
     data_source: str = "json",
     scenario_id: str | None = None,
+    strategy_mode: str = "legacy_event_window",
 ) -> dict:
     if data_source == "local-db":
         cfg = LocalBacktestDbConfig.from_env()
@@ -35,6 +42,7 @@ def run_backtest(
             start_date=request.scenario.start_date,
             end_date=request.scenario.end_date,
             symbols=request.scenario.symbols,
+            strategy_mode=strategy_mode,
         )
     else:
         if not data_path:
@@ -64,21 +72,24 @@ def run_backtest(
 
     budget_per_symbol = request.config.initial_capital / max(len(request.scenario.symbols), 1)
     plans = []
+    skipped = []
     for candidate in historical.candidates:
         if candidate.symbol not in request.scenario.symbols:
             continue
-        plan, _skip = build_order_plan_from_candidate(
+        plan, skip = build_order_plan_from_candidate(
             candidate,
             generated_at=historical.market_snapshot.as_of,
             market=request.scenario.market,
-            side=Side.BUY,
+            side=candidate.side_bias if strategy_mode == "research_similarity_v1" else Side.BUY,
             tuning=tuning,
             budget=budget_per_symbol,
             venue=ExecutionVenue.BACKTEST,
-            rationale_prefix=request.scenario.strategy_id,
+            rationale_prefix=f"{request.scenario.strategy_id}:{strategy_mode}",
         )
         if plan:
             plans.append(plan)
+        elif skip:
+            skipped.append({"symbol": candidate.symbol, **skip, "strategy_mode": strategy_mode})
 
     broker = SimulatedBroker(
         rules=SimulationRules(
@@ -92,18 +103,62 @@ def run_backtest(
         fills.extend(broker.simulate_plan(plan, historical.bars_by_symbol.get(plan.symbol, [])))
 
     summary = build_summary(scenario_id=request.scenario.scenario_id, plans=plans, fills=fills)
+    historical_metadata = getattr(historical, "metadata", {}) or {}
+    diagnostics = historical_metadata.get("diagnostics", {})
+    walk_forward = [s.__dict__ for s in build_walk_forward_splits(n_obs=max(len(historical.candidates), len(request.scenario.symbols), 1), train_size=1, test_size=1, step_size=1, purge=0, embargo=0)]
+    sensitivity = [p.__dict__ for p in sensitivity_sweep(plans=plans, fills=fills, fee_grid=[0.0, request.config.fee_bps, request.config.fee_bps + 5.0], slippage_grid=[0.0, request.config.slippage_bps, request.config.slippage_bps + 5.0], total_symbols=len(request.scenario.symbols))]
     result = {
         "scenario": request.scenario.scenario_id,
+        "strategy_mode": strategy_mode,
         "plans": [p.to_dict() for p in plans],
         "fills": [f.to_dict() for f in fills],
         "summary": summary.__dict__,
+        "diagnostics": diagnostics,
+        "validation": {
+            "walk_forward_splits": walk_forward,
+            "sensitivity_sweep": sensitivity,
+            "coverage": summary.metadata.get("coverage", 0.0),
+            "no_trade_ratio": summary.metadata.get("no_trade_ratio", 0.0),
+        },
+        "skipped": skipped,
     }
-    if output_dir:
+
+    if sql_db_url:
+        snapshot_info = {
+            "data_source": data_source,
+            "strategy_mode": strategy_mode,
+            "historical_metadata": historical_metadata,
+        }
+        run_id = SqlResultStore(sql_db_url).save_run(
+            run_key=request.scenario.scenario_id,
+            scenario_id=request.scenario.scenario_id,
+            strategy_id=request.scenario.strategy_id,
+            strategy_mode=strategy_mode,
+            market=request.scenario.market,
+            data_source=data_source,
+            config_version=request.scenario.strategy_version,
+            label_version=str(request.config.metadata.get("label_version", "v1")),
+            vector_version=str(request.config.metadata.get("vector_version", strategy_mode)),
+            initial_capital=request.config.initial_capital,
+            params={
+                "scenario_params": request.scenario.params,
+                "scenario_notes": request.scenario.notes,
+                "config_metadata": request.config.metadata,
+            },
+            summary=summary.__dict__,
+            diagnostics=diagnostics,
+            plans=plans,
+            fills=fills,
+            snapshot_info=snapshot_info,
+        )
+        result["sql_run_id"] = run_id
+
+    if output_dir and save_json:
         result_path = JsonResultStore(output_dir).save_run(
             run_id=request.scenario.scenario_id,
             plans=plans,
             fills=fills,
-            summary=summary.__dict__,
+            summary={**summary.__dict__, "diagnostics": diagnostics, "strategy_mode": strategy_mode},
         )
         result["result_path"] = result_path
     return result
@@ -118,9 +173,12 @@ def main() -> int:
     parser.add_argument("--symbols", required=True, help="comma-separated")
     parser.add_argument("--data", default="", help="historical json fixture path")
     parser.add_argument("--data-source", choices=["json", "local-db"], default="json")
+    parser.add_argument("--strategy-mode", choices=STRATEGY_MODES, default="legacy_event_window")
     parser.add_argument("--initial-capital", type=float, default=10000.0)
     parser.add_argument("--output", default="")
     parser.add_argument("--results-dir", default="")
+    parser.add_argument("--results-db-url", default="", help="optional SQL result store target DB URL")
+    parser.add_argument("--no-json-artifact", action="store_true", help="skip JSON artifact save even when results-dir is set")
     args = parser.parse_args()
 
     request = RunnerRequest(
@@ -138,8 +196,11 @@ def main() -> int:
         request,
         args.data or None,
         output_dir=args.results_dir or None,
+        save_json=not args.no_json_artifact,
+        sql_db_url=args.results_db_url or None,
         data_source=args.data_source,
         scenario_id=args.scenario_id,
+        strategy_mode=args.strategy_mode,
     )
     payload = json.dumps(result, ensure_ascii=False, indent=2)
     if request.output_path:
