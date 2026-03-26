@@ -5,7 +5,7 @@ from typing import Iterable, List, Optional
 
 import numpy as np
 
-from .models import PrototypeAnchor
+from .models import DecisionSurface, DistributionEstimate, PrototypeAnchor
 from .repository import CandidateIndex
 
 
@@ -34,6 +34,7 @@ class EVConfig:
     min_expected_utility: float = 0.005
     min_regime_alignment: float = 0.5
     use_kernel_weighting: bool = True
+    max_return_interval_width: float = 0.08
 
 
 @dataclass(frozen=True)
@@ -120,16 +121,7 @@ def fit_calibration_on_fold(*, fold_id: str, raw_scores: list[float], targets: l
     model = fit_calibration(scores=train_scores, targets=train_targets, method=method)
     calibrated_test = [model.calibrate_ev(raw_scores[i]) for i in test_indices if i < len(raw_scores)]
     raw_test = [raw_scores[i] for i in test_indices if i < len(raw_scores)]
-    return CalibrationFoldArtifact(
-        fold_id=fold_id,
-        train_indices=list(train_indices),
-        test_indices=list(test_indices),
-        model=model,
-        train_size=len(train_scores),
-        test_size=len(raw_test),
-        raw_mean=float(np.mean(raw_test)) if raw_test else 0.0,
-        calibrated_mean=float(np.mean(calibrated_test)) if calibrated_test else 0.0,
-    )
+    return CalibrationFoldArtifact(fold_id=fold_id, train_indices=list(train_indices), test_indices=list(test_indices), model=model, train_size=len(train_scores), test_size=len(raw_test), raw_mean=float(np.mean(raw_test)) if raw_test else 0.0, calibrated_mean=float(np.mean(calibrated_test)) if calibrated_test else 0.0)
 
 
 def apply_calibration_to_test(*, raw_scores: list[float], raw_probs: list[float], fold: CalibrationFoldArtifact) -> dict:
@@ -179,23 +171,37 @@ def score_candidates_exact(*, query_embedding: list[float], candidates: Iterable
         return_score = float(candidate.mean_return_pct or 0.0)
         win_rate = float(candidate.win_rate or 0.0)
         uncertainty = float(candidate.uncertainty or 0.0)
-        score = (
-            cfg.similarity_weight * similarity
-            + cfg.anchor_quality_weight * float(candidate.anchor_quality)
-            + cfg.regime_match_weight * regime_match
-            + cfg.sector_match_weight * sector_match
-            + cfg.liquidity_weight * liquidity
-            + cfg.support_weight * support_score
-            + cfg.return_weight * return_score
-            + cfg.win_rate_weight * win_rate
-            - cfg.uncertainty_penalty_weight * uncertainty
-        )
-        out.append(CandidateScore(prototype_id=candidate.prototype_id, anchor_code=candidate.anchor_code, score=float(score), similarity=float(similarity), anchor_quality=float(candidate.anchor_quality), regime_match=regime_match, sector_match=sector_match, liquidity_score=liquidity, diagnostics={"member_count": candidate.member_count, "support_count": candidate.support_count, "decayed_support": candidate.decayed_support, "mean_return_pct": candidate.mean_return_pct, "win_rate": candidate.win_rate, "uncertainty": candidate.uncertainty}))
+        score = cfg.similarity_weight * similarity + cfg.anchor_quality_weight * float(candidate.anchor_quality) + cfg.regime_match_weight * regime_match + cfg.sector_match_weight * sector_match + cfg.liquidity_weight * liquidity + cfg.support_weight * support_score + cfg.return_weight * return_score + cfg.win_rate_weight * win_rate - cfg.uncertainty_penalty_weight * uncertainty
+        out.append(CandidateScore(prototype_id=candidate.prototype_id, anchor_code=candidate.anchor_code, score=float(score), similarity=float(similarity), anchor_quality=float(candidate.anchor_quality), regime_match=regime_match, sector_match=sector_match, liquidity_score=liquidity, diagnostics={"member_count": candidate.member_count, "support_count": candidate.support_count, "decayed_support": candidate.decayed_support, "mean_return_pct": candidate.mean_return_pct, "win_rate": candidate.win_rate, "uncertainty": candidate.uncertainty, "representative_symbol": candidate.representative_symbol, "regime_bucket": candidate.regime_bucket, "sector_bucket": candidate.sector_bucket, "liquidity_bucket": candidate.liquidity_bucket}))
     out.sort(key=lambda x: x.score, reverse=True)
     return out
 
 
-def estimate_expected_value(*, side: str, query_embedding: list[float], candidates: Iterable[PrototypeAnchor], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> EVEstimate:
+def _weighted_quantile(values: list[float], weights: np.ndarray, q: float) -> float:
+    if not values:
+        return 0.0
+    order = np.argsort(np.asarray(values, dtype=float))
+    vals = np.asarray(values, dtype=float)[order]
+    w = weights[order]
+    cdf = np.cumsum(w) / max(float(np.sum(w)), 1e-12)
+    return float(vals[np.searchsorted(cdf, q, side="left")])
+
+
+def _row_side_metrics(side: str, candidate: PrototypeAnchor) -> tuple[float, float, float, float]:
+    if side == "BUY":
+        p_target = float(candidate.win_rate or 0.0)
+        p_stop = max(0.0, 1.0 - p_target)
+        p_flat = 0.0
+        exp_ret = float(candidate.mean_return_pct or 0.0)
+    else:
+        p_target = float(candidate.win_rate or 0.0)
+        p_stop = max(0.0, 1.0 - p_target)
+        p_flat = 0.0
+        exp_ret = float(candidate.mean_return_pct or 0.0)
+    return p_target, p_stop, p_flat, exp_ret
+
+
+def estimate_distribution(*, side: str, query_embedding: list[float], candidates: Iterable[PrototypeAnchor], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> DistributionEstimate:
     cfg = ev_config or EVConfig()
     calibration = calibration or CalibrationModel(method="identity")
     ranked = _ranked_candidates(query_embedding=query_embedding, candidates=candidates, candidate_index=candidate_index)
@@ -204,39 +210,78 @@ def estimate_expected_value(*, side: str, query_embedding: list[float], candidat
         similarity = max(0.0, _cos(query_embedding, c.embedding))
         regime_alignment = 1.0 if regime_code and c.regime_code == regime_code else 0.0
         sector_alignment = 1.0 if sector_code and c.sector_code == sector_code else 0.0
-        freshness_penalty = 1.0 / (1.0 + max(0.0, float(c.freshness_days or 0.0)) / 30.0)
-        support_boost = min(1.0, float(c.decayed_support or c.support_count or 0.0) / 5.0)
+        freshness_score = 1.0 / (1.0 + max(0.0, float(c.freshness_days or 0.0)) / 30.0)
+        support_score = min(1.0, float(c.decayed_support or c.support_count or 0.0) / 5.0)
         kernel = np.exp(cfg.kernel_temperature * (similarity - 1.0)) if cfg.use_kernel_weighting else similarity
-        weight = float(kernel * (0.5 + 0.3 * support_boost + 0.2 * freshness_penalty) * (0.5 + 0.5 * max(regime_alignment, sector_alignment)))
-        p_up = float(c.win_rate or 0.0) if side == "BUY" else float(1.0 - float(c.win_rate or 0.0))
-        p_down = 1.0 - p_up
-        rows.append({"candidate": c, "similarity": similarity, "weight": weight, "p_up": p_up, "p_down": p_down, "ret": float(c.mean_return_pct or 0.0), "mae": abs(float(c.mae_mean_pct or 0.0)), "mfe": float(c.mfe_mean_pct or 0.0), "uncertainty": float(c.uncertainty or 0.0), "dispersion": float(c.return_dispersion or 0.0), "regime_alignment": regime_alignment})
+        weight = float(kernel * (0.45 + 0.30 * support_score + 0.25 * freshness_score) * (0.40 + 0.60 * max(regime_alignment, sector_alignment)))
+        p_target, p_stop, p_flat, exp_ret = _row_side_metrics(side, c)
+        rows.append({"candidate": c, "similarity": similarity, "weight": weight, "p_target": p_target, "p_stop": p_stop, "p_flat": p_flat, "ret": exp_ret, "mae": abs(float(c.mae_mean_pct or 0.0)), "mfe": float(c.mfe_mean_pct or 0.0), "uncertainty": float(c.uncertainty or 0.0), "dispersion": float(c.return_dispersion or 0.0), "regime_alignment": regime_alignment, "freshness_score": freshness_score, "support_score": support_score})
     rows.sort(key=lambda x: x["weight"], reverse=True)
     rows = rows[: cfg.top_k]
     total_w = sum(r["weight"] for r in rows)
     if total_w <= 1e-12:
-        return EVEstimate(side=side, expected_utility=0.0, expected_net_return=0.0, p_up_first=0.0, p_down_first=0.0, expected_mae=0.0, expected_mfe=0.0, uncertainty=1.0, dispersion=1.0, effective_sample_size=0.0, regime_alignment=0.0, calibrated_ev=0.0, calibrated_win_prob=0.0, abstained=True, abstain_reasons=["no_neighbors"], top_matches=[], diagnostics={"ev_decomposition": {}, "calibration": {"method": calibration.method, "slope": calibration.slope, "intercept": calibration.intercept}, "raw_ev": 0.0})
+        return DistributionEstimate(side=side, uncertainty=1.0, utility={"fallback_raw_ev": 0.0}, top_matches=[])
     weights = np.asarray([r["weight"] / total_w for r in rows], dtype=float)
-    n_eff = float(1.0 / np.sum(weights ** 2))
-    p_up = float(sum(w * r["p_up"] for w, r in zip(weights, rows)))
-    p_down = float(sum(w * r["p_down"] for w, r in zip(weights, rows)))
+    p_target = float(sum(w * r["p_target"] for w, r in zip(weights, rows)))
+    p_stop = float(sum(w * r["p_stop"] for w, r in zip(weights, rows)))
+    p_flat = float(sum(w * r["p_flat"] for w, r in zip(weights, rows)))
     exp_ret = float(sum(w * r["ret"] for w, r in zip(weights, rows)))
     exp_mae = float(sum(w * r["mae"] for w, r in zip(weights, rows)))
     exp_mfe = float(sum(w * r["mfe"] for w, r in zip(weights, rows)))
-    dispersion = float(sum(w * r["dispersion"] for w, r in zip(weights, rows)))
     uncertainty = float(sum(w * r["uncertainty"] for w, r in zip(weights, rows)))
     regime_alignment = float(sum(w * r["regime_alignment"] for w, r in zip(weights, rows)))
-    raw_ev = exp_ret - 0.5 * exp_mae + 0.25 * exp_mfe - uncertainty
-    calibrated_prob = calibration.calibrate_prob(p_up if side == "BUY" else p_down)
-    calibrated_ev = calibration.calibrate_ev(raw_ev)
+    n_eff = float(1.0 / np.sum(weights ** 2))
+    values = [float(r["ret"]) for r in rows]
+    q10 = _weighted_quantile(values, weights, 0.10)
+    q50 = _weighted_quantile(values, weights, 0.50)
+    q90 = _weighted_quantile(values, weights, 0.90)
+    lower_bound = q10 - uncertainty
+    upper_bound = q90 + uncertainty
+    utility = {
+        "expected_net_return": exp_ret,
+        "mae_penalty": 0.5 * exp_mae,
+        "mfe_credit": 0.25 * exp_mfe,
+        "uncertainty_penalty": uncertainty,
+        "fallback_raw_ev": exp_ret - 0.5 * exp_mae + 0.25 * exp_mfe - uncertainty,
+    }
+    top_matches = [{"prototype_id": r["candidate"].prototype_id, "weight": r["weight"], "why": {"similarity": r["similarity"], "support": float(r["candidate"].support_count or 0.0), "freshness_days": float(r["candidate"].freshness_days or 0.0)}, "representative_symbol": r["candidate"].representative_symbol, "expected_return": r["candidate"].mean_return_pct, "uncertainty": r["candidate"].uncertainty} for r in rows]
+    return DistributionEstimate(side=side, p_target_first=calibration.calibrate_prob(p_target), p_stop_first=calibration.calibrate_prob(p_stop), p_flat=max(0.0, min(1.0, p_flat)), expected_net_return=calibration.calibrate_ev(exp_ret), expected_mae=exp_mae, expected_mfe=exp_mfe, q10_return=q10, q50_return=q50, q90_return=q90, effective_sample_size=n_eff, regime_alignment=regime_alignment, uncertainty=uncertainty, lower_bound_return=lower_bound, upper_bound_return=upper_bound, utility=utility, top_matches=top_matches)
+
+
+def build_decision_surface(*, query_embedding: list[float], buy_candidates: Iterable[PrototypeAnchor], sell_candidates: Iterable[PrototypeAnchor], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> DecisionSurface:
+    cfg = ev_config or EVConfig()
+    buy = estimate_distribution(side="BUY", query_embedding=query_embedding, candidates=buy_candidates, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
+    sell = estimate_distribution(side="SELL", query_embedding=query_embedding, candidates=sell_candidates, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
     reasons = []
-    if calibrated_ev < cfg.min_expected_utility:
-        reasons.append("low_ev")
-    if uncertainty > cfg.max_uncertainty:
+    better = "BUY" if buy.expected_net_return >= sell.expected_net_return else "SELL"
+    chosen = buy if better == "BUY" else sell
+    interval_width = chosen.q90_return - chosen.q10_return
+    if chosen.effective_sample_size < cfg.min_effective_sample_size:
+        reasons.append("low_ess")
+    if chosen.uncertainty > cfg.max_uncertainty:
         reasons.append("high_uncertainty")
-    if n_eff < cfg.min_effective_sample_size:
-        reasons.append("low_neff")
-    if regime_alignment < cfg.min_regime_alignment:
+    if interval_width > cfg.max_return_interval_width:
+        reasons.append("wide_interval")
+    if chosen.regime_alignment < cfg.min_regime_alignment:
         reasons.append("regime_mismatch")
-    top_matches = [{"prototype_id": r["candidate"].prototype_id, "weight": r["weight"], "similarity": r["similarity"], "support_count": r["candidate"].support_count, "mean_return_pct": r["candidate"].mean_return_pct, "uncertainty": r["candidate"].uncertainty} for r in rows]
-    return EVEstimate(side=side, expected_utility=raw_ev, expected_net_return=exp_ret, p_up_first=p_up if side == "BUY" else p_down, p_down_first=p_down if side == "BUY" else p_up, expected_mae=exp_mae, expected_mfe=exp_mfe, uncertainty=uncertainty, dispersion=dispersion, effective_sample_size=n_eff, regime_alignment=regime_alignment, calibrated_ev=calibrated_ev, calibrated_win_prob=calibrated_prob, abstained=bool(reasons), abstain_reasons=reasons, top_matches=top_matches, diagnostics={"ev_decomposition": {"expected_net_return": exp_ret, "mae_penalty": 0.5 * exp_mae, "mfe_credit": 0.25 * exp_mfe, "uncertainty_penalty": uncertainty}, "calibration": {"method": calibration.method, "slope": calibration.slope, "intercept": calibration.intercept}, "raw_ev": raw_ev, "ev_lift": calibrated_ev - raw_ev})
+    if chosen.lower_bound_return <= 0.0:
+        reasons.append("lower_bound_non_positive")
+    abstain = bool(reasons)
+    return DecisionSurface(buy=buy, sell=sell, chosen_side="ABSTAIN" if abstain else better, abstain=abstain, abstain_reasons=reasons, diagnostics={"buy_summary": buy.utility, "sell_summary": sell.utility, "decision_rule": {"winner": better, "chosen_lower_bound": chosen.lower_bound_return, "chosen_interval_width": interval_width}})
+
+
+def estimate_expected_value(*, side: str, query_embedding: list[float], candidates: Iterable[PrototypeAnchor], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> EVEstimate:
+    dist = estimate_distribution(side=side, query_embedding=query_embedding, candidates=candidates, regime_code=regime_code, sector_code=sector_code, ev_config=ev_config, candidate_index=candidate_index, calibration=calibration)
+    cfg = ev_config or EVConfig()
+    reasons = []
+    if dist.utility.get("fallback_raw_ev", 0.0) < cfg.min_expected_utility:
+        reasons.append("low_ev")
+    if dist.uncertainty > cfg.max_uncertainty:
+        reasons.append("high_uncertainty")
+    if dist.effective_sample_size < cfg.min_effective_sample_size:
+        reasons.append("low_neff")
+    if dist.regime_alignment < cfg.min_regime_alignment:
+        reasons.append("regime_mismatch")
+    if dist.lower_bound_return <= 0.0:
+        reasons.append("lower_bound_non_positive")
+    return EVEstimate(side=side, expected_utility=float(dist.utility.get("fallback_raw_ev", 0.0)), expected_net_return=dist.expected_net_return, p_up_first=dist.p_target_first, p_down_first=dist.p_stop_first, expected_mae=dist.expected_mae, expected_mfe=dist.expected_mfe, uncertainty=dist.uncertainty, dispersion=float(max(dist.q90_return - dist.q10_return, 0.0)), effective_sample_size=dist.effective_sample_size, regime_alignment=dist.regime_alignment, calibrated_ev=dist.expected_net_return, calibrated_win_prob=dist.p_target_first, abstained=bool(reasons), abstain_reasons=reasons, top_matches=dist.top_matches, diagnostics={"ev_decomposition": dist.utility, "raw_ev": dist.utility.get("fallback_raw_ev", 0.0), "decision_surface_compatible": True, "interval": {"q10": dist.q10_return, "q50": dist.q50_return, "q90": dist.q90_return}})

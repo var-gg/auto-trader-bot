@@ -15,7 +15,7 @@ from backtest_app.reporting.summary import build_summary
 from backtest_app.results.store import JsonResultStore, SqlResultStore
 from backtest_app.simulated_broker.engine import SimulatedBroker
 from backtest_app.simulated_broker.models import SimulationRules
-from backtest_app.validation import build_walk_forward_splits, sensitivity_sweep
+from backtest_app.validation import run_fold_validation, sensitivity_sweep
 from shared.domain.execution import build_order_plan_from_candidate
 from shared.domain.models import ExecutionVenue, Side
 
@@ -46,6 +46,7 @@ def run_backtest(
             end_date=request.scenario.end_date,
             symbols=request.scenario.symbols,
             strategy_mode=strategy_mode,
+            research_spec=request.config.research_spec,
         )
     else:
         if not data_path:
@@ -76,11 +77,9 @@ def run_backtest(
     portfolio_cfg = PortfolioConfig()
     quote_policy_cfg = QuotePolicyConfig(
         ev_threshold=float(request.config.metadata.get("quote_ev_threshold", 0.005)),
-        buy_gap_ev_coef=float(request.config.metadata.get("quote_buy_gap_ev_coef", 0.35)),
-        buy_gap_mae_coef=float(request.config.metadata.get("quote_buy_gap_mae_coef", 0.80)),
-        sell_gap_ev_coef=float(request.config.metadata.get("quote_sell_gap_ev_coef", 0.35)),
-        sell_gap_mfe_coef=float(request.config.metadata.get("quote_sell_gap_mfe_coef", 0.30)),
         uncertainty_cap=float(request.config.metadata.get("quote_uncertainty_cap", 0.12)),
+        min_effective_sample_size=float(request.config.metadata.get("quote_min_effective_sample_size", 1.5)),
+        min_fill_probability=float(request.config.metadata.get("quote_min_fill_probability", 0.10)),
     )
     portfolio_decisions = build_portfolio_decisions(candidates=historical.candidates, initial_capital=request.config.initial_capital, cfg=portfolio_cfg)
     budget_per_symbol = request.config.initial_capital / max(len(request.scenario.symbols), 1)
@@ -136,12 +135,13 @@ def run_backtest(
     summary = build_summary(scenario_id=request.scenario.scenario_id, plans=plans, fills=fills, bars_by_symbol=historical.bars_by_symbol)
     historical_metadata = getattr(historical, "metadata", {}) or {}
     diagnostics = historical_metadata.get("diagnostics", {})
-    walk_forward = [s.__dict__ for s in build_walk_forward_splits(n_obs=max(len(historical.candidates), len(request.scenario.symbols), 1), train_size=1, test_size=1, step_size=1, purge=0, embargo=0)]
+    validation_folds = run_fold_validation(plans=plans, fills=fills, bars_by_symbol=historical.bars_by_symbol, total_symbols=len(request.scenario.symbols), horizon_days=int(request.config.research_spec.horizon_days if request.config.research_spec else 5), mode="walk_forward" if strategy_mode == "research_similarity_v2" else "walk_forward") if strategy_mode == "research_similarity_v2" else {"mode": "disabled", "folds": [], "aggregate": {}, "rejection_reasons": [], "train_artifacts": [], "test_artifacts": []}
     sensitivity = [p.__dict__ for p in sensitivity_sweep(plans=plans, fills=fills, fee_grid=[0.0, request.config.fee_bps, request.config.fee_bps + 5.0], slippage_grid=[0.0, request.config.slippage_bps, request.config.slippage_bps + 5.0], total_symbols=len(request.scenario.symbols), bars_by_symbol=historical.bars_by_symbol)]
     quote_policy_sweep = {
         "ev_threshold": [0.003, quote_policy_cfg.ev_threshold, 0.010],
-        "buy_gap_coefficients": [quote_policy_cfg.buy_gap_ev_coef, quote_policy_cfg.buy_gap_mae_coef],
-        "sell_gap_coefficients": [quote_policy_cfg.sell_gap_ev_coef, quote_policy_cfg.sell_gap_mfe_coef],
+        "gap_grid": list(quote_policy_cfg.gap_grid),
+        "size_grid": list(quote_policy_cfg.size_grid),
+        "min_fill_probability": [0.05, quote_policy_cfg.min_fill_probability, 0.20],
         "uncertainty_caps": [0.08, quote_policy_cfg.uncertainty_cap, 0.16],
     }
     result = {
@@ -172,7 +172,7 @@ def run_backtest(
             "signal_panel": historical_metadata.get("signal_panel_artifact", []),
         },
         "validation": {
-            "walk_forward_splits": walk_forward,
+            "fold_engine": validation_folds,
             "sensitivity_sweep": sensitivity,
             "quote_policy_sweep": quote_policy_sweep,
             "coverage": summary.metadata.get("coverage", 0.0),

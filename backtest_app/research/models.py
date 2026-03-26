@@ -5,6 +5,48 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass(frozen=True)
+class DistributionEstimate:
+    side: str
+    p_target_first: float = 0.0
+    p_stop_first: float = 0.0
+    p_flat: float = 0.0
+    expected_net_return: float = 0.0
+    expected_mae: float = 0.0
+    expected_mfe: float = 0.0
+    q10_return: float = 0.0
+    q50_return: float = 0.0
+    q90_return: float = 0.0
+    effective_sample_size: float = 0.0
+    regime_alignment: float = 0.0
+    uncertainty: float = 1.0
+    lower_bound_return: float = 0.0
+    upper_bound_return: float = 0.0
+    utility: Dict[str, Any] = field(default_factory=dict)
+    top_matches: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DecisionSurface:
+    buy: DistributionEstimate
+    sell: DistributionEstimate
+    chosen_side: str = "ABSTAIN"
+    abstain: bool = True
+    abstain_reasons: List[str] = field(default_factory=list)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EventOutcomeRecord:
+    symbol: str
+    event_date: str
+    outcome_end_date: Optional[str]
+    schema_version: str
+    path_summary: Dict[str, Any] = field(default_factory=dict)
+    side_outcomes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ResearchAnchor:
     symbol: str
     anchor_code: str

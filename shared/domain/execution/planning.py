@@ -52,6 +52,11 @@ def build_order_plan_from_candidate(
             "max_reverse_pct": candidate.max_reverse_pct,
             "signal_strength": candidate.signal_strength,
             "strategy_side_bias": candidate.side_bias.value if hasattr(candidate.side_bias, 'value') else str(candidate.side_bias),
+            "expected_horizon_days": candidate.expected_horizon_days,
+            "regime_code": ((candidate.diagnostics or {}).get("query") or {}).get("regime_code") if isinstance(candidate.diagnostics, dict) else None,
+            "sector_code": ((candidate.diagnostics or {}).get("query") or {}).get("sector_code") if isinstance(candidate.diagnostics, dict) else None,
+            "decision_surface_summary": ((candidate.diagnostics or {}).get("decision_surface") or {}) if isinstance(candidate.diagnostics, dict) else {},
+            "chosen_policy_reason": quote_policy.get("chosen_policy_reason"),
             "quote_policy": quote_policy,
         },
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Protocol
 
+from .artifacts import JsonResearchArtifactStore
 from .models import PrototypeAnchor, ResearchAnchor
 
 
@@ -39,3 +40,17 @@ class ExactCosineCandidateIndex:
             scored.append((sim, c))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _, c in scored]
+
+
+def load_prototypes_asof(*, artifact_store: JsonResearchArtifactStore, run_id: str, name: str = "prototype_snapshot", as_of_date: str | None = None, memory_version: str | None = None, side: str | None = None) -> list[dict]:
+    payload = artifact_store.load_prototype_snapshot(run_id=run_id, name=name)
+    if not payload:
+        return []
+    if as_of_date and payload.get("as_of_date") != as_of_date:
+        return []
+    if memory_version and payload.get("memory_version") != memory_version:
+        return []
+    prototypes = list(payload.get("prototypes") or [])
+    if side is None:
+        return prototypes
+    return [p for p in prototypes if side in (p.get("stats") or {})]

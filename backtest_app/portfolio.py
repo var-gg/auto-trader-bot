@@ -58,8 +58,21 @@ def _correlation_bucket(candidate: SignalCandidate) -> str:
     return f"{candidate.side_bias.value}:{sector}"
 
 
+def _candidate_overlap_penalty(candidate: SignalCandidate) -> float:
+    query = ((candidate.diagnostics or {}).get("query") or {}) if isinstance(candidate.diagnostics, dict) else {}
+    return float(query.get("overlap_penalty", 0.0) or 0.0)
+
+
+def _candidate_utility_rank(candidate: SignalCandidate) -> float:
+    policy = quote_policy_v1(signal_to_policy_input(candidate))
+    diagnostics = policy.diagnostics if isinstance(policy.diagnostics, dict) else {}
+    confidence = float(candidate.confidence or 0.0)
+    overlap_penalty = _candidate_overlap_penalty(candidate)
+    return float(diagnostics.get("optimizer_best", {}).get("utility", 0.0)) + 0.35 * _candidate_ev(candidate) + 0.10 * confidence - 0.50 * _candidate_uncertainty(candidate) - 0.25 * overlap_penalty
+
+
 def rank_candidates_cross_sectional(candidates: Sequence[SignalCandidate]) -> list[SignalCandidate]:
-    return sorted(list(candidates), key=lambda c: (_candidate_ev(c), c.confidence or 0.0), reverse=True)
+    return sorted(list(candidates), key=lambda c: (_candidate_utility_rank(c), _candidate_ev(c), c.confidence or 0.0), reverse=True)
 
 
 def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_capital: float, cfg: PortfolioConfig | None = None) -> list[PortfolioDecision]:
@@ -82,7 +95,10 @@ def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_
         raw_size = cfg.base_risk_unit * volatility_scale * confidence_scale * uncertainty_scale
         policy = quote_policy_v1(signal_to_policy_input(cand))
         size_multiplier = max(0.0, min(2.0, policy.size_multiplier if not policy.no_trade else 0.0))
-        requested_budget = risk_budget_total / max(cfg.top_n, 1) * size_multiplier
+        policy_utility = float(policy.diagnostics.get("optimizer_best", {}).get("utility", 0.0)) if isinstance(policy.diagnostics, dict) else 0.0
+        overlap_penalty = _candidate_overlap_penalty(cand)
+        ranking_utility = policy_utility + 0.35 * ev + 0.10 * float(cand.confidence or 0.0) - 0.50 * uncertainty - 0.25 * overlap_penalty
+        requested_budget = risk_budget_total / max(cfg.top_n, 1) * size_multiplier * max(0.25, min(1.5, 1.0 + ranking_utility))
         kill_reason = None
         if policy.no_trade:
             kill_reason = "quote_policy_no_trade"
@@ -115,6 +131,9 @@ def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_
                 "confidence_scale": confidence_scale,
                 "uncertainty_scale": uncertainty_scale,
                 "raw_size": raw_size,
+                "policy_utility": policy_utility,
+                "overlap_penalty": overlap_penalty,
+                "ranking_utility": ranking_utility,
                 "size_multiplier": size_multiplier,
                 "requested_budget": requested_budget,
                 "quote_policy": policy.diagnostics | {"policy_name": policy.policy_name, "buy_gap": policy.buy_gap, "sell_gap": policy.sell_gap, "size_multiplier": policy.size_multiplier, "no_trade": policy.no_trade},

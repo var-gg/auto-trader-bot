@@ -58,10 +58,49 @@ class AnchorEventRecord(ResearchBase):
     liquidity_score: Mapped[float | None] = mapped_column(Numeric(18, 8))
     prototype_id: Mapped[str | None] = mapped_column(Text)
     prototype_membership: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    # Contract: {schema_version, raw_path_summary, side_outcomes:{BUY:{...},SELL:{...}}}
     event_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
     diagnostics: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
     created_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class PrototypeRunRecord(ResearchBase):
+    __tablename__ = "prototype_run"
+    __table_args__ = (
+        UniqueConstraint("run_id", "as_of_date", "memory_version", name="uq_prototype_run_canonical"),
+        Index("ix_prototype_run_asof", "as_of_date", "memory_version"),
+        {"schema": "trading"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    run_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("trading.anchor_label_run.id", ondelete="CASCADE"), nullable=False)
+    as_of_date: Mapped[object] = mapped_column(Date, nullable=False)
+    memory_version: Mapped[str] = mapped_column(Text, nullable=False)
+    prototype_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    lineage_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class PrototypeRecord(ResearchBase):
+    __tablename__ = "prototype_record"
+    __table_args__ = (
+        UniqueConstraint("prototype_run_id", "prototype_id", name="uq_prototype_record_canonical"),
+        Index("ix_prototype_record_pid", "prototype_id"),
+        Index("ix_prototype_record_run", "prototype_run_id"),
+        {"schema": "trading"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    prototype_run_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("trading.prototype_run.id", ondelete="CASCADE"), nullable=False)
+    prototype_id: Mapped[str] = mapped_column(Text, nullable=False)
+    as_of_date: Mapped[object] = mapped_column(Date, nullable=False)
+    memory_version: Mapped[str] = mapped_column(Text, nullable=False)
+    cluster_key: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    representative_hash: Mapped[str | None] = mapped_column(Text)
+    stats_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    membership_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class AnchorVectorRecord(ResearchBase):

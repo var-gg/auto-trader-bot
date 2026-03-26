@@ -1,75 +1,50 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-
-FEATURE_WINDOW_BARS = 60
-WARMUP_DAYS = 120
 from typing import Dict, Iterable, List
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
-from shared.domain.models import MarketCode, OutcomeLabel, Side, SignalCandidate, MarketSnapshot
-
+from backtest_app.configs.models import ResearchExperimentSpec
 from backtest_app.research.pipeline import generate_similarity_candidates, generate_similarity_candidates_rolling
+from shared.domain.models import MarketCode, MarketSnapshot, OutcomeLabel, Side, SignalCandidate
 
 from .features import compute_bar_features
 from .models import HistoricalBar, HistoricalSlice
 
+WARMUP_DAYS = 120
+
 
 class LocalPostgresLoader:
-    """Read-only local Postgres loader for backtest_app.
-
-    Uses backtest_app-only session wiring; never reuses live FastAPI session setup.
-    """
-
     def __init__(self, session_factory: sessionmaker[Session], *, schema: str = "trading"):
         self.session_factory = session_factory
         self.schema = schema
 
-    def load_for_scenario(
-        self,
-        *,
-        scenario_id: str,
-        market: str,
-        start_date: str,
-        end_date: str,
-        symbols: Iterable[str],
-        strategy_mode: str = "legacy_event_window",
-    ) -> HistoricalSlice:
+    def load_for_scenario(self, *, scenario_id: str, market: str, start_date: str, end_date: str, symbols: Iterable[str], strategy_mode: str = "legacy_event_window", research_spec: ResearchExperimentSpec | None = None) -> HistoricalSlice:
         symbols = [s for s in symbols if s]
         if not symbols:
             raise ValueError("symbols required")
-        bars_by_symbol = self._load_bars(start_date=start_date, end_date=end_date, symbols=symbols, warmup_days=WARMUP_DAYS)
+        spec = research_spec or ResearchExperimentSpec()
+        bars_by_symbol = self._load_bars(start_date=start_date, end_date=end_date, symbols=symbols, warmup_days=max(WARMUP_DAYS, spec.feature_window_bars * 2))
         sector_map = self._load_sector_map(symbols)
         features_by_symbol: Dict[str, Dict[str, float]] = {symbol: compute_bar_features(bars) for symbol, bars in bars_by_symbol.items()}
 
         if strategy_mode == "research_similarity_v1":
             macro_payload = self._load_macro_payload(as_of=end_date)
-            candidates, research_diag = generate_similarity_candidates(bars_by_symbol=bars_by_symbol, market=market, macro_payload=macro_payload, sector_map=sector_map)
+            candidates, research_diag = generate_similarity_candidates(bars_by_symbol=bars_by_symbol, market=market, macro_payload=macro_payload, sector_map=sector_map, spec=spec)
             snapshot_ts = self._resolve_snapshot_ts(bars_by_symbol)
             enriched = self._enrich_candidates(candidates, features_by_symbol)
             snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False, macro_state=macro_payload)
-            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "diagnostics": research_diag})
+            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "diagnostics": research_diag})
 
         if strategy_mode == "research_similarity_v2":
-            macro_history = self._load_macro_history(start_date=start_date, end_date=end_date, prewarm_days=WARMUP_DAYS)
-            candidates, research_diag = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market=market, macro_history_by_date=macro_history, sector_map=sector_map, feature_window_bars=FEATURE_WINDOW_BARS)
+            macro_history = self._load_macro_history(start_date=start_date, end_date=end_date, prewarm_days=max(WARMUP_DAYS, spec.feature_window_bars * 2))
+            candidates, research_diag = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market=market, macro_history_by_date=macro_history, sector_map=sector_map, spec=spec)
             snapshot_ts = self._resolve_snapshot_ts(bars_by_symbol)
             enriched = self._enrich_candidates(candidates, features_by_symbol)
             snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False)
-            return HistoricalSlice(
-                market_snapshot=snapshot,
-                bars_by_symbol=bars_by_symbol,
-                candidates=enriched,
-                metadata={
-                    "source": "local-db",
-                    "scenario_id": scenario_id,
-                    "strategy_mode": strategy_mode,
-                    "diagnostics": research_diag,
-                    "signal_panel_artifact": research_diag.get("signal_panel", []),
-                },
-            )
+            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "diagnostics": research_diag, "signal_panel_artifact": research_diag.get("signal_panel", []), "memory_snapshot_artifact": research_diag.get("artifacts", {})})
 
         candidates, snapshot_ts = self._load_candidates(scenario_id=scenario_id, market=market, start_date=start_date, end_date=end_date, symbols=symbols)
         enriched = self._enrich_candidates(candidates, features_by_symbol)
@@ -81,28 +56,7 @@ class LocalPostgresLoader:
         for candidate in candidates:
             prov = dict(candidate.provenance)
             prov["derived_bar_features"] = features_by_symbol.get(candidate.symbol, {})
-            enriched.append(
-                SignalCandidate(
-                    symbol=candidate.symbol,
-                    ticker_id=candidate.ticker_id,
-                    market=candidate.market,
-                    side_bias=candidate.side_bias,
-                    signal_strength=candidate.signal_strength,
-                    confidence=candidate.confidence,
-                    anchor_date=candidate.anchor_date,
-                    reference_date=candidate.reference_date,
-                    current_price=candidate.current_price,
-                    atr_pct=candidate.atr_pct,
-                    target_return_pct=candidate.target_return_pct,
-                    max_reverse_pct=candidate.max_reverse_pct,
-                    expected_horizon_days=candidate.expected_horizon_days,
-                    outcome_label=candidate.outcome_label,
-                    reverse_breach_day=candidate.reverse_breach_day,
-                    provenance=prov,
-                    diagnostics=dict(candidate.diagnostics),
-                    notes=list(candidate.notes),
-                )
-            )
+            enriched.append(SignalCandidate(symbol=candidate.symbol, ticker_id=candidate.ticker_id, market=candidate.market, side_bias=candidate.side_bias, signal_strength=candidate.signal_strength, confidence=candidate.confidence, anchor_date=candidate.anchor_date, reference_date=candidate.reference_date, current_price=candidate.current_price, atr_pct=candidate.atr_pct, target_return_pct=candidate.target_return_pct, max_reverse_pct=candidate.max_reverse_pct, expected_horizon_days=candidate.expected_horizon_days, outcome_label=candidate.outcome_label, reverse_breach_day=candidate.reverse_breach_day, provenance=prov, diagnostics=dict(candidate.diagnostics), notes=list(candidate.notes)))
         return enriched
 
     def _resolve_snapshot_ts(self, bars_by_symbol: Dict[str, List[HistoricalBar]]) -> datetime:
@@ -110,25 +64,19 @@ class LocalPostgresLoader:
         if not timestamps:
             return datetime.utcnow()
         raw = max(timestamps)
-        if isinstance(raw, datetime):
-            return raw
-        return datetime.fromisoformat(str(raw))
+        return raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
 
     def _load_macro_payload(self, *, as_of: str) -> Dict[str, float]:
-        sql = text(
-            f"""
+        sql = text(f"""
             SELECT latest.name, latest.value
             FROM (
-                SELECT s.name,
-                       v.value,
-                       ROW_NUMBER() OVER (PARTITION BY v.series_id ORDER BY v.obs_date DESC, v.id DESC) AS rn
+                SELECT s.name, v.value, ROW_NUMBER() OVER (PARTITION BY v.series_id ORDER BY v.obs_date DESC, v.id DESC) AS rn
                   FROM {self.schema}.macro_data_series_value v
                   JOIN {self.schema}.macro_data_series s ON s.id = v.series_id
                  WHERE v.obs_date <= CAST(:as_of AS date)
             ) latest
             WHERE latest.rn = 1
-            """
-        )
+            """)
         try:
             with self.session_factory() as session:
                 rows = [dict(r._mapping) for r in session.execute(sql, {"as_of": as_of})]
@@ -137,15 +85,13 @@ class LocalPostgresLoader:
             return {}
 
     def _load_macro_history(self, *, start_date: str, end_date: str, prewarm_days: int = 0) -> Dict[str, Dict[str, float]]:
-        sql = text(
-            f"""
+        sql = text(f"""
             SELECT v.obs_date, s.name, v.value
               FROM {self.schema}.macro_data_series_value v
               JOIN {self.schema}.macro_data_series s ON s.id = v.series_id
              WHERE v.obs_date BETWEEN CAST(:prewarm_start AS date) AND CAST(:end_date AS date)
              ORDER BY v.obs_date, s.name
-            """
-        )
+            """)
         by_date: Dict[str, Dict[str, float]] = {}
         last_seen: Dict[str, float] = {}
         try:
@@ -154,8 +100,7 @@ class LocalPostgresLoader:
                 rows = [dict(r._mapping) for r in session.execute(sql, {"prewarm_start": prewarm_start, "end_date": end_date})]
             for row in rows:
                 d = str(row["obs_date"])
-                if d not in by_date:
-                    by_date[d] = dict(last_seen)
+                by_date.setdefault(d, dict(last_seen))
                 if row.get("value") is not None:
                     last_seen[str(row["name"])] = float(row["value"])
                     by_date[d][str(row["name"])] = float(row["value"])
@@ -163,10 +108,9 @@ class LocalPostgresLoader:
             end = datetime.fromisoformat(end_date)
             while cursor <= end:
                 d = cursor.date().isoformat()
-                by_date.setdefault(d, dict(last_seen if d in by_date else last_seen))
-                if d in by_date:
-                    last_seen = dict(by_date[d])
-                cursor = cursor + timedelta(days=1)
+                by_date.setdefault(d, dict(last_seen))
+                last_seen = dict(by_date[d])
+                cursor += timedelta(days=1)
             return by_date
         except Exception:
             return {}
@@ -205,29 +149,7 @@ class LocalPostgresLoader:
         if not rows:
             raise ValueError(f"No bt_event_window rows found for scenario_id={scenario_id}")
         snapshot_ts = rows[0]["event_time"]
-        candidates = [
-            SignalCandidate(
-                symbol=row["symbol"],
-                ticker_id=row["ticker_id"],
-                market=MarketCode(row["market"]),
-                side_bias=Side(row["side_bias"]),
-                signal_strength=float(row["signal_strength"]),
-                confidence=float(row["confidence"]) if row["confidence"] is not None else None,
-                anchor_date=row["anchor_date"],
-                reference_date=row["reference_date"],
-                current_price=float(row["current_price"]) if row["current_price"] is not None else None,
-                atr_pct=float(row["atr_pct"]) if row["atr_pct"] is not None else None,
-                target_return_pct=float(row["target_return_pct"]) if row["target_return_pct"] is not None else None,
-                max_reverse_pct=float(row["max_reverse_pct"]) if row["max_reverse_pct"] is not None else None,
-                expected_horizon_days=row["expected_horizon_days"],
-                reverse_breach_day=row["reverse_breach_day"],
-                outcome_label=OutcomeLabel(row["outcome_label"]) if row.get("outcome_label") else OutcomeLabel.UNKNOWN,
-                provenance=dict(row.get("provenance") or {}),
-                diagnostics=dict(row.get("diagnostics") or {}),
-                notes=list(row.get("notes") or []),
-            )
-            for row in rows
-        ]
+        candidates = [SignalCandidate(symbol=row["symbol"], ticker_id=row["ticker_id"], market=MarketCode(row["market"]), side_bias=Side(row["side_bias"]), signal_strength=float(row["signal_strength"]), confidence=float(row["confidence"]) if row["confidence"] is not None else None, anchor_date=row["anchor_date"], reference_date=row["reference_date"], current_price=float(row["current_price"]) if row["current_price"] is not None else None, atr_pct=float(row["atr_pct"]) if row["atr_pct"] is not None else None, target_return_pct=float(row["target_return_pct"]) if row["target_return_pct"] is not None else None, max_reverse_pct=float(row["max_reverse_pct"]) if row["max_reverse_pct"] is not None else None, expected_horizon_days=row["expected_horizon_days"], reverse_breach_day=row["reverse_breach_day"], outcome_label=OutcomeLabel(row["outcome_label"]) if row.get("outcome_label") else OutcomeLabel.UNKNOWN, provenance=dict(row.get("provenance") or {}), diagnostics=dict(row.get("diagnostics") or {}), notes=list(row.get("notes") or [])) for row in rows]
         return candidates, snapshot_ts
 
     def _load_bars(self, *, start_date: str, end_date: str, symbols: List[str], warmup_days: int = 0) -> Dict[str, List[HistoricalBar]]:

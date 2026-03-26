@@ -32,12 +32,20 @@ def test_generate_similarity_candidates_rolling_builds_panel_without_future_libr
     assert diagnostics["throughput"]["n_decision_dates"] >= 1
     assert diagnostics["signal_panel_jsonl"]
     assert diagnostics["cache_keys"]["library_cache_keys"]
+    assert diagnostics["event_records"]
+    populated_batches = [batch["records"] for batch in diagnostics["event_records"] if batch["records"]]
+    assert populated_batches
+    first_batch = populated_batches[0]
+    assert "BUY" in first_batch[0]["side_outcomes"]
+    assert "SELL" in first_batch[0]["side_outcomes"]
     for row in diagnostics["signal_panel"]:
         assert row["query"]["decision_convention"] == DECISION_CONVENTION
         assert row["query"]["feature_window_bars"] >= 60
         assert row["query"]["feature_coverage_bars"] >= 60
         assert row["query"]["insufficient_history"] is False
         assert row["library"]["max_outcome_end_before_decision"] is None or row["library"]["max_outcome_end_before_decision"] < row["decision_date"]
+        if row["library"]["max_outcome_end_before_decision"] is not None:
+            assert row["library"]["event_record_count"] >= 1
         for side in ("long", "short"):
             for match in row["top_matches"][side]:
                 assert "prototype_id" in match

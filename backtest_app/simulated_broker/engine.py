@@ -40,6 +40,8 @@ class SimulatedBroker:
 
     def simulate_plan(self, plan: OrderPlan, bars: Iterable[HistoricalBar]) -> List[FillOutcome]:
         bars = list(bars)
+        quote_policy = dict((plan.metadata or {}).get("quote_policy") or {}) if isinstance(plan.metadata, dict) else {}
+        fill_proxy = float(quote_policy.get("fill_probability_proxy", quote_policy.get("optimizer_best", {}).get("fill_probability", 0.0)) or 0.0)
         if not bars:
             return [
                 FillOutcome(
@@ -93,6 +95,7 @@ class SimulatedBroker:
                             "fill_reason": reason,
                             "fee_bps": self.rules.fee_bps,
                             "session_cutoff_mode": self.rules.session_cutoff_mode,
+                            "fill_probability_proxy": fill_proxy,
                         },
                     )
                 )
