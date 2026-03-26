@@ -31,6 +31,7 @@ def test_multiscale_feature_vector_exposes_shape_ctx_and_metadata():
     assert len(fv.embedding) == len(fv.shape_vector) + len(fv.ctx_vector)
     for key in ("ret_1", "ret_3", "ret_5", "ret_10", "ret_20", "ret_60", "realized_vol_20", "atr_pct_14", "drawdown_20", "relative_volume", "adv_percentile"):
         assert key in fv.shape_features
+    assert abs(float(fv.shape_features["ret_60"])) > 0.0
     for key in ("mkt_rel_ret_1", "sector_rel_ret_1", "beta_residual_20", "vol_normalized_residual_20"):
         assert key in fv.residual_features
     for key in ("vix_level", "vix_change", "vix_zscore", "breadth_level"):

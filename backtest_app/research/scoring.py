@@ -88,6 +88,18 @@ class CalibrationModel:
         return float(ev * max(0.0, min(1.5, self.slope)) + self.intercept * 0.01)
 
 
+@dataclass(frozen=True)
+class CalibrationFoldArtifact:
+    fold_id: str
+    train_indices: list[int]
+    test_indices: list[int]
+    model: CalibrationModel
+    train_size: int
+    test_size: int
+    raw_mean: float
+    calibrated_mean: float
+
+
 def fit_calibration(*, scores: list[float], targets: list[int], method: str = "logistic") -> CalibrationModel:
     if not scores or not targets or len(scores) != len(targets):
         return CalibrationModel(method="identity")
@@ -100,6 +112,35 @@ def fit_calibration(*, scores: list[float], targets: list[int], method: str = "l
     slope = 1.0 if var <= 1e-12 else max(0.1, min(10.0, cov / var * 10.0))
     intercept = float(np.log(max(1e-6, y_mean) / max(1e-6, 1.0 - y_mean))) - slope * x_mean
     return CalibrationModel(method=method, slope=slope, intercept=intercept)
+
+
+def fit_calibration_on_fold(*, fold_id: str, raw_scores: list[float], targets: list[int], train_indices: list[int], test_indices: list[int], method: str = "logistic") -> CalibrationFoldArtifact:
+    train_scores = [raw_scores[i] for i in train_indices if i < len(raw_scores)]
+    train_targets = [targets[i] for i in train_indices if i < len(targets)]
+    model = fit_calibration(scores=train_scores, targets=train_targets, method=method)
+    calibrated_test = [model.calibrate_ev(raw_scores[i]) for i in test_indices if i < len(raw_scores)]
+    raw_test = [raw_scores[i] for i in test_indices if i < len(raw_scores)]
+    return CalibrationFoldArtifact(
+        fold_id=fold_id,
+        train_indices=list(train_indices),
+        test_indices=list(test_indices),
+        model=model,
+        train_size=len(train_scores),
+        test_size=len(raw_test),
+        raw_mean=float(np.mean(raw_test)) if raw_test else 0.0,
+        calibrated_mean=float(np.mean(calibrated_test)) if calibrated_test else 0.0,
+    )
+
+
+def apply_calibration_to_test(*, raw_scores: list[float], raw_probs: list[float], fold: CalibrationFoldArtifact) -> dict:
+    calibrated_scores = []
+    calibrated_probs = []
+    for i in fold.test_indices:
+        if i >= len(raw_scores) or i >= len(raw_probs):
+            continue
+        calibrated_scores.append({"index": i, "raw_ev": raw_scores[i], "calibrated_ev": fold.model.calibrate_ev(raw_scores[i])})
+        calibrated_probs.append({"index": i, "raw_prob": raw_probs[i], "calibrated_prob": fold.model.calibrate_prob(raw_probs[i])})
+    return {"fold_id": fold.fold_id, "calibrated_scores": calibrated_scores, "calibrated_probs": calibrated_probs, "artifact": {"method": fold.model.method, "slope": fold.model.slope, "intercept": fold.model.intercept, "train_size": fold.train_size, "test_size": fold.test_size, "raw_mean": fold.raw_mean, "calibrated_mean": fold.calibrated_mean}}
 
 
 def _cos(a: list[float], b: list[float]) -> float:
@@ -122,7 +163,6 @@ def _ranked_candidates(*, query_embedding: list[float], candidates: Iterable[Pro
 def score_candidates_exact(*, query_embedding: list[float], candidates: Iterable[PrototypeAnchor], regime_code: Optional[str], sector_code: Optional[str], min_liquidity_score: float = 0.0, config: ScoringConfig | None = None, candidate_index: CandidateIndex | None = None) -> List[CandidateScore]:
     cfg = config or ScoringConfig(min_liquidity_score=min_liquidity_score)
     ranked_candidates = _ranked_candidates(query_embedding=query_embedding, candidates=candidates, candidate_index=candidate_index)
-
     out: List[CandidateScore] = []
     for candidate in ranked_candidates:
         liquidity = float(candidate.liquidity_score or 0.0)
@@ -150,7 +190,7 @@ def score_candidates_exact(*, query_embedding: list[float], candidates: Iterable
             + cfg.win_rate_weight * win_rate
             - cfg.uncertainty_penalty_weight * uncertainty
         )
-        out.append(CandidateScore(prototype_id=candidate.prototype_id, anchor_code=candidate.anchor_code, score=float(score), similarity=float(similarity), anchor_quality=float(candidate.anchor_quality), regime_match=regime_match, sector_match=sector_match, liquidity_score=liquidity, diagnostics={"member_count": candidate.member_count, "support_count": candidate.support_count, "decayed_support": candidate.decayed_support, "mean_return_pct": candidate.mean_return_pct, "win_rate": candidate.win_rate, "uncertainty": candidate.uncertainty, "representative_symbol": candidate.representative_symbol, "regime_bucket": candidate.regime_bucket, "sector_bucket": candidate.sector_bucket, "liquidity_bucket": candidate.liquidity_bucket}))
+        out.append(CandidateScore(prototype_id=candidate.prototype_id, anchor_code=candidate.anchor_code, score=float(score), similarity=float(similarity), anchor_quality=float(candidate.anchor_quality), regime_match=regime_match, sector_match=sector_match, liquidity_score=liquidity, diagnostics={"member_count": candidate.member_count, "support_count": candidate.support_count, "decayed_support": candidate.decayed_support, "mean_return_pct": candidate.mean_return_pct, "win_rate": candidate.win_rate, "uncertainty": candidate.uncertainty}))
     out.sort(key=lambda x: x.score, reverse=True)
     return out
 
@@ -175,7 +215,7 @@ def estimate_expected_value(*, side: str, query_embedding: list[float], candidat
     rows = rows[: cfg.top_k]
     total_w = sum(r["weight"] for r in rows)
     if total_w <= 1e-12:
-        return EVEstimate(side=side, expected_utility=0.0, expected_net_return=0.0, p_up_first=0.0, p_down_first=0.0, expected_mae=0.0, expected_mfe=0.0, uncertainty=1.0, dispersion=1.0, effective_sample_size=0.0, regime_alignment=0.0, calibrated_ev=0.0, calibrated_win_prob=0.0, abstained=True, abstain_reasons=["no_neighbors"], top_matches=[], diagnostics={"ev_decomposition": {}})
+        return EVEstimate(side=side, expected_utility=0.0, expected_net_return=0.0, p_up_first=0.0, p_down_first=0.0, expected_mae=0.0, expected_mfe=0.0, uncertainty=1.0, dispersion=1.0, effective_sample_size=0.0, regime_alignment=0.0, calibrated_ev=0.0, calibrated_win_prob=0.0, abstained=True, abstain_reasons=["no_neighbors"], top_matches=[], diagnostics={"ev_decomposition": {}, "calibration": {"method": calibration.method, "slope": calibration.slope, "intercept": calibration.intercept}, "raw_ev": 0.0})
     weights = np.asarray([r["weight"] / total_w for r in rows], dtype=float)
     n_eff = float(1.0 / np.sum(weights ** 2))
     p_up = float(sum(w * r["p_up"] for w, r in zip(weights, rows)))
@@ -198,5 +238,5 @@ def estimate_expected_value(*, side: str, query_embedding: list[float], candidat
         reasons.append("low_neff")
     if regime_alignment < cfg.min_regime_alignment:
         reasons.append("regime_mismatch")
-    top_matches = [{"prototype_id": r["candidate"].prototype_id, "weight": r["weight"], "similarity": r["similarity"], "support_count": r["candidate"].support_count, "decayed_support": r["candidate"].decayed_support, "freshness_days": r["candidate"].freshness_days, "mean_return_pct": r["candidate"].mean_return_pct, "uncertainty": r["candidate"].uncertainty} for r in rows]
-    return EVEstimate(side=side, expected_utility=raw_ev, expected_net_return=exp_ret, p_up_first=p_up if side == "BUY" else p_down, p_down_first=p_down if side == "BUY" else p_up, expected_mae=exp_mae, expected_mfe=exp_mfe, uncertainty=uncertainty, dispersion=dispersion, effective_sample_size=n_eff, regime_alignment=regime_alignment, calibrated_ev=calibrated_ev, calibrated_win_prob=calibrated_prob, abstained=bool(reasons), abstain_reasons=reasons, top_matches=top_matches, diagnostics={"ev_decomposition": {"expected_net_return": exp_ret, "mae_penalty": 0.5 * exp_mae, "mfe_credit": 0.25 * exp_mfe, "uncertainty_penalty": uncertainty}, "calibration": {"method": calibration.method, "slope": calibration.slope, "intercept": calibration.intercept}})
+    top_matches = [{"prototype_id": r["candidate"].prototype_id, "weight": r["weight"], "similarity": r["similarity"], "support_count": r["candidate"].support_count, "mean_return_pct": r["candidate"].mean_return_pct, "uncertainty": r["candidate"].uncertainty} for r in rows]
+    return EVEstimate(side=side, expected_utility=raw_ev, expected_net_return=exp_ret, p_up_first=p_up if side == "BUY" else p_down, p_down_first=p_down if side == "BUY" else p_up, expected_mae=exp_mae, expected_mfe=exp_mfe, uncertainty=uncertainty, dispersion=dispersion, effective_sample_size=n_eff, regime_alignment=regime_alignment, calibrated_ev=calibrated_ev, calibrated_win_prob=calibrated_prob, abstained=bool(reasons), abstain_reasons=reasons, top_matches=top_matches, diagnostics={"ev_decomposition": {"expected_net_return": exp_ret, "mae_penalty": 0.5 * exp_mae, "mfe_credit": 0.25 * exp_mfe, "uncertainty_penalty": uncertainty}, "calibration": {"method": calibration.method, "slope": calibration.slope, "intercept": calibration.intercept}, "raw_ev": raw_ev, "ev_lift": calibrated_ev - raw_ev})

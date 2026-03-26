@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+
+FEATURE_WINDOW_BARS = 60
+WARMUP_DAYS = 120
 from typing import Dict, Iterable, List
 
 from sqlalchemy import text
@@ -37,7 +40,7 @@ class LocalPostgresLoader:
         symbols = [s for s in symbols if s]
         if not symbols:
             raise ValueError("symbols required")
-        bars_by_symbol = self._load_bars(start_date=start_date, end_date=end_date, symbols=symbols)
+        bars_by_symbol = self._load_bars(start_date=start_date, end_date=end_date, symbols=symbols, warmup_days=WARMUP_DAYS)
         sector_map = self._load_sector_map(symbols)
         features_by_symbol: Dict[str, Dict[str, float]] = {symbol: compute_bar_features(bars) for symbol, bars in bars_by_symbol.items()}
 
@@ -50,8 +53,8 @@ class LocalPostgresLoader:
             return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "diagnostics": research_diag})
 
         if strategy_mode == "research_similarity_v2":
-            macro_history = self._load_macro_history(start_date=start_date, end_date=end_date)
-            candidates, research_diag = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market=market, macro_history_by_date=macro_history, sector_map=sector_map)
+            macro_history = self._load_macro_history(start_date=start_date, end_date=end_date, prewarm_days=WARMUP_DAYS)
+            candidates, research_diag = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market=market, macro_history_by_date=macro_history, sector_map=sector_map, feature_window_bars=FEATURE_WINDOW_BARS)
             snapshot_ts = self._resolve_snapshot_ts(bars_by_symbol)
             enriched = self._enrich_candidates(candidates, features_by_symbol)
             snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False)
@@ -133,21 +136,22 @@ class LocalPostgresLoader:
         except Exception:
             return {}
 
-    def _load_macro_history(self, *, start_date: str, end_date: str) -> Dict[str, Dict[str, float]]:
+    def _load_macro_history(self, *, start_date: str, end_date: str, prewarm_days: int = 0) -> Dict[str, Dict[str, float]]:
         sql = text(
             f"""
             SELECT v.obs_date, s.name, v.value
               FROM {self.schema}.macro_data_series_value v
               JOIN {self.schema}.macro_data_series s ON s.id = v.series_id
-             WHERE v.obs_date BETWEEN CAST(:start_date AS date) AND CAST(:end_date AS date)
+             WHERE v.obs_date BETWEEN CAST(:prewarm_start AS date) AND CAST(:end_date AS date)
              ORDER BY v.obs_date, s.name
             """
         )
         by_date: Dict[str, Dict[str, float]] = {}
         last_seen: Dict[str, float] = {}
         try:
+            prewarm_start = (datetime.fromisoformat(start_date) - timedelta(days=prewarm_days)).date().isoformat()
             with self.session_factory() as session:
-                rows = [dict(r._mapping) for r in session.execute(sql, {"start_date": start_date, "end_date": end_date})]
+                rows = [dict(r._mapping) for r in session.execute(sql, {"prewarm_start": prewarm_start, "end_date": end_date})]
             for row in rows:
                 d = str(row["obs_date"])
                 if d not in by_date:
@@ -226,17 +230,18 @@ class LocalPostgresLoader:
         ]
         return candidates, snapshot_ts
 
-    def _load_bars(self, *, start_date: str, end_date: str, symbols: List[str]) -> Dict[str, List[HistoricalBar]]:
+    def _load_bars(self, *, start_date: str, end_date: str, symbols: List[str], warmup_days: int = 0) -> Dict[str, List[HistoricalBar]]:
         sql = text(f"""
         SELECT symbol, trade_date, open, high, low, close, volume
           FROM {self.schema}.bt_mirror_ohlcv_daily
          WHERE symbol = ANY(:symbols)
-           AND trade_date BETWEEN CAST(:start_date AS date) AND CAST(:end_date AS date)
+           AND trade_date BETWEEN CAST(:warmup_start AS date) AND CAST(:end_date AS date)
          ORDER BY symbol, trade_date
         """)
         out: Dict[str, List[HistoricalBar]] = {symbol: [] for symbol in symbols}
+        warmup_start = (datetime.fromisoformat(start_date) - timedelta(days=warmup_days)).date().isoformat()
         with self.session_factory() as session:
-            for row in session.execute(sql, {"symbols": symbols, "start_date": start_date, "end_date": end_date}):
+            for row in session.execute(sql, {"symbols": symbols, "warmup_start": warmup_start, "end_date": end_date}):
                 m = row._mapping
                 out[m["symbol"]].append(HistoricalBar(symbol=m["symbol"], timestamp=str(m["trade_date"]), open=float(m["open"]), high=float(m["high"]), low=float(m["low"]), close=float(m["close"]), volume=float(m["volume"] or 0)))
         return out

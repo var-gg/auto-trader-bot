@@ -1,16 +1,25 @@
 from datetime import datetime
 
 from backtest_app.historical_data.models import HistoricalBar, HistoricalSlice
-from backtest_app.research.pipeline import generate_similarity_candidates_rolling
+from backtest_app.research.pipeline import DECISION_CONVENTION, generate_similarity_candidates_rolling
 from backtest_app.runner import cli
 from shared.domain.models import MarketCode, MarketSnapshot
 
 
 def _bars(symbol: str):
-    return [
-        HistoricalBar(symbol=symbol, timestamp=f"2026-01-{i:02d}", open=100 + i, high=102 + i, low=99 + i, close=101 + i, volume=1000000 + i * 1000)
-        for i in range(1, 15)
-    ]
+    rows = []
+    price = 100.0
+    from datetime import date, timedelta
+    start = date(2025, 10, 1)
+    for i in range(84):
+        d = start + timedelta(days=i)
+        open_ = price
+        close = price * 1.002
+        high = close * 1.01
+        low = open_ * 0.99
+        rows.append(HistoricalBar(symbol=symbol, timestamp=d.isoformat(), open=open_, high=high, low=low, close=close, volume=1000000 + (i + 1) * 1000))
+        price = close
+    return rows
 
 
 def test_generate_similarity_candidates_rolling_builds_panel_without_future_library_leakage():
@@ -19,13 +28,32 @@ def test_generate_similarity_candidates_rolling_builds_panel_without_future_libr
     candidates, diagnostics = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market="US", macro_history_by_date=macro_history, abstain_margin=0.0)
     assert isinstance(candidates, list)
     assert diagnostics["signal_panel"]
-    first = diagnostics["signal_panel"][0]
-    assert first["library"]["anchor_count"] >= 0
+    assert diagnostics["throughput"]["n_symbols"] == 2
+    assert diagnostics["throughput"]["n_decision_dates"] >= 1
+    assert diagnostics["signal_panel_jsonl"]
+    assert diagnostics["cache_keys"]["library_cache_keys"]
     for row in diagnostics["signal_panel"]:
+        assert row["query"]["decision_convention"] == DECISION_CONVENTION
+        assert row["query"]["feature_window_bars"] >= 60
+        assert row["query"]["feature_coverage_bars"] >= 60
+        assert row["query"]["insufficient_history"] is False
+        assert row["library"]["max_outcome_end_before_decision"] is None or row["library"]["max_outcome_end_before_decision"] < row["decision_date"]
         for side in ("long", "short"):
             for match in row["top_matches"][side]:
                 assert "prototype_id" in match
                 assert "weight" in match
+
+
+def test_generate_similarity_candidates_rolling_uses_next_open_as_current_price():
+    bars_by_symbol = {"AAPL": _bars("AAPL"), "MSFT": _bars("MSFT")}
+    macro_history = {f"2026-01-{i:02d}": {"growth": 0.0} for i in range(1, 15)}
+    candidates, diagnostics = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market="US", macro_history_by_date=macro_history, abstain_margin=0.0)
+    if candidates:
+        c = candidates[0]
+        decision_date = c.provenance["decision_date"]
+        bars = bars_by_symbol[c.symbol]
+        idx = next(i for i, b in enumerate(bars) if str(b.timestamp)[:10] == decision_date)
+        assert c.current_price == bars[idx + 1].open
 
 
 class FakeRollingLoader:

@@ -5,6 +5,8 @@ from typing import Dict, List, Sequence
 
 from shared.domain.models import SignalCandidate, Side
 
+from backtest_app.quote_policy import quote_policy_v1, signal_to_policy_input
+
 
 @dataclass(frozen=True)
 class PortfolioConfig:
@@ -78,10 +80,13 @@ def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_
         confidence_scale = max(0.1, min(1.5, float(cand.confidence or 0.0)))
         uncertainty_scale = max(0.1, 1.0 - uncertainty)
         raw_size = cfg.base_risk_unit * volatility_scale * confidence_scale * uncertainty_scale
-        size_multiplier = max(0.0, min(2.0, raw_size / 50.0))
+        policy = quote_policy_v1(signal_to_policy_input(cand))
+        size_multiplier = max(0.0, min(2.0, policy.size_multiplier if not policy.no_trade else 0.0))
         requested_budget = risk_budget_total / max(cfg.top_n, 1) * size_multiplier
         kill_reason = None
-        if ev < cfg.min_ev_threshold:
+        if policy.no_trade:
+            kill_reason = "quote_policy_no_trade"
+        elif ev < cfg.min_ev_threshold:
             kill_reason = "below_ev_threshold"
         elif sector_counts.get(sector, 0) >= cfg.max_sector_positions:
             kill_reason = "sector_cap"
@@ -109,8 +114,10 @@ def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_
                 "volatility_scale": volatility_scale,
                 "confidence_scale": confidence_scale,
                 "uncertainty_scale": uncertainty_scale,
+                "raw_size": raw_size,
                 "size_multiplier": size_multiplier,
                 "requested_budget": requested_budget,
+                "quote_policy": policy.diagnostics | {"policy_name": policy.policy_name, "buy_gap": policy.buy_gap, "sell_gap": policy.sell_gap, "size_multiplier": policy.size_multiplier, "no_trade": policy.no_trade},
             },
         )
         selected.append(decision)

@@ -96,20 +96,20 @@ def temp_backtest_db():
             );
             """
         )
-        conn.execute(text("""
-            INSERT INTO trading.bt_mirror_ohlcv_daily(ticker_id, symbol, trade_date, open, high, low, close, volume)
-            VALUES
-              (1, 'AAPL', '2026-01-01', 100, 104, 99, 103, 1000000),
-              (1, 'AAPL', '2026-01-02', 103, 105, 101, 104, 1100000),
-              (1, 'AAPL', '2026-01-03', 104, 106, 102, 105, 1200000),
-              (1, 'AAPL', '2026-01-04', 105, 107, 103, 106, 1300000),
-              (1, 'AAPL', '2026-01-05', 106, 108, 104, 107, 1250000),
-              (1, 'AAPL', '2026-01-06', 107, 109, 105, 108, 1280000),
-              (1, 'AAPL', '2026-01-07', 108, 111, 107, 110, 1400000),
-              (1, 'AAPL', '2026-01-08', 110, 112, 109, 111, 1410000),
-              (1, 'AAPL', '2026-01-09', 111, 114, 110, 113, 1500000),
-              (1, 'AAPL', '2026-01-10', 113, 116, 112, 115, 1550000);
-        """))
+        values = []
+        price = 100.0
+        from datetime import date, timedelta
+        start = date(2025, 11, 1)
+        for i in range(90):
+            d = start + timedelta(days=i)
+            open_ = price
+            close = price * 1.002
+            high = close * 1.01
+            low = open_ * 0.99
+            volume = 1000000 + (i + 1) * 1000
+            values.append(f"(1, 'AAPL', '{d.isoformat()}', {open_:.6f}, {high:.6f}, {low:.6f}, {close:.6f}, {int(volume)})")
+            price = close
+        conn.execute(text("INSERT INTO trading.bt_mirror_ohlcv_daily(ticker_id, symbol, trade_date, open, high, low, close, volume) VALUES " + ",\n".join(values)))
         conn.execute(text("""
             INSERT INTO trading.bt_event_window(
                 scenario_id, market, symbol, ticker_id, event_time, anchor_date, reference_date,
@@ -191,3 +191,8 @@ def test_research_similarity_v2_actual_loader_and_runner(temp_backtest_db, monke
     assert result["strategy_mode"] == "research_similarity_v2"
     assert isinstance(result["artifacts"]["signal_panel"], list)
     assert result["diagnostics"].get("signal_panel") is not None
+    if result["artifacts"]["signal_panel"]:
+        row = result["artifacts"]["signal_panel"][0]
+        assert row["query"]["feature_window_bars"] >= 60
+        assert row["query"]["feature_coverage_bars"] >= 60
+        assert row["query"]["insufficient_history"] is False

@@ -20,7 +20,7 @@ def _cand(symbol, side, ev, conf, atr, sector, regime="RISK_ON"):
         max_reverse_pct=0.03,
         expected_horizon_days=5,
         outcome_label=OutcomeLabel.UNKNOWN,
-        diagnostics={"query": {"sector_code": sector, "regime_code": regime}, "ev": {"long": {"calibrated_ev": ev, "uncertainty": 0.02, "abstain_reasons": []}, "short": {"calibrated_ev": ev, "uncertainty": 0.02, "abstain_reasons": []}}},
+        diagnostics={"query": {"sector_code": sector, "regime_code": regime}, "ev": {"long": {"calibrated_ev": ev, "expected_mae": 0.01, "expected_mfe": 0.03, "uncertainty": 0.02, "effective_sample_size": 3.0, "abstain_reasons": []}, "short": {"calibrated_ev": ev, "expected_mae": 0.01, "expected_mfe": 0.03, "uncertainty": 0.02, "effective_sample_size": 3.0, "abstain_reasons": []}}},
     )
 
 
@@ -35,4 +35,5 @@ def test_portfolio_layer_selects_top_ev_with_caps_and_sizing():
     selected = [d for d in decisions if d.selected]
     assert len(selected) == 2
     assert selected[0].requested_budget > 0
+    assert "quote_policy" in selected[0].diagnostics
     assert any(d.kill_reason == "sector_cap" for d in decisions if not d.selected)

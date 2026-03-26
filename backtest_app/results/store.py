@@ -18,7 +18,7 @@ from shared.domain.models import FillOutcome, FillStatus, OrderPlan
 class JsonResultStore:
     output_dir: str
 
-    def save_run(self, *, run_id: str, plans: Iterable[OrderPlan], fills: Iterable[FillOutcome], summary: Mapping[str, object]) -> str:
+    def save_run(self, *, run_id: str, plans: Iterable[OrderPlan], fills: Iterable[FillOutcome], summary: Mapping[str, object], diagnostics: Mapping[str, object] | None = None) -> str:
         out_dir = Path(self.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{run_id}.json"
@@ -27,6 +27,7 @@ class JsonResultStore:
             "plans": [p.to_dict() for p in plans],
             "fills": [f.to_dict() for f in fills],
             "summary": dict(summary),
+            "diagnostics": dict(diagnostics or {}),
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return str(path)

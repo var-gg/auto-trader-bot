@@ -5,6 +5,7 @@ from typing import Dict, Iterable, List
 
 from shared.domain.models import FillOutcome, FillStatus, OrderPlan
 
+from backtest_app.historical_data.models import HistoricalBar
 from backtest_app.validation import compute_performance_metrics
 
 
@@ -19,10 +20,10 @@ class BacktestSummary:
     metadata: Dict[str, object] = field(default_factory=dict)
 
 
-def build_summary(*, scenario_id: str, plans: Iterable[OrderPlan], fills: Iterable[FillOutcome]) -> BacktestSummary:
+def build_summary(*, scenario_id: str, plans: Iterable[OrderPlan], fills: Iterable[FillOutcome], bars_by_symbol: Dict[str, List[HistoricalBar]] | None = None) -> BacktestSummary:
     plans = list(plans)
     fills = list(fills)
-    perf = compute_performance_metrics(plans=plans, fills=fills, total_symbols=len({plan.symbol for plan in plans}) or len(plans) or 1)
+    perf = compute_performance_metrics(plans=plans, fills=fills, bars_by_symbol=bars_by_symbol, total_symbols=len({plan.symbol for plan in plans}) or len(plans) or 1)
     return BacktestSummary(
         scenario_id=scenario_id,
         total_plans=len(plans),
@@ -30,5 +31,5 @@ def build_summary(*, scenario_id: str, plans: Iterable[OrderPlan], fills: Iterab
         filled_legs=sum(1 for fill in fills if fill.fill_status == FillStatus.FULL),
         unfilled_legs=sum(1 for fill in fills if fill.fill_status != FillStatus.FULL),
         symbols=sorted({plan.symbol for plan in plans}),
-        metadata={"report": "validation", **perf},
+        metadata={"report": "validation", **perf, "raw_vs_calibrated_ev_lift": perf.get("raw_vs_calibrated_ev_lift", {})},
     )

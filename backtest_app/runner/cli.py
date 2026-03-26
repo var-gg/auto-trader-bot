@@ -10,6 +10,7 @@ from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest
 from backtest_app.historical_data.loader import JsonHistoricalDataLoader
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
 from backtest_app.portfolio import PortfolioConfig, build_portfolio_decisions
+from backtest_app.quote_policy import QuotePolicyConfig, compare_policy_ab, quote_policy_v1, signal_to_policy_input
 from backtest_app.reporting.summary import build_summary
 from backtest_app.results.store import JsonResultStore, SqlResultStore
 from backtest_app.simulated_broker.engine import SimulatedBroker
@@ -73,6 +74,14 @@ def run_backtest(
     }
 
     portfolio_cfg = PortfolioConfig()
+    quote_policy_cfg = QuotePolicyConfig(
+        ev_threshold=float(request.config.metadata.get("quote_ev_threshold", 0.005)),
+        buy_gap_ev_coef=float(request.config.metadata.get("quote_buy_gap_ev_coef", 0.35)),
+        buy_gap_mae_coef=float(request.config.metadata.get("quote_buy_gap_mae_coef", 0.80)),
+        sell_gap_ev_coef=float(request.config.metadata.get("quote_sell_gap_ev_coef", 0.35)),
+        sell_gap_mfe_coef=float(request.config.metadata.get("quote_sell_gap_mfe_coef", 0.30)),
+        uncertainty_cap=float(request.config.metadata.get("quote_uncertainty_cap", 0.12)),
+    )
     portfolio_decisions = build_portfolio_decisions(candidates=historical.candidates, initial_capital=request.config.initial_capital, cfg=portfolio_cfg)
     budget_per_symbol = request.config.initial_capital / max(len(request.scenario.symbols), 1)
     plans = []
@@ -89,6 +98,8 @@ def run_backtest(
         generated_at = historical.market_snapshot.as_of
         if strategy_mode == "research_similarity_v2" and candidate.reference_date:
             generated_at = datetime.fromisoformat(f"{candidate.reference_date}T00:00:00")
+        policy_ab = compare_policy_ab(candidate, quote_policy_cfg)
+        active_policy = policy_ab["quote_policy_v1"]
         plan, skip = build_order_plan_from_candidate(
             candidate,
             generated_at=generated_at,
@@ -98,11 +109,13 @@ def run_backtest(
             budget=max(0.0, budget_per_symbol * decision.size_multiplier),
             venue=ExecutionVenue.BACKTEST,
             rationale_prefix=f"{request.scenario.strategy_id}:{strategy_mode}",
+            quote_policy=active_policy,
         )
         if plan:
+            plan.metadata["quote_policy_ab"] = policy_ab
             plans.append(plan)
         elif skip:
-            skipped.append({"symbol": candidate.symbol, **skip, "strategy_mode": strategy_mode})
+            skipped.append({"symbol": candidate.symbol, **skip, "strategy_mode": strategy_mode, "quote_policy_ab": policy_ab})
 
     broker = SimulatedBroker(
         rules=SimulationRules(
@@ -120,11 +133,17 @@ def run_backtest(
                 bars = [bar for bar in bars if str(bar.timestamp)[:10] >= decision_day]
         fills.extend(broker.simulate_plan(plan, bars))
 
-    summary = build_summary(scenario_id=request.scenario.scenario_id, plans=plans, fills=fills)
+    summary = build_summary(scenario_id=request.scenario.scenario_id, plans=plans, fills=fills, bars_by_symbol=historical.bars_by_symbol)
     historical_metadata = getattr(historical, "metadata", {}) or {}
     diagnostics = historical_metadata.get("diagnostics", {})
     walk_forward = [s.__dict__ for s in build_walk_forward_splits(n_obs=max(len(historical.candidates), len(request.scenario.symbols), 1), train_size=1, test_size=1, step_size=1, purge=0, embargo=0)]
-    sensitivity = [p.__dict__ for p in sensitivity_sweep(plans=plans, fills=fills, fee_grid=[0.0, request.config.fee_bps, request.config.fee_bps + 5.0], slippage_grid=[0.0, request.config.slippage_bps, request.config.slippage_bps + 5.0], total_symbols=len(request.scenario.symbols))]
+    sensitivity = [p.__dict__ for p in sensitivity_sweep(plans=plans, fills=fills, fee_grid=[0.0, request.config.fee_bps, request.config.fee_bps + 5.0], slippage_grid=[0.0, request.config.slippage_bps, request.config.slippage_bps + 5.0], total_symbols=len(request.scenario.symbols), bars_by_symbol=historical.bars_by_symbol)]
+    quote_policy_sweep = {
+        "ev_threshold": [0.003, quote_policy_cfg.ev_threshold, 0.010],
+        "buy_gap_coefficients": [quote_policy_cfg.buy_gap_ev_coef, quote_policy_cfg.buy_gap_mae_coef],
+        "sell_gap_coefficients": [quote_policy_cfg.sell_gap_ev_coef, quote_policy_cfg.sell_gap_mfe_coef],
+        "uncertainty_caps": [0.08, quote_policy_cfg.uncertainty_cap, 0.16],
+    }
     result = {
         "scenario": request.scenario.scenario_id,
         "strategy_mode": strategy_mode,
@@ -155,6 +174,7 @@ def run_backtest(
         "validation": {
             "walk_forward_splits": walk_forward,
             "sensitivity_sweep": sensitivity,
+            "quote_policy_sweep": quote_policy_sweep,
             "coverage": summary.metadata.get("coverage", 0.0),
             "no_trade_ratio": summary.metadata.get("no_trade_ratio", 0.0),
         },
@@ -197,6 +217,7 @@ def run_backtest(
             plans=plans,
             fills=fills,
             summary={**summary.__dict__, "diagnostics": diagnostics, "strategy_mode": strategy_mode},
+            diagnostics={"quote_policy_sweep": quote_policy_sweep, "portfolio": result["portfolio"], "signal_diagnostics": diagnostics},
         )
         result["result_path"] = result_path
     return result

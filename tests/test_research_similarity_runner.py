@@ -27,8 +27,8 @@ class FakeSimilarityLoader:
 def test_generate_similarity_candidates_abstains_when_margin_is_weak():
     bars_by_symbol = {
         "AAA": [
-            HistoricalBar(symbol="AAA", timestamp=f"2026-01-{i:02d}", open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1000000)
-            for i in range(1, 15)
+            HistoricalBar(symbol="AAA", timestamp=f"2025-10-{((i - 1) % 28) + 1:02d}" if i <= 28 else (f"2025-11-{((i - 29) % 28) + 1:02d}" if i <= 56 else f"2025-12-{((i - 57) % 28) + 1:02d}"), open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1000000)
+            for i in range(1, 85)
         ]
     }
     candidates, diagnostics = generate_similarity_candidates(
