@@ -5,7 +5,7 @@ from typing import Iterable, List, Optional
 
 import numpy as np
 
-from .models import DecisionSurface, DistributionEstimate, PrototypeAnchor
+from .models import DecisionSurface, DistributionEstimate, StatePrototype
 from .repository import CandidateIndex
 
 
@@ -145,34 +145,38 @@ def _cos(a: list[float], b: list[float]) -> float:
     return float(np.dot(av, bv) / (an * bn))
 
 
-def _ranked_candidates(*, query_embedding: list[float], candidates: Iterable[PrototypeAnchor], candidate_index: CandidateIndex | None) -> list[PrototypeAnchor]:
+def _ranked_candidates(*, query_embedding: list[float], candidates: Iterable[StatePrototype], candidate_index: CandidateIndex | None) -> list[StatePrototype]:
     ranked_candidates = list(candidates)
     if candidate_index is not None:
         ranked_candidates = candidate_index.rank(query_embedding=query_embedding, candidates=ranked_candidates)
     return ranked_candidates
 
 
-def score_candidates_exact(*, query_embedding: list[float], candidates: Iterable[PrototypeAnchor], regime_code: Optional[str], sector_code: Optional[str], min_liquidity_score: float = 0.0, config: ScoringConfig | None = None, candidate_index: CandidateIndex | None = None) -> List[CandidateScore]:
+def _side_row(candidate: StatePrototype, side: str) -> dict:
+    return dict((candidate.side_stats or {}).get(side) or {})
+
+
+def score_candidates_exact(*, query_embedding: list[float], candidates: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], min_liquidity_score: float = 0.0, config: ScoringConfig | None = None, candidate_index: CandidateIndex | None = None, side: str = "BUY") -> List[CandidateScore]:
     cfg = config or ScoringConfig(min_liquidity_score=min_liquidity_score)
     ranked_candidates = _ranked_candidates(query_embedding=query_embedding, candidates=candidates, candidate_index=candidate_index)
     out: List[CandidateScore] = []
     for candidate in ranked_candidates:
+        side_stats = _side_row(candidate, side)
         liquidity = float(candidate.liquidity_score or 0.0)
-        if liquidity < cfg.min_liquidity_score:
-            continue
-        if int(candidate.support_count or candidate.member_count or 0) < cfg.min_support_count:
+        support_count = int(side_stats.get("support_count", candidate.support_count or candidate.member_count or 0))
+        if liquidity < cfg.min_liquidity_score or support_count < cfg.min_support_count:
             continue
         sector_match = 1.0 if sector_code and candidate.sector_code == sector_code else 0.0
         if cfg.require_sector_match and sector_code and sector_match <= 0.0:
             continue
         regime_match = 1.0 if regime_code and candidate.regime_code == regime_code else 0.0
         similarity = _cos(query_embedding, candidate.embedding)
-        support_score = min(1.0, float(candidate.decayed_support or candidate.support_count or 0.0) / 5.0)
-        return_score = float(candidate.mean_return_pct or 0.0)
-        win_rate = float(candidate.win_rate or 0.0)
-        uncertainty = float(candidate.uncertainty or 0.0)
+        support_score = min(1.0, float(side_stats.get("decayed_support", candidate.decayed_support or 0.0)) / 5.0)
+        return_score = float(side_stats.get("mean_return_pct", 0.0))
+        win_rate = float(side_stats.get("win_rate", 0.0))
+        uncertainty = float(side_stats.get("uncertainty", 0.0))
         score = cfg.similarity_weight * similarity + cfg.anchor_quality_weight * float(candidate.anchor_quality) + cfg.regime_match_weight * regime_match + cfg.sector_match_weight * sector_match + cfg.liquidity_weight * liquidity + cfg.support_weight * support_score + cfg.return_weight * return_score + cfg.win_rate_weight * win_rate - cfg.uncertainty_penalty_weight * uncertainty
-        out.append(CandidateScore(prototype_id=candidate.prototype_id, anchor_code=candidate.anchor_code, score=float(score), similarity=float(similarity), anchor_quality=float(candidate.anchor_quality), regime_match=regime_match, sector_match=sector_match, liquidity_score=liquidity, diagnostics={"member_count": candidate.member_count, "support_count": candidate.support_count, "decayed_support": candidate.decayed_support, "mean_return_pct": candidate.mean_return_pct, "win_rate": candidate.win_rate, "uncertainty": candidate.uncertainty, "representative_symbol": candidate.representative_symbol, "regime_bucket": candidate.regime_bucket, "sector_bucket": candidate.sector_bucket, "liquidity_bucket": candidate.liquidity_bucket}))
+        out.append(CandidateScore(prototype_id=candidate.prototype_id, anchor_code=candidate.anchor_code, score=float(score), similarity=float(similarity), anchor_quality=float(candidate.anchor_quality), regime_match=regime_match, sector_match=sector_match, liquidity_score=liquidity, diagnostics={"member_count": candidate.member_count, "support_count": support_count, "decayed_support": side_stats.get("decayed_support"), "mean_return_pct": return_score, "win_rate": win_rate, "uncertainty": uncertainty, "representative_symbol": candidate.representative_symbol, "regime_bucket": candidate.metadata.get("prior_buckets", {}).get("regime"), "sector_bucket": candidate.metadata.get("prior_buckets", {}).get("sector"), "liquidity_bucket": candidate.metadata.get("prior_buckets", {}).get("liquidity")}))
     out.sort(key=lambda x: x.score, reverse=True)
     return out
 
@@ -187,35 +191,37 @@ def _weighted_quantile(values: list[float], weights: np.ndarray, q: float) -> fl
     return float(vals[np.searchsorted(cdf, q, side="left")])
 
 
-def _row_side_metrics(side: str, candidate: PrototypeAnchor) -> tuple[float, float, float, float]:
-    if side == "BUY":
-        p_target = float(candidate.win_rate or 0.0)
-        p_stop = max(0.0, 1.0 - p_target)
-        p_flat = 0.0
-        exp_ret = float(candidate.mean_return_pct or 0.0)
-    else:
-        p_target = float(candidate.win_rate or 0.0)
-        p_stop = max(0.0, 1.0 - p_target)
-        p_flat = 0.0
-        exp_ret = float(candidate.mean_return_pct or 0.0)
-    return p_target, p_stop, p_flat, exp_ret
-
-
-def estimate_distribution(*, side: str, query_embedding: list[float], candidates: Iterable[PrototypeAnchor], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> DistributionEstimate:
+def estimate_distribution(*, side: str, query_embedding: list[float], candidates: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> DistributionEstimate:
     cfg = ev_config or EVConfig()
     calibration = calibration or CalibrationModel(method="identity")
     ranked = _ranked_candidates(query_embedding=query_embedding, candidates=candidates, candidate_index=candidate_index)
     rows = []
     for c in ranked:
+        side_stats = _side_row(c, side)
+        if not side_stats:
+            continue
         similarity = max(0.0, _cos(query_embedding, c.embedding))
         regime_alignment = 1.0 if regime_code and c.regime_code == regime_code else 0.0
         sector_alignment = 1.0 if sector_code and c.sector_code == sector_code else 0.0
-        freshness_score = 1.0 / (1.0 + max(0.0, float(c.freshness_days or 0.0)) / 30.0)
-        support_score = min(1.0, float(c.decayed_support or c.support_count or 0.0) / 5.0)
+        freshness_score = 1.0 / (1.0 + max(0.0, float(side_stats.get("freshness_days", c.freshness_days or 0.0))) / 30.0)
+        support_score = min(1.0, float(side_stats.get("decayed_support", c.decayed_support or 0.0)) / 5.0)
         kernel = np.exp(cfg.kernel_temperature * (similarity - 1.0)) if cfg.use_kernel_weighting else similarity
         weight = float(kernel * (0.45 + 0.30 * support_score + 0.25 * freshness_score) * (0.40 + 0.60 * max(regime_alignment, sector_alignment)))
-        p_target, p_stop, p_flat, exp_ret = _row_side_metrics(side, c)
-        rows.append({"candidate": c, "similarity": similarity, "weight": weight, "p_target": p_target, "p_stop": p_stop, "p_flat": p_flat, "ret": exp_ret, "mae": abs(float(c.mae_mean_pct or 0.0)), "mfe": float(c.mfe_mean_pct or 0.0), "uncertainty": float(c.uncertainty or 0.0), "dispersion": float(c.return_dispersion or 0.0), "regime_alignment": regime_alignment, "freshness_score": freshness_score, "support_score": support_score})
+        p_target = float(side_stats.get("p_target_first", 0.0))
+        p_stop = float(side_stats.get("p_stop_first", 0.0))
+        p_flat = float(side_stats.get("p_flat", 0.0))
+        p_ambiguous = float(side_stats.get("p_ambiguous", 0.0))
+        p_no_trade = float(side_stats.get("p_no_trade", 0.0))
+        exp_ret = (
+            p_target * max(float(side_stats.get("return_q90_pct", side_stats.get("mean_return_pct", 0.0))), 0.0)
+            + p_flat * float(side_stats.get("return_q50_pct", side_stats.get("median_return_pct", 0.0)))
+            + float(side_stats.get("horizon_up_count", 0.0)) / max(float(side_stats.get("support_count", 1.0)), 1.0) * max(float(side_stats.get("mean_return_pct", 0.0)), 0.0)
+            - p_stop * abs(min(float(side_stats.get("return_q10_pct", side_stats.get("mean_return_pct", 0.0))), 0.0))
+            - float(side_stats.get("horizon_down_count", 0.0)) / max(float(side_stats.get("support_count", 1.0)), 1.0) * abs(min(float(side_stats.get("mean_return_pct", 0.0)), 0.0))
+            - 0.50 * p_ambiguous * (abs(float(side_stats.get("mae_mean_pct", 0.0))) + abs(float(side_stats.get("mfe_mean_pct", 0.0))))
+            - 0.75 * p_no_trade * abs(float(side_stats.get("return_q50_pct", side_stats.get("median_return_pct", 0.0))))
+        )
+        rows.append({"candidate": c, "similarity": similarity, "weight": weight, "p_target": p_target, "p_stop": p_stop, "p_flat": p_flat, "p_ambiguous": p_ambiguous, "p_no_trade": p_no_trade, "ret": exp_ret, "mae": abs(float(side_stats.get("mae_mean_pct", 0.0))), "mfe": float(side_stats.get("mfe_mean_pct", 0.0)), "uncertainty": float(side_stats.get("uncertainty", 0.0)), "dispersion": float(side_stats.get("return_dispersion", 0.0)), "regime_alignment": regime_alignment, "freshness_score": freshness_score, "support_score": support_score, "side_stats": side_stats})
     rows.sort(key=lambda x: x["weight"], reverse=True)
     rows = rows[: cfg.top_k]
     total_w = sum(r["weight"] for r in rows)
@@ -225,6 +231,8 @@ def estimate_distribution(*, side: str, query_embedding: list[float], candidates
     p_target = float(sum(w * r["p_target"] for w, r in zip(weights, rows)))
     p_stop = float(sum(w * r["p_stop"] for w, r in zip(weights, rows)))
     p_flat = float(sum(w * r["p_flat"] for w, r in zip(weights, rows)))
+    p_ambiguous = float(sum(w * r["p_ambiguous"] for w, r in zip(weights, rows)))
+    p_no_trade = float(sum(w * r["p_no_trade"] for w, r in zip(weights, rows)))
     exp_ret = float(sum(w * r["ret"] for w, r in zip(weights, rows)))
     exp_mae = float(sum(w * r["mae"] for w, r in zip(weights, rows)))
     exp_mfe = float(sum(w * r["mfe"] for w, r in zip(weights, rows)))
@@ -237,21 +245,15 @@ def estimate_distribution(*, side: str, query_embedding: list[float], candidates
     q90 = _weighted_quantile(values, weights, 0.90)
     lower_bound = q10 - uncertainty
     upper_bound = q90 + uncertainty
-    utility = {
-        "expected_net_return": exp_ret,
-        "mae_penalty": 0.5 * exp_mae,
-        "mfe_credit": 0.25 * exp_mfe,
-        "uncertainty_penalty": uncertainty,
-        "fallback_raw_ev": exp_ret - 0.5 * exp_mae + 0.25 * exp_mfe - uncertainty,
-    }
-    top_matches = [{"prototype_id": r["candidate"].prototype_id, "weight": r["weight"], "why": {"similarity": r["similarity"], "support": float(r["candidate"].support_count or 0.0), "freshness_days": float(r["candidate"].freshness_days or 0.0)}, "representative_symbol": r["candidate"].representative_symbol, "expected_return": r["candidate"].mean_return_pct, "uncertainty": r["candidate"].uncertainty} for r in rows]
+    utility = {"expected_net_return": exp_ret, "p_target_first": p_target, "p_stop_first": p_stop, "p_flat": p_flat, "p_ambiguous": p_ambiguous, "p_no_trade": p_no_trade, "mae_penalty": 0.5 * exp_mae, "mfe_credit": 0.25 * exp_mfe, "ambiguous_penalty": 0.5 * p_ambiguous, "no_trade_penalty": 0.75 * p_no_trade, "uncertainty_penalty": uncertainty, "fallback_raw_ev": exp_ret - 0.5 * exp_mae + 0.25 * exp_mfe - 0.5 * p_ambiguous - 0.75 * p_no_trade - uncertainty}
+    top_matches = [{"prototype_id": r["candidate"].prototype_id, "weight": r["weight"], "why": {"similarity": r["similarity"], "support": float(r["side_stats"].get("support_count", 0.0)), "freshness_days": float(r["side_stats"].get("freshness_days", 0.0)), "target_first_count": r["side_stats"].get("target_first_count", 0), "stop_first_count": r["side_stats"].get("stop_first_count", 0), "flat_count": r["side_stats"].get("flat_count", 0), "ambiguous_count": r["side_stats"].get("ambiguous_count", 0), "no_trade_count": r["side_stats"].get("no_trade_count", 0)}, "representative_symbol": r["candidate"].representative_symbol, "expected_return": r["side_stats"].get("mean_return_pct"), "uncertainty": r["side_stats"].get("uncertainty")} for r in rows]
     return DistributionEstimate(side=side, p_target_first=calibration.calibrate_prob(p_target), p_stop_first=calibration.calibrate_prob(p_stop), p_flat=max(0.0, min(1.0, p_flat)), expected_net_return=calibration.calibrate_ev(exp_ret), expected_mae=exp_mae, expected_mfe=exp_mfe, q10_return=q10, q50_return=q50, q90_return=q90, effective_sample_size=n_eff, regime_alignment=regime_alignment, uncertainty=uncertainty, lower_bound_return=lower_bound, upper_bound_return=upper_bound, utility=utility, top_matches=top_matches)
 
 
-def build_decision_surface(*, query_embedding: list[float], buy_candidates: Iterable[PrototypeAnchor], sell_candidates: Iterable[PrototypeAnchor], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> DecisionSurface:
+def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> DecisionSurface:
     cfg = ev_config or EVConfig()
-    buy = estimate_distribution(side="BUY", query_embedding=query_embedding, candidates=buy_candidates, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
-    sell = estimate_distribution(side="SELL", query_embedding=query_embedding, candidates=sell_candidates, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
+    buy = estimate_distribution(side="BUY", query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
+    sell = estimate_distribution(side="SELL", query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
     reasons = []
     better = "BUY" if buy.expected_net_return >= sell.expected_net_return else "SELL"
     chosen = buy if better == "BUY" else sell
@@ -266,11 +268,18 @@ def build_decision_surface(*, query_embedding: list[float], buy_candidates: Iter
         reasons.append("regime_mismatch")
     if chosen.lower_bound_return <= 0.0:
         reasons.append("lower_bound_non_positive")
+    if float(chosen.utility.get("p_ambiguous", 0.0)) >= 0.30:
+        reasons.append("high_ambiguous_share")
+    if float(chosen.utility.get("p_no_trade", 0.0)) >= 0.30:
+        reasons.append("high_no_trade_share")
     abstain = bool(reasons)
-    return DecisionSurface(buy=buy, sell=sell, chosen_side="ABSTAIN" if abstain else better, abstain=abstain, abstain_reasons=reasons, diagnostics={"buy_summary": buy.utility, "sell_summary": sell.utility, "decision_rule": {"winner": better, "chosen_lower_bound": chosen.lower_bound_return, "chosen_interval_width": interval_width}})
+    why = "BUY" if better == "BUY" else "SELL"
+    if abstain:
+        why = "ABSTAIN"
+    return DecisionSurface(buy=buy, sell=sell, chosen_side="ABSTAIN" if abstain else better, abstain=abstain, abstain_reasons=reasons, diagnostics={"prototype_pool_size": len(list(prototype_pool)) if not isinstance(prototype_pool, list) else len(prototype_pool), "shared_neighbor_pool": True, "buy_summary": buy.utility, "sell_summary": sell.utility, "decision_rule": {"winner": better, "chosen_lower_bound": chosen.lower_bound_return, "chosen_interval_width": interval_width, "why": why, "why_summary": f"{why}: p_target={chosen.utility.get('p_target_first', 0.0):.2f}, p_stop={chosen.utility.get('p_stop_first', 0.0):.2f}, p_flat={chosen.utility.get('p_flat', 0.0):.2f}, p_ambiguous={chosen.utility.get('p_ambiguous', 0.0):.2f}, p_no_trade={chosen.utility.get('p_no_trade', 0.0):.2f}"}})
 
 
-def estimate_expected_value(*, side: str, query_embedding: list[float], candidates: Iterable[PrototypeAnchor], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> EVEstimate:
+def estimate_expected_value(*, side: str, query_embedding: list[float], candidates: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> EVEstimate:
     dist = estimate_distribution(side=side, query_embedding=query_embedding, candidates=candidates, regime_code=regime_code, sector_code=sector_code, ev_config=ev_config, candidate_index=candidate_index, calibration=calibration)
     cfg = ev_config or EVConfig()
     reasons = []

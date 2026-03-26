@@ -9,7 +9,7 @@ from typing import Dict, Iterable, List
 
 import numpy as np
 
-from .models import EventOutcomeRecord, PrototypeAnchor, ResearchAnchor
+from .models import EventOutcomeRecord, PrototypeAnchor, ResearchAnchor, StatePrototype
 
 
 @dataclass(frozen=True)
@@ -46,15 +46,6 @@ def _parse_date(raw: str | None) -> date | None:
     return datetime.fromisoformat(str(raw)[:10]).date()
 
 
-def _freshness_days(members: List[ResearchAnchor], as_of_date: str | None = None) -> float:
-    dates = [d for d in (_parse_date(a.reference_date) for a in members) if d is not None]
-    if not dates:
-        return 9999.0
-    latest = max(dates)
-    ref = _parse_date(as_of_date) or latest
-    return float((ref - latest).days)
-
-
 def _decayed_support_from_dates(dates: List[date], halflife_days: float, as_of_date: str | None = None) -> float:
     if not dates:
         return 0.0
@@ -66,204 +57,118 @@ def _decayed_support_from_dates(dates: List[date], halflife_days: float, as_of_d
     return out
 
 
-def _decayed_support(members: List[ResearchAnchor], halflife_days: float, as_of_date: str | None = None) -> float:
-    dates = [d for d in (_parse_date(a.reference_date) for a in members) if d is not None]
-    return _decayed_support_from_dates(dates, halflife_days, as_of_date=as_of_date)
-
-
-def _medoid(cluster: List[ResearchAnchor]) -> ResearchAnchor:
-    if len(cluster) == 1:
-        return cluster[0]
-    arr = [np.asarray(c.embedding, dtype=float) for c in cluster]
-    sims = []
-    for i, a in enumerate(arr):
-        total = 0.0
-        for j, b in enumerate(arr):
-            if i == j:
-                continue
-            total += _cos(a, b)
-        sims.append((total, cluster[i]))
-    sims.sort(key=lambda x: (x[0], x[1].anchor_quality, x[1].liquidity_score or 0.0), reverse=True)
-    return sims[0][1]
-
-
-def _cluster_key(anchor: ResearchAnchor) -> tuple:
-    return (
-        anchor.regime_code or "UNKNOWN",
-        anchor.sector_code or "UNKNOWN",
-        _liq_bucket(anchor.liquidity_score),
-    )
-
-
 def _quantile(values: list[float], q: float) -> float:
     if not values:
         return 0.0
     return float(np.quantile(np.asarray(values, dtype=float), q))
 
 
-def _cluster_stats(cluster: List[ResearchAnchor], cfg: PrototypeConfig, *, as_of_date: str | None = None) -> dict:
-    returns = [float(a.after_cost_return_pct or 0.0) for a in cluster]
-    maes = [float(a.mae_pct or 0.0) for a in cluster]
-    mfes = [float(a.mfe_pct or 0.0) for a in cluster]
-    support_count = len(cluster)
-    decayed_support = _decayed_support(cluster, cfg.recency_halflife_days, as_of_date=as_of_date)
+def _state_side_stats(members: list[dict], cfg: PrototypeConfig, *, as_of_date: str | None = None) -> dict:
+    returns = [float(m.get("after_cost_return_pct", 0.0) or 0.0) for m in members]
+    maes = [abs(float(m.get("mae_pct", 0.0) or 0.0)) for m in members]
+    mfes = [float(m.get("mfe_pct", 0.0) or 0.0) for m in members]
+    dates = [_parse_date(m.get("event_date")) for m in members if _parse_date(m.get("event_date")) is not None]
+    support_count = len(members)
     dispersion = pstdev(returns) if len(returns) > 1 else 0.0
-    uncertainty = dispersion / max(np.sqrt(support_count), 1.0)
-    freshness = _freshness_days(cluster, as_of_date=as_of_date)
+    target_first_count = sum(int(m.get("target_first_count", 0) or 0) for m in members)
+    stop_first_count = sum(int(m.get("stop_first_count", 0) or 0) for m in members)
+    flat_count = sum(int(m.get("flat_count", 0) or 0) for m in members)
+    ambiguous_count = sum(int(m.get("ambiguous_count", 0) or 0) for m in members)
+    no_trade_count = sum(int(m.get("no_trade_count", 0) or 0) for m in members)
+    horizon_up_count = sum(int(m.get("horizon_up_count", 0) or 0) for m in members)
+    horizon_down_count = sum(int(m.get("horizon_down_count", 0) or 0) for m in members)
+    total_outcomes = max(target_first_count + stop_first_count + flat_count + ambiguous_count + no_trade_count, support_count, 1)
     return {
         "support_count": support_count,
-        "decayed_support": decayed_support,
+        "decayed_support": _decayed_support_from_dates(dates, cfg.recency_halflife_days, as_of_date=as_of_date),
         "mean_return_pct": mean(returns) if returns else 0.0,
         "median_return_pct": median(returns) if returns else 0.0,
         "win_rate": sum(1 for r in returns if r > 0) / max(len(returns), 1),
         "mae_mean_pct": mean(maes) if maes else 0.0,
         "mfe_mean_pct": mean(mfes) if mfes else 0.0,
         "return_q10_pct": _quantile(returns, 0.10),
+        "return_q50_pct": _quantile(returns, 0.50),
         "return_q90_pct": _quantile(returns, 0.90),
         "return_dispersion": dispersion,
-        "uncertainty": uncertainty,
-        "freshness_days": freshness,
+        "uncertainty": dispersion / max(np.sqrt(support_count), 1.0),
+        "freshness_days": float(((_parse_date(as_of_date) or date.today()) - max(dates)).days) if dates else 9999.0,
+        "target_first_count": target_first_count,
+        "stop_first_count": stop_first_count,
+        "flat_count": flat_count,
+        "ambiguous_count": ambiguous_count,
+        "no_trade_count": no_trade_count,
+        "horizon_up_count": horizon_up_count,
+        "horizon_down_count": horizon_down_count,
+        "p_target_first": target_first_count / total_outcomes,
+        "p_stop_first": stop_first_count / total_outcomes,
+        "p_flat": flat_count / total_outcomes,
+        "p_ambiguous": ambiguous_count / total_outcomes,
+        "p_no_trade": no_trade_count / total_outcomes,
     }
 
 
-def _representative_hash(anchor: ResearchAnchor) -> str:
-    payload = json.dumps({"symbol": anchor.symbol, "reference_date": anchor.reference_date, "embedding": [round(float(x), 8) for x in anchor.embedding]}, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+def _representative_hash(payload: dict) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:12]
 
 
-def _prototype_id(*, as_of_date: str | None, memory_version: str, cluster_key: tuple, representative: ResearchAnchor) -> str:
-    rep_hash = _representative_hash(representative)
-    return f"{as_of_date or representative.reference_date}:{memory_version}:{'|'.join(cluster_key)}:{rep_hash}"
+def build_state_prototypes_from_event_memory(*, event_records: Iterable[EventOutcomeRecord], as_of_date: str, memory_version: str, spec_hash: str, config: PrototypeConfig | None = None) -> list[StatePrototype]:
+    cfg = config or PrototypeConfig(memory_version=memory_version)
+    eligible = [e for e in event_records if not e.outcome_end_date or e.outcome_end_date < as_of_date]
+    clusters: list[list[dict]] = []
+    for event in eligible:
+        emb = list(((event.diagnostics or {}).get("embedding") or (event.path_summary or {}).get("embedding") or []))
+        if not emb:
+            emb = [0.0, 0.0]
+        row = {
+            "event": event,
+            "embedding": emb,
+            "shape_vector": list(((event.diagnostics or {}).get("shape_vector") or [])),
+            "ctx_vector": list(((event.diagnostics or {}).get("ctx_vector") or [])),
+            "regime_code": str(event.diagnostics.get("regime_code") or event.path_summary.get("regime_code") or "UNKNOWN"),
+            "sector_code": str(event.diagnostics.get("sector_code") or event.path_summary.get("sector_code") or "UNKNOWN"),
+            "liquidity_bucket": str(event.path_summary.get("liquidity_bucket") or "UNKNOWN"),
+            "anchor_quality": float(event.diagnostics.get("quality_score", 1.0) or 1.0),
+            "liquidity_score": float(event.diagnostics.get("liquidity_score", 0.0) or 0.0),
+        }
+        vec = np.asarray(row["embedding"], dtype=float)
+        matched = False
+        for cluster in clusters:
+            rep = np.asarray(cluster[0]["embedding"], dtype=float)
+            if _cos(vec, rep) >= cfg.dedup_similarity_threshold:
+                cluster.append(row)
+                matched = True
+                break
+        if not matched:
+            clusters.append([row])
+    prototypes: list[StatePrototype] = []
+    for cluster in clusters:
+        events = [r["event"] for r in cluster]
+        member_dates = [_parse_date(e.event_date) for e in events if _parse_date(e.event_date) is not None]
+        decayed_support = _decayed_support_from_dates(member_dates, cfg.recency_halflife_days, as_of_date=as_of_date)
+        if len(cluster) < cfg.min_support_count or decayed_support < cfg.min_decayed_support:
+            continue
+        rep = max(cluster, key=lambda r: (r["anchor_quality"], r["liquidity_score"]))
+        rep_payload = {"symbol": rep["event"].symbol, "event_date": rep["event"].event_date, "embedding": [round(float(x), 8) for x in rep["embedding"]]}
+        representative_hash = _representative_hash(rep_payload)
+        prior_buckets = {"regime": sorted({r["regime_code"] for r in cluster}), "sector": sorted({r["sector_code"] for r in cluster}), "liquidity": sorted({r["liquidity_bucket"] for r in cluster})}
+        member_refs = [{"symbol": e.symbol, "event_date": e.event_date, "outcome_end_date": e.outcome_end_date} for e in events]
+        lineage = [{"ref": f"{e.symbol}:{e.event_date}", "side_outcomes": dict(e.side_outcomes or {})} for e in events]
+        side_stats = {side: _state_side_stats([{**dict((e.side_outcomes or {}).get(side) or {}), "event_date": e.event_date} for e in events], cfg, as_of_date=as_of_date) for side in ("BUY", "SELL")}
+        prototype_id = f"{as_of_date}:{memory_version}:{representative_hash}"
+        prototypes.append(StatePrototype(prototype_id=prototype_id, anchor_code="STATE_MEMORY_V1", embedding=list(rep["embedding"]), member_count=len(cluster), representative_symbol=rep["event"].symbol, representative_date=rep["event"].event_date, representative_hash=representative_hash, shape_vector=list(rep["shape_vector"]), ctx_vector=list(rep["ctx_vector"]), vector_version=memory_version, feature_version=spec_hash, embedding_model="event-memory-state", vector_dim=len(rep["embedding"]), anchor_quality=float(mean([r["anchor_quality"] for r in cluster])), regime_code=rep["regime_code"], sector_code=rep["sector_code"], liquidity_score=float(mean([r["liquidity_score"] for r in cluster])), support_count=len(cluster), decayed_support=decayed_support, freshness_days=float(((_parse_date(as_of_date) or date.today()) - max(member_dates)).days) if member_dates else 9999.0, prototype_membership={"member_refs": member_refs, "lineage": lineage}, side_stats=side_stats, metadata={"as_of_date": as_of_date, "memory_version": memory_version, "spec_hash": spec_hash, "representative_hash": representative_hash, "prior_buckets": prior_buckets}))
+    prototypes.sort(key=lambda p: p.prototype_id)
+    return prototypes
 
 
 def build_anchor_prototypes(anchors: Iterable[ResearchAnchor], config: PrototypeConfig | None = None, *, as_of_date: str | None = None) -> List[PrototypeAnchor]:
     cfg = config or PrototypeConfig()
-    groups: Dict[tuple, List[ResearchAnchor]] = {}
-    for anchor in anchors:
-        if anchor.anchor_quality < cfg.min_anchor_quality:
-            continue
-        groups.setdefault((anchor.side, *_cluster_key(anchor)), []).append(anchor)
-
     out: List[PrototypeAnchor] = []
-    for (side, regime_bucket, sector_bucket, liquidity_bucket), members in groups.items():
-        clusters: List[List[ResearchAnchor]] = []
-        for anchor in members:
-            vec = np.asarray(anchor.embedding, dtype=float)
-            matched = False
-            for cluster in clusters:
-                rep = _medoid(cluster)
-                if _cos(vec, np.asarray(rep.embedding, dtype=float)) >= cfg.dedup_similarity_threshold:
-                    cluster.append(anchor)
-                    matched = True
-                    break
-            if not matched:
-                clusters.append([anchor])
-
-        for cluster in clusters:
-            stats = _cluster_stats(cluster, cfg, as_of_date=as_of_date)
-            if stats["support_count"] < cfg.min_support_count or stats["decayed_support"] < cfg.min_decayed_support or stats["freshness_days"] > cfg.max_age_days:
-                continue
-            rep = _medoid(cluster)
-            prototype_id = _prototype_id(as_of_date=as_of_date, memory_version=cfg.memory_version or str(rep.vector_version or "memory"), cluster_key=(side, regime_bucket, sector_bucket, liquidity_bucket), representative=rep)
-            out.append(
-                PrototypeAnchor(
-                    prototype_id=prototype_id,
-                    anchor_code=rep.anchor_code,
-                    side=side,
-                    embedding=list(rep.embedding),
-                    member_count=len(cluster),
-                    representative_symbol=rep.symbol,
-                    representative_date=rep.reference_date,
-                    shape_vector=list(rep.shape_vector),
-                    ctx_vector=list(rep.ctx_vector),
-                    vector_version=rep.vector_version,
-                    feature_version=rep.metadata.get("feature_version"),
-                    embedding_model=rep.embedding_model,
-                    vector_dim=rep.vector_dim,
-                    anchor_quality=float(mean([a.anchor_quality for a in cluster])),
-                    regime_code=regime_bucket,
-                    sector_code=sector_bucket,
-                    liquidity_score=float(mean([float(a.liquidity_score or 0.0) for a in cluster])),
-                    support_count=stats["support_count"],
-                    decayed_support=stats["decayed_support"],
-                    mean_return_pct=stats["mean_return_pct"],
-                    median_return_pct=stats["median_return_pct"],
-                    win_rate=stats["win_rate"],
-                    mae_mean_pct=stats["mae_mean_pct"],
-                    mfe_mean_pct=stats["mfe_mean_pct"],
-                    return_dispersion=stats["return_dispersion"],
-                    uncertainty=stats["uncertainty"],
-                    freshness_days=stats["freshness_days"],
-                    liquidity_bucket=liquidity_bucket,
-                    regime_bucket=regime_bucket,
-                    sector_bucket=sector_bucket,
-                    prototype_membership={
-                        "member_symbols": [c.symbol for c in cluster],
-                        "member_dates": [c.reference_date for c in cluster],
-                        "member_anchor_codes": [c.anchor_code for c in cluster],
-                    },
-                    metadata={
-                        "cross_regime_merge": False,
-                        "representative_kind": "medoid",
-                        "return_q10_pct": stats["return_q10_pct"],
-                        "return_q90_pct": stats["return_q90_pct"],
-                        "memory_version": cfg.memory_version,
-                        "as_of_date": as_of_date,
-                        "representative_hash": _representative_hash(rep),
-                    },
-                )
-            )
-    out.sort(key=lambda p: p.prototype_id)
+    for anchor in anchors:
+        rep_hash = _representative_hash({"symbol": anchor.symbol, "reference_date": anchor.reference_date, "embedding": [round(float(x), 8) for x in anchor.embedding]})
+        out.append(PrototypeAnchor(prototype_id=f"{as_of_date or anchor.reference_date}:{cfg.memory_version}:{anchor.side}:{rep_hash}", anchor_code=anchor.anchor_code, side=anchor.side, embedding=list(anchor.embedding), member_count=1, representative_symbol=anchor.symbol, representative_date=anchor.reference_date, shape_vector=list(anchor.shape_vector), ctx_vector=list(anchor.ctx_vector), vector_version=anchor.vector_version, feature_version=anchor.metadata.get("feature_version"), embedding_model=anchor.embedding_model, vector_dim=anchor.vector_dim, anchor_quality=anchor.anchor_quality, regime_code=anchor.regime_code, sector_code=anchor.sector_code, liquidity_score=anchor.liquidity_score, support_count=1, decayed_support=1.0, mean_return_pct=float(anchor.after_cost_return_pct or 0.0), median_return_pct=float(anchor.after_cost_return_pct or 0.0), win_rate=1.0 if float(anchor.after_cost_return_pct or 0.0) > 0 else 0.0, mae_mean_pct=abs(float(anchor.mae_pct or 0.0)), mfe_mean_pct=float(anchor.mfe_pct or 0.0), return_dispersion=0.0, uncertainty=0.0, freshness_days=0.0, liquidity_bucket=_liq_bucket(anchor.liquidity_score), regime_bucket=anchor.regime_code, sector_bucket=anchor.sector_code, prototype_membership=anchor.prototype_membership, metadata={"representative_hash": rep_hash, "legacy_wrapper": True}))
     return out
 
 
-def build_prototype_snapshot_from_event_memory(*, event_records: Iterable[EventOutcomeRecord], as_of_date: str, memory_version: str, config: PrototypeConfig | None = None) -> dict:
-    cfg = config or PrototypeConfig(memory_version=memory_version)
-    groups: Dict[tuple, list[dict]] = {}
-    lineage: dict[str, list[dict]] = {}
-    for event in event_records:
-        if event.outcome_end_date and event.outcome_end_date >= as_of_date:
-            continue
-        path = dict(event.path_summary or {})
-        regime = str(event.diagnostics.get("regime_code") or path.get("regime_code") or "UNKNOWN")
-        sector = str(event.diagnostics.get("sector_code") or path.get("sector_code") or "UNKNOWN")
-        liquidity_bucket = str(path.get("liquidity_bucket") or "UNKNOWN")
-        for side in ("BUY", "SELL"):
-            side_outcome = dict((event.side_outcomes or {}).get(side) or {})
-            key = (regime, sector, liquidity_bucket)
-            groups.setdefault(key, []).append({"event": event, "side": side, "outcome": side_outcome})
-
-    prototypes = []
-    for key, members in sorted(groups.items()):
-        regime, sector, liquidity_bucket = key
-        side_stats = {}
-        member_refs = []
-        representative_basis = []
-        for side in ("BUY", "SELL"):
-            side_members = [m for m in members if m["side"] == side]
-            returns = [float(m["outcome"].get("after_cost_return_pct", 0.0) or 0.0) for m in side_members]
-            maes = [float(m["outcome"].get("mae_pct", 0.0) or 0.0) for m in side_members]
-            mfes = [float(m["outcome"].get("mfe_pct", 0.0) or 0.0) for m in side_members]
-            dates = [_parse_date(m["event"].event_date) for m in side_members if _parse_date(m["event"].event_date) is not None]
-            support_count = len(side_members)
-            side_stats[side] = {
-                "support_count": support_count,
-                "decayed_support": _decayed_support_from_dates(dates, cfg.recency_halflife_days, as_of_date=as_of_date),
-                "mean_return_pct": mean(returns) if returns else 0.0,
-                "median_return_pct": median(returns) if returns else 0.0,
-                "win_rate": sum(1 for r in returns if r > 0) / max(len(returns), 1),
-                "mae_mean_pct": mean(maes) if maes else 0.0,
-                "mfe_mean_pct": mean(mfes) if mfes else 0.0,
-                "return_q10_pct": _quantile(returns, 0.10),
-                "return_q90_pct": _quantile(returns, 0.90),
-                "dispersion": pstdev(returns) if len(returns) > 1 else 0.0,
-                "uncertainty": (pstdev(returns) if len(returns) > 1 else 0.0) / max(np.sqrt(support_count), 1.0),
-                "freshness_days": float(((_parse_date(as_of_date) or date.today()) - max(dates)).days) if dates else 9999.0,
-            }
-            member_refs.extend([{"symbol": m["event"].symbol, "event_date": m["event"].event_date, "outcome_end_date": m["event"].outcome_end_date, "side": side} for m in side_members])
-            representative_basis.extend([f"{m['event'].symbol}:{m['event'].event_date}:{side}" for m in side_members])
-        rep_hash = hashlib.sha256("|".join(sorted(representative_basis)).encode("utf-8")).hexdigest()[:12]
-        prototype_id = f"{as_of_date}:{memory_version}:{'|'.join(key)}:{rep_hash}"
-        lineage[prototype_id] = member_refs
-        prototypes.append({"prototype_id": prototype_id, "as_of_date": as_of_date, "memory_version": memory_version, "cluster_key": {"regime_code": regime, "sector_code": sector, "liquidity_bucket": liquidity_bucket}, "representative_hash": rep_hash, "stats": side_stats, "membership": member_refs})
-    return {"as_of_date": as_of_date, "memory_version": memory_version, "prototype_count": len(prototypes), "prototypes": prototypes, "lineage": lineage}
+def build_prototype_snapshot_from_event_memory(*, event_records: Iterable[EventOutcomeRecord], as_of_date: str, memory_version: str, config: PrototypeConfig | None = None, spec_hash: str = "unknown") -> dict:
+    prototypes = build_state_prototypes_from_event_memory(event_records=event_records, as_of_date=as_of_date, memory_version=memory_version, spec_hash=spec_hash, config=config)
+    return {"as_of_date": as_of_date, "memory_version": memory_version, "spec_hash": spec_hash, "prototype_count": len(prototypes), "prototypes": [p.__dict__ for p in prototypes], "lineage": {p.prototype_id: p.prototype_membership.get("member_refs", []) for p in prototypes}}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
 
@@ -29,6 +30,24 @@ class ResearchExperimentSpec:
 
 
 @dataclass(frozen=True)
+class ResearchRunManifest:
+    experiment_id: str
+    spec_hash: str
+    data_snapshot_id: str
+    code_commit: str
+    calendar_convention: str
+    execution_convention: str
+    cost_model_version: str
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+    def manifest_id(self) -> str:
+        payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
 class BacktestScenario:
     scenario_id: str
     market: str
@@ -50,6 +69,7 @@ class BacktestConfig:
     allow_partial_fills: bool = True
     metadata: Dict[str, str] = field(default_factory=dict)
     research_spec: Optional[ResearchExperimentSpec] = None
+    manifest: Optional[ResearchRunManifest] = None
 
 
 @dataclass(frozen=True)
@@ -57,3 +77,16 @@ class RunnerRequest:
     scenario: BacktestScenario
     config: BacktestConfig
     output_path: Optional[str] = None
+
+
+def resolve_code_commit() -> str:
+    try:
+        proc = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+        return proc.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def build_research_manifest(*, scenario: BacktestScenario, config: BacktestConfig, data_snapshot_id: str, calendar_convention: str = "TRADING_DAY", execution_convention: str = "EOD_T_SIGNAL__T1_OPEN_EXECUTION", cost_model_version: str = "cost_v1", code_commit: str | None = None) -> ResearchRunManifest:
+    spec = config.research_spec or ResearchExperimentSpec()
+    return ResearchRunManifest(experiment_id=scenario.scenario_id, spec_hash=spec.spec_hash(), data_snapshot_id=data_snapshot_id, code_commit=code_commit or resolve_code_commit(), calendar_convention=calendar_convention, execution_convention=execution_convention, cost_model_version=cost_model_version)

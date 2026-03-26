@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable, Protocol
 
 from .artifacts import JsonResearchArtifactStore
-from .models import PrototypeAnchor, ResearchAnchor
+from .models import ResearchAnchor, StatePrototype
 
 
 class AnchorSearchRepository(Protocol):
@@ -20,12 +20,12 @@ class InMemoryAnchorRepository:
 
 
 class CandidateIndex(Protocol):
-    def rank(self, *, query_embedding: list[float], candidates: Iterable[PrototypeAnchor]) -> list[PrototypeAnchor]: ...
+    def rank(self, *, query_embedding: list[float], candidates: Iterable[StatePrototype]) -> list[StatePrototype]: ...
 
 
 @dataclass
 class ExactCosineCandidateIndex:
-    def rank(self, *, query_embedding: list[float], candidates: Iterable[PrototypeAnchor]) -> list[PrototypeAnchor]:
+    def rank(self, *, query_embedding: list[float], candidates: Iterable[StatePrototype]) -> list[StatePrototype]:
         import numpy as np
 
         q = np.asarray(query_embedding, dtype=float)
@@ -42,7 +42,7 @@ class ExactCosineCandidateIndex:
         return [c for _, c in scored]
 
 
-def load_prototypes_asof(*, artifact_store: JsonResearchArtifactStore, run_id: str, name: str = "prototype_snapshot", as_of_date: str | None = None, memory_version: str | None = None, side: str | None = None) -> list[dict]:
+def load_prototypes_asof(*, artifact_store: JsonResearchArtifactStore, run_id: str, name: str = "prototype_snapshot", as_of_date: str | None = None, memory_version: str | None = None, side: str | None = None) -> list[StatePrototype]:
     payload = artifact_store.load_prototype_snapshot(run_id=run_id, name=name)
     if not payload:
         return []
@@ -50,7 +50,7 @@ def load_prototypes_asof(*, artifact_store: JsonResearchArtifactStore, run_id: s
         return []
     if memory_version and payload.get("memory_version") != memory_version:
         return []
-    prototypes = list(payload.get("prototypes") or [])
+    prototypes = [StatePrototype(**p) for p in list(payload.get("prototypes") or [])]
     if side is None:
         return prototypes
-    return [p for p in prototypes if side in (p.get("stats") or {})]
+    return [p for p in prototypes if side in (p.side_stats or {})]

@@ -107,3 +107,30 @@ class PrototypeAnchor:
     sector_bucket: Optional[str] = None
     prototype_membership: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class StatePrototype:
+    prototype_id: str
+    anchor_code: str
+    embedding: List[float]
+    member_count: int
+    representative_symbol: Optional[str] = None
+    representative_date: Optional[str] = None
+    representative_hash: Optional[str] = None
+    shape_vector: List[float] = field(default_factory=list)
+    ctx_vector: List[float] = field(default_factory=list)
+    vector_version: Optional[str] = None
+    feature_version: Optional[str] = None
+    embedding_model: Optional[str] = None
+    vector_dim: Optional[int] = None
+    anchor_quality: float = 0.0
+    regime_code: Optional[str] = None
+    sector_code: Optional[str] = None
+    liquidity_score: Optional[float] = None
+    support_count: int = 0
+    decayed_support: float = 0.0
+    freshness_days: Optional[float] = None
+    prototype_membership: Dict[str, Any] = field(default_factory=dict)
+    side_stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)

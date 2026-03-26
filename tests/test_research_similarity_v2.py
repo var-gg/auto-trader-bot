@@ -3,7 +3,9 @@ from datetime import datetime
 from backtest_app.historical_data.models import HistoricalBar, HistoricalSlice
 from backtest_app.research.pipeline import DECISION_CONVENTION, generate_similarity_candidates_rolling
 from backtest_app.runner import cli
-from shared.domain.models import MarketCode, MarketSnapshot
+from backtest_app.simulated_broker.engine import SimulatedBroker
+from backtest_app.simulated_broker.models import SimulationRules
+from shared.domain.models import ExecutionVenue, FillStatus, LadderLeg, MarketCode, MarketSnapshot, OrderPlan, OrderType, Side
 
 
 def _bars(symbol: str):
@@ -43,6 +45,8 @@ def test_generate_similarity_candidates_rolling_builds_panel_without_future_libr
         assert row["query"]["feature_window_bars"] >= 60
         assert row["query"]["feature_coverage_bars"] >= 60
         assert row["query"]["insufficient_history"] is False
+        assert row["query"]["execution_date"] > row["decision_date"]
+        assert row["query"]["price_reference_source"] == "next_open"
         assert row["library"]["max_outcome_end_before_decision"] is None or row["library"]["max_outcome_end_before_decision"] < row["decision_date"]
         if row["library"]["max_outcome_end_before_decision"] is not None:
             assert row["library"]["event_record_count"] >= 1
@@ -59,9 +63,11 @@ def test_generate_similarity_candidates_rolling_uses_next_open_as_current_price(
     if candidates:
         c = candidates[0]
         decision_date = c.provenance["decision_date"]
+        execution_date = c.provenance["execution_date"]
         bars = bars_by_symbol[c.symbol]
         idx = next(i for i, b in enumerate(bars) if str(b.timestamp)[:10] == decision_date)
         assert c.current_price == bars[idx + 1].open
+        assert execution_date == str(bars[idx + 1].timestamp)[:10]
 
 
 class FakeRollingLoader:
@@ -95,3 +101,49 @@ def test_run_backtest_supports_research_similarity_v2(monkeypatch):
     result = cli.run_backtest(request, None, data_source="local-db", scenario_id="scn-r2", strategy_mode="research_similarity_v2")
     assert result["strategy_mode"] == "research_similarity_v2"
     assert result["artifacts"]["signal_panel"][0]["decision_date"] == "2026-01-10"
+
+
+def test_simulated_broker_blocks_same_day_fill_before_execution_start_for_research_v2():
+    broker = SimulatedBroker(rules=SimulationRules())
+    plan = OrderPlan(
+        plan_id="p1",
+        symbol="AAPL",
+        ticker_id=1,
+        side=Side.BUY,
+        generated_at=datetime(2026, 1, 10, 15, 30, 0),
+        status="READY",
+        rationale="test",
+        venue=ExecutionVenue.BACKTEST,
+        requested_budget=1000.0,
+        requested_quantity=1,
+        legs=[LadderLeg(leg_id="l1", side=Side.BUY, order_type=OrderType.LIMIT, quantity=1, limit_price=100.0)],
+        metadata={"earliest_fill_ts": "2026-01-11T09:00:00", "quote_policy": {}},
+    )
+    bars = [
+        HistoricalBar(symbol="AAPL", timestamp="2026-01-10", open=101.0, high=102.0, low=99.0, close=101.0, volume=1000),
+        HistoricalBar(symbol="AAPL", timestamp="2026-01-11", open=103.0, high=104.0, low=101.0, close=103.0, volume=1000),
+    ]
+    fills = broker.simulate_plan(plan, bars)
+    assert fills[0].fill_status == FillStatus.UNFILLED
+
+
+def test_legacy_mode_same_day_fill_convention_is_unchanged():
+    broker = SimulatedBroker(rules=SimulationRules())
+    plan = OrderPlan(
+        plan_id="p2",
+        symbol="AAPL",
+        ticker_id=1,
+        side=Side.BUY,
+        generated_at=datetime(2026, 1, 10, 15, 30, 0),
+        status="READY",
+        rationale="legacy",
+        venue=ExecutionVenue.BACKTEST,
+        requested_budget=1000.0,
+        requested_quantity=1,
+        legs=[LadderLeg(leg_id="l1", side=Side.BUY, order_type=OrderType.LIMIT, quantity=1, limit_price=100.0)],
+        metadata={"quote_policy": {}},
+    )
+    bars = [HistoricalBar(symbol="AAPL", timestamp="2026-01-10", open=101.0, high=102.0, low=99.0, close=101.0, volume=1000)]
+    fills = broker.simulate_plan(plan, bars)
+    assert fills[0].fill_status in {FillStatus.FULL, FillStatus.PARTIAL}
+    assert str(fills[0].event_time)[:10] == "2026-01-10"

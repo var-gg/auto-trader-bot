@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from dataclasses import dataclass, field
+from typing import Dict, Sequence
 
 from shared.domain.models import SignalCandidate, Side
 
@@ -17,6 +17,14 @@ class PortfolioConfig:
     max_correlated_group_positions: int = 1
     max_turnover_names: int = 5
     base_risk_unit: float = 1.0
+
+
+@dataclass(frozen=True)
+class PortfolioState:
+    cash: float
+    reserved_capital: float = 0.0
+    open_positions: Dict[str, dict] = field(default_factory=dict)
+    turnover_used: int = 0
 
 
 @dataclass(frozen=True)
@@ -75,14 +83,15 @@ def rank_candidates_cross_sectional(candidates: Sequence[SignalCandidate]) -> li
     return sorted(list(candidates), key=lambda c: (_candidate_utility_rank(c), _candidate_ev(c), c.confidence or 0.0), reverse=True)
 
 
-def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_capital: float, cfg: PortfolioConfig | None = None) -> list[PortfolioDecision]:
+def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_capital: float, cfg: PortfolioConfig | None = None, state: PortfolioState | None = None) -> list[PortfolioDecision]:
     cfg = cfg or PortfolioConfig()
+    state = state or PortfolioState(cash=initial_capital)
     ranked = rank_candidates_cross_sectional(candidates)
-    selected: list[PortfolioDecision] = []
+    decisions: list[PortfolioDecision] = []
     sector_counts: Dict[str, int] = {}
     corr_counts: Dict[str, int] = {}
-    turnover_used = 0
-    risk_budget_total = initial_capital * cfg.risk_budget_fraction
+    available_capital = max(0.0, min(initial_capital, state.cash - state.reserved_capital))
+    risk_budget_total = available_capital * cfg.risk_budget_fraction
 
     for cand in ranked:
         ev = _candidate_ev(cand)
@@ -99,8 +108,12 @@ def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_
         overlap_penalty = _candidate_overlap_penalty(cand)
         ranking_utility = policy_utility + 0.35 * ev + 0.10 * float(cand.confidence or 0.0) - 0.50 * uncertainty - 0.25 * overlap_penalty
         requested_budget = risk_budget_total / max(cfg.top_n, 1) * size_multiplier * max(0.25, min(1.5, 1.0 + ranking_utility))
+        remaining_capital = max(0.0, available_capital - sum(d.requested_budget for d in decisions if d.selected))
+        requested_budget = min(requested_budget, remaining_capital)
         kill_reason = None
-        if policy.no_trade:
+        if cand.symbol in state.open_positions:
+            kill_reason = "already_open"
+        elif policy.no_trade:
             kill_reason = "quote_policy_no_trade"
         elif ev < cfg.min_ev_threshold:
             kill_reason = "below_ev_threshold"
@@ -108,10 +121,12 @@ def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_
             kill_reason = "sector_cap"
         elif corr_counts.get(corr, 0) >= cfg.max_correlated_group_positions:
             kill_reason = "correlated_cap"
-        elif turnover_used >= cfg.max_turnover_names:
+        elif len([d for d in decisions if d.selected]) >= cfg.max_turnover_names:
             kill_reason = "turnover_budget"
-        elif len([d for d in selected if d.selected]) >= cfg.top_n:
+        elif len([d for d in decisions if d.selected]) >= cfg.top_n:
             kill_reason = "top_n_limit"
+        elif requested_budget <= 0.0:
+            kill_reason = "capital_reserved"
 
         decision = PortfolioDecision(
             candidate=cand,
@@ -136,12 +151,12 @@ def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_
                 "ranking_utility": ranking_utility,
                 "size_multiplier": size_multiplier,
                 "requested_budget": requested_budget,
+                "available_capital": available_capital,
                 "quote_policy": policy.diagnostics | {"policy_name": policy.policy_name, "buy_gap": policy.buy_gap, "sell_gap": policy.sell_gap, "size_multiplier": policy.size_multiplier, "no_trade": policy.no_trade},
             },
         )
-        selected.append(decision)
+        decisions.append(decision)
         if kill_reason is None:
             sector_counts[sector] = sector_counts.get(sector, 0) + 1
             corr_counts[corr] = corr_counts.get(corr, 0) + 1
-            turnover_used += 1
-    return selected
+    return decisions

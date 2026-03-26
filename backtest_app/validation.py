@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil, erf, sqrt
-from typing import Iterable, List, Sequence
+from typing import Callable, Iterable, List, Sequence
 
+from backtest_app.configs.models import BacktestScenario, RunnerRequest
 from backtest_app.historical_data.models import HistoricalBar
+from backtest_app.research.scoring import apply_calibration_to_test, fit_calibration_on_fold
 from shared.domain.models import FillOutcome, FillStatus, OrderPlan, Side
 
 
@@ -96,7 +98,7 @@ def plan_outcomes(plans: Sequence[OrderPlan], fills: Sequence[FillOutcome], bars
     for plan in plans:
         matched = [f for f in fills if f.plan_id == plan.plan_id and f.fill_status in {FillStatus.FULL, FillStatus.PARTIAL}]
         if not matched:
-            outcomes.append({"plan_id": plan.plan_id, "symbol": plan.symbol, "side": plan.side.value, "filled": False, "return_pct": 0.0, "realized_path_return_pct": 0.0, "score": float(plan.metadata.get("signal_strength", 0.0) or 0.0), "regime_code": plan.metadata.get("regime_code"), "baseline": plan.metadata.get("baseline", "strategy"), "horizon_days": int(plan.metadata.get("expected_horizon_days", plan.metadata.get("horizon_days", 5)) or 5)})
+            outcomes.append({"plan_id": plan.plan_id, "symbol": plan.symbol, "side": plan.side.value, "filled": False, "return_pct": 0.0, "realized_path_return_pct": 0.0, "score": float((plan.metadata.get("calibrated_signal_strength") or plan.metadata.get("signal_strength") or 0.0)), "regime_code": plan.metadata.get("regime_code"), "baseline": plan.metadata.get("baseline", "strategy"), "horizon_days": int(plan.metadata.get("expected_horizon_days", plan.metadata.get("horizon_days", 5)) or 5)})
             continue
         total_qty = max(1.0, sum(float(f.filled_quantity or 0) for f in matched))
         avg_fill = sum(float(f.average_fill_price or 0.0) * float(f.filled_quantity or 0) for f in matched) / total_qty
@@ -105,7 +107,7 @@ def plan_outcomes(plans: Sequence[OrderPlan], fills: Sequence[FillOutcome], bars
         fee_bps = max(float((f.metadata or {}).get("fee_bps", 0.0) or 0.0) for f in matched)
         path = _future_bars(plan.symbol, entry_date, bars_by_symbol, horizon_days)
         realized_path_return, exit_date = _realized_return_from_path(side=plan.side.value, entry_price=avg_fill, path=path, fee_bps=fee_bps)
-        outcomes.append({"plan_id": plan.plan_id, "symbol": plan.symbol, "side": plan.side.value, "filled": True, "avg_fill_price": avg_fill, "entry_date": entry_date, "exit_date": exit_date, "exit_holding_overlap_end": exit_date, "return_pct": realized_path_return, "realized_path_return_pct": realized_path_return, "score": float(plan.metadata.get("signal_strength", 0.0) or 0.0), "regime_code": plan.metadata.get("regime_code"), "baseline": plan.metadata.get("baseline", "strategy"), "horizon_days": horizon_days})
+        outcomes.append({"plan_id": plan.plan_id, "symbol": plan.symbol, "side": plan.side.value, "filled": True, "avg_fill_price": avg_fill, "entry_date": entry_date, "exit_date": exit_date, "exit_holding_overlap_end": exit_date, "return_pct": realized_path_return, "realized_path_return_pct": realized_path_return, "score": float((plan.metadata.get("calibrated_signal_strength") or plan.metadata.get("signal_strength") or 0.0)), "regime_code": plan.metadata.get("regime_code"), "baseline": plan.metadata.get("baseline", "strategy"), "horizon_days": horizon_days})
     return outcomes
 
 
@@ -269,7 +271,7 @@ def compute_performance_metrics(*, plans: Sequence[OrderPlan], fills: Sequence[F
     no_trade_ratio = no_trade_count / max(len(outcomes), 1)
     scored_plans = []
     for plan in plans:
-        strength = float(plan.metadata.get("signal_strength", 0.0) or 0.0)
+        strength = float(plan.metadata.get("calibrated_signal_strength", plan.metadata.get("signal_strength", 0.0)) or 0.0)
         outcome = next((o for o in outcomes if o["plan_id"] == plan.plan_id), None)
         scored_plans.append((strength, outcome))
     bucket_rows = _bucketize(scored_plans, score_buckets)
@@ -277,32 +279,7 @@ def compute_performance_metrics(*, plans: Sequence[OrderPlan], fills: Sequence[F
     short_stats = _long_short_stats(outcomes, Side.SELL.value)
     monotonicity = all(bucket_rows[i]["expectancy"] <= bucket_rows[i + 1]["expectancy"] for i in range(len(bucket_rows) - 1)) if len(bucket_rows) > 1 else True
     baseline = _baseline_metrics(outcomes, bars_by_symbol)
-    metrics = {
-        "expectancy": expectancy,
-        "expectancy_after_cost": expectancy,
-        "realized_path_pnl": sum(realized),
-        "max_drawdown": _max_drawdown(realized),
-        "turnover": turnover,
-        "hit_rate": sum(1 for value in realized if value > 0) / max(len(realized), 1),
-        "coverage": coverage,
-        "no_trade_ratio": no_trade_ratio,
-        "precision_at_k": _precision_at_k(scored_plans, top_k),
-        "long_expectancy": long_stats["expectancy"],
-        "short_expectancy": short_stats["expectancy"],
-        "long_count": long_stats["count"],
-        "short_count": short_stats["count"],
-        "long_stats": long_stats,
-        "short_stats": short_stats,
-        "score_decile_monotonicity": monotonicity,
-        "calibration_by_score_bucket": bucket_rows,
-        "calibration_error": _ece(bucket_rows),
-        "psr": _psr(expectancy, realized),
-        "dsr": _psr(expectancy * 0.9, realized),
-        "baseline_comparison": baseline,
-        "baseline_excess_information": {name: row.get("excess_information", 0.0) for name, row in baseline.items()},
-        "regime_breakdown": _regime_breakdown(outcomes),
-        "effective_sample_size": _overlap_adjusted_sample_size(outcomes),
-    }
+    metrics = {"expectancy": expectancy, "expectancy_after_cost": expectancy, "realized_path_pnl": sum(realized), "max_drawdown": _max_drawdown(realized), "turnover": turnover, "hit_rate": sum(1 for value in realized if value > 0) / max(len(realized), 1), "coverage": coverage, "no_trade_ratio": no_trade_ratio, "precision_at_k": _precision_at_k(scored_plans, top_k), "long_expectancy": long_stats["expectancy"], "short_expectancy": short_stats["expectancy"], "long_count": long_stats["count"], "short_count": short_stats["count"], "long_stats": long_stats, "short_stats": short_stats, "score_decile_monotonicity": monotonicity, "calibration_by_score_bucket": bucket_rows, "calibration_error": _ece(bucket_rows), "psr": _psr(expectancy, realized), "dsr": _psr(expectancy * 0.9, realized), "baseline_comparison": baseline, "baseline_excess_information": {name: row.get("excess_information", 0.0) for name, row in baseline.items()}, "regime_breakdown": _regime_breakdown(outcomes), "effective_sample_size": _overlap_adjusted_sample_size(outcomes)}
     metrics["validation_report"] = format_validation_report(metrics)
     return metrics
 
@@ -320,24 +297,49 @@ def rejection_reasons(metrics: dict) -> list[str]:
     return reasons
 
 
-def _fold_dates(plans: Sequence[OrderPlan], fills: Sequence[FillOutcome], bars_by_symbol: dict[str, list[HistoricalBar]] | None) -> list[str]:
-    outcomes = plan_outcomes(plans, fills, bars_by_symbol)
-    dates = sorted({str(o.get("entry_date") or "") for o in outcomes if o.get("entry_date")})
-    return [d for d in dates if d]
+def _all_candidate_dates(result: dict) -> list[str]:
+    return sorted({str(d.get("decision_date")) for d in (result.get("portfolio", {}).get("decisions") or []) if d.get("decision_date")})
 
 
-def _subset_by_dates(plans: Sequence[OrderPlan], fills: Sequence[FillOutcome], date_set: set[str]) -> tuple[list[OrderPlan], list[FillOutcome]]:
-    kept_plans = [p for p in plans if str((p.metadata or {}).get("anchor_date") or p.generated_at.date().isoformat())[:10] in date_set]
-    kept_ids = {p.plan_id for p in kept_plans}
-    kept_fills = [f for f in fills if f.plan_id in kept_ids]
-    return kept_plans, kept_fills
+def _make_request_for_window(request: RunnerRequest, *, start_date: str, end_date: str) -> RunnerRequest:
+    return RunnerRequest(scenario=replace(request.scenario, start_date=start_date, end_date=end_date), config=request.config, output_path=None)
 
 
-def run_fold_validation(*, plans: Sequence[OrderPlan], fills: Sequence[FillOutcome], bars_by_symbol: dict[str, list[HistoricalBar]] | None, total_symbols: int, horizon_days: int, mode: str = "walk_forward") -> dict:
-    dates = _fold_dates(plans, fills, bars_by_symbol)
-    purge, embargo = compute_purge_embargo(horizon_days=horizon_days, holding_overlap=1.0)
+def _calibration_targets(result: dict) -> tuple[list[float], list[int]]:
+    plans = result.get("plans") or []
+    fills = result.get("fills") or []
+    fill_by_plan = {f.get("plan_id"): f for f in fills if f.get("fill_status") in {"FULL", "PARTIAL"}}
+    raw_scores = []
+    targets = []
+    for p in plans:
+        raw_scores.append(float((p.get("metadata") or {}).get("signal_strength", 0.0) or 0.0))
+        avg_fill = (fill_by_plan.get(p.get("plan_id")) or {}).get("average_fill_price")
+        realized = ((p.get("metadata") or {}).get("decision_surface_summary") or {}).get("chosen_side")
+        targets.append(1 if avg_fill is not None and realized is not None else 0)
+    return raw_scores, targets
+
+
+def _apply_fold_calibration(test_result: dict, fold_id: str, raw_scores: list[float], targets: list[int]) -> tuple[dict, dict]:
+    if not raw_scores or not targets:
+        fold = fit_calibration_on_fold(fold_id=fold_id, raw_scores=[0.0], targets=[0], train_indices=[0], test_indices=[0], method="identity")
+    else:
+        fold = fit_calibration_on_fold(fold_id=fold_id, raw_scores=raw_scores, targets=targets, train_indices=list(range(len(raw_scores))), test_indices=list(range(len(test_result.get("plans") or []))), method="logistic")
+    test_raw_scores = [float((p.get("metadata") or {}).get("signal_strength", 0.0) or 0.0) for p in (test_result.get("plans") or [])]
+    test_raw_probs = [max(0.0, min(1.0, s)) for s in test_raw_scores]
+    applied = apply_calibration_to_test(raw_scores=test_raw_scores, raw_probs=test_raw_probs, fold=fold)
+    calibrated = {row["index"]: row["calibrated_ev"] for row in applied["calibrated_scores"]}
+    for idx, plan in enumerate(test_result.get("plans") or []):
+        plan.setdefault("metadata", {})["calibrated_signal_strength"] = calibrated.get(idx, plan.get("metadata", {}).get("signal_strength", 0.0))
+    return test_result, {"fold_id": fold_id, **applied["artifact"]}
+
+
+def run_fold_validation(*, request: RunnerRequest, data_path: str | None, data_source: str, scenario_id: str | None, strategy_mode: str, runner_fn: Callable[..., dict], holding_overlap: float = 1.0, mode: str = "walk_forward") -> dict:
+    bootstrap = runner_fn(request=request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, enable_validation=False)
+    dates = _all_candidate_dates(bootstrap)
+    horizon_days = int(request.config.research_spec.horizon_days if request.config.research_spec else 5)
+    purge, embargo = compute_purge_embargo(horizon_days=horizon_days, holding_overlap=holding_overlap)
     if len(dates) < 3:
-        aggregate = compute_performance_metrics(plans=plans, fills=fills, bars_by_symbol=bars_by_symbol, total_symbols=total_symbols)
+        aggregate = compute_performance_metrics(plans=[], fills=[], bars_by_symbol={}, total_symbols=len(request.scenario.symbols))
         return {"mode": mode, "purge": purge, "embargo": embargo, "folds": [], "aggregate": aggregate, "rejection_reasons": rejection_reasons(aggregate), "train_artifacts": [], "test_artifacts": []}
     if mode == "cpcv":
         fold_defs = build_cpcv_folds(n_obs=len(dates), n_folds=min(3, max(1, len(dates) // 2)), test_fold_size=max(1, len(dates) // 3), purge=purge, embargo=embargo)
@@ -350,38 +352,42 @@ def run_fold_validation(*, plans: Sequence[OrderPlan], fills: Sequence[FillOutco
     folds = []
     train_artifacts = []
     test_artifacts = []
-    for idx, fold in enumerate(normalized, start=1):
-        train_plans, train_fills = _subset_by_dates(plans, fills, set(fold["train_dates"]))
-        test_plans, test_fills = _subset_by_dates(plans, fills, set(fold["test_dates"]))
-        train_metrics = compute_performance_metrics(plans=train_plans, fills=train_fills, bars_by_symbol=bars_by_symbol, total_symbols=total_symbols)
-        test_metrics = compute_performance_metrics(plans=test_plans, fills=test_fills, bars_by_symbol=bars_by_symbol, total_symbols=total_symbols)
-        leakage_ok = True
-        if train_plans and test_plans:
-            train_outcomes = plan_outcomes(train_plans, train_fills, bars_by_symbol)
-            test_outcomes = plan_outcomes(test_plans, test_fills, bars_by_symbol)
-            max_train_exit = max((o.get("exit_date") or "") for o in train_outcomes if o.get("exit_date")) if train_outcomes else ""
-            min_test_entry = min((o.get("entry_date") or "") for o in test_outcomes if o.get("entry_date")) if test_outcomes else ""
-            leakage_ok = (not max_train_exit) or (not min_test_entry) or (max_train_exit < min_test_entry)
-        fold_row = {"fold_id": f"fold_{idx}", "split": fold, "train_metrics": train_metrics, "test_metrics": test_metrics, "leakage_ok": leakage_ok, "rejection_reasons": rejection_reasons(test_metrics)}
+    test_metrics_rows = []
+    for idx, split in enumerate(normalized, start=1):
+        fold_id = f"fold_{idx}"
+        train_request = _make_request_for_window(request, start_date=split["train_dates"][0], end_date=split["train_dates"][-1])
+        test_request = _make_request_for_window(request, start_date=split["test_dates"][0], end_date=split["test_dates"][-1])
+        train_result = runner_fn(request=train_request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, enable_validation=False)
+        test_result = runner_fn(request=test_request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, enable_validation=False)
+        train_returned_dates = set(_all_candidate_dates(train_result))
+        test_returned_dates = set(_all_candidate_dates(test_result))
+        if any(d not in set(split["train_dates"]) for d in train_returned_dates):
+            raise AssertionError(f"train leakage detected: {fold_id}")
+        if any(d not in set(split["test_dates"]) for d in test_returned_dates):
+            raise AssertionError(f"test leakage detected: {fold_id}")
+        train_raw_scores, train_targets = _calibration_targets(train_result)
+        test_result, calibration_artifact = _apply_fold_calibration(test_result, fold_id, train_raw_scores, train_targets)
+        leakage_ok = not split["train_dates"] or not split["test_dates"] or split["train_dates"][-1] < split["test_dates"][0]
+        if not leakage_ok:
+            raise AssertionError(f"fold leakage detected: {fold_id}")
+        train_metrics = compute_performance_metrics(plans=[_dict_to_plan(p) for p in train_result.get("plans") or []], fills=[_dict_to_fill(f) for f in train_result.get("fills") or []], bars_by_symbol=bootstrap.get("artifacts", {}).get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or {}, total_symbols=len(request.scenario.symbols)) if train_result.get("plans") is not None else {}
+        test_metrics = compute_performance_metrics(plans=[_dict_to_plan(p) for p in test_result.get("plans") or []], fills=[_dict_to_fill(f) for f in test_result.get("fills") or []], bars_by_symbol=bootstrap.get("artifacts", {}).get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or {}, total_symbols=len(request.scenario.symbols)) if test_result.get("plans") is not None else {}
+        test_metrics_rows.append(test_metrics)
+        fold_row = {"fold_id": fold_id, "split": split, "train_metrics": train_metrics, "test_metrics": test_metrics, "leakage_ok": leakage_ok, "rejection_reasons": rejection_reasons(test_metrics), "calibration": calibration_artifact}
         folds.append(fold_row)
-        train_artifacts.append({"fold_id": fold_row["fold_id"], "kind": "train_only", "dates": fold["train_dates"], "metrics": train_metrics})
-        test_artifacts.append({"fold_id": fold_row["fold_id"], "kind": "test_only", "dates": fold["test_dates"], "metrics": test_metrics})
-    test_metrics_rows = [f["test_metrics"] for f in folds]
-    aggregate = {
-        "expectancy_after_cost": sum(float(m.get("expectancy_after_cost", 0.0)) for m in test_metrics_rows) / max(len(test_metrics_rows), 1),
-        "realized_path_pnl": sum(float(m.get("realized_path_pnl", 0.0)) for m in test_metrics_rows),
-        "psr": sum(float(m.get("psr", 0.0)) for m in test_metrics_rows) / max(len(test_metrics_rows), 1),
-        "dsr": sum(float(m.get("dsr", 0.0)) for m in test_metrics_rows) / max(len(test_metrics_rows), 1),
-        "calibration_error": sum(float(m.get("calibration_error", 0.0)) for m in test_metrics_rows) / max(len(test_metrics_rows), 1),
-        "score_decile_monotonicity": all(bool(m.get("score_decile_monotonicity", False)) for m in test_metrics_rows),
-        "baseline_excess_information": {name: sum(float(m.get("baseline_excess_information", {}).get(name, 0.0)) for m in test_metrics_rows) / max(len(test_metrics_rows), 1) for name in {k for m in test_metrics_rows for k in (m.get("baseline_excess_information", {}) or {}).keys()}},
-        "effective_sample_size": sum(float(m.get("effective_sample_size", 0.0)) for m in test_metrics_rows),
-        "regime_breakdown": [item for m in test_metrics_rows for item in (m.get("regime_breakdown") or [])],
-        "fold_count": len(folds),
-        "all_folds_leakage_ok": all(bool(f.get("leakage_ok", False)) for f in folds),
-    }
+        train_artifacts.append({"fold_id": fold_id, "kind": "train_only", "dates": split["train_dates"], "calibration_fit": calibration_artifact, "result": train_result})
+        test_artifacts.append({"fold_id": fold_id, "kind": "test_only", "dates": split["test_dates"], "frozen_from_train": True, "result": test_result})
+    aggregate = {"expectancy_after_cost": sum(float(m.get("expectancy_after_cost", 0.0)) for m in test_metrics_rows) / max(len(test_metrics_rows), 1), "realized_path_pnl": sum(float(m.get("realized_path_pnl", 0.0)) for m in test_metrics_rows), "psr": sum(float(m.get("psr", 0.0)) for m in test_metrics_rows) / max(len(test_metrics_rows), 1), "dsr": sum(float(m.get("dsr", 0.0)) for m in test_metrics_rows) / max(len(test_metrics_rows), 1), "calibration_error": sum(float(m.get("calibration_error", 0.0)) for m in test_metrics_rows) / max(len(test_metrics_rows), 1), "score_decile_monotonicity": all(bool(m.get("score_decile_monotonicity", False)) for m in test_metrics_rows), "baseline_excess_information": {name: sum(float(m.get("baseline_excess_information", {}).get(name, 0.0)) for m in test_metrics_rows) / max(len(test_metrics_rows), 1) for name in {k for m in test_metrics_rows for k in (m.get("baseline_excess_information", {}) or {}).keys()}}, "effective_sample_size": sum(float(m.get("effective_sample_size", 0.0)) for m in test_metrics_rows), "regime_breakdown": [item for m in test_metrics_rows for item in (m.get("regime_breakdown") or [])], "fold_count": len(folds), "all_folds_leakage_ok": all(bool(f.get("leakage_ok", False)) for f in folds)}
     aggregate["validation_report"] = format_validation_report(aggregate)
     return {"mode": mode, "purge": purge, "embargo": embargo, "folds": folds, "aggregate": aggregate, "rejection_reasons": rejection_reasons(aggregate), "train_artifacts": train_artifacts, "test_artifacts": test_artifacts}
+
+
+def _dict_to_plan(payload: dict) -> OrderPlan:
+    return OrderPlan.from_dict(payload)
+
+
+def _dict_to_fill(payload: dict) -> FillOutcome:
+    return FillOutcome.from_dict(payload)
 
 
 def sensitivity_sweep(*, plans: Sequence[OrderPlan], fills: Sequence[FillOutcome], fee_grid: Iterable[float], slippage_grid: Iterable[float], total_symbols: int | None = None, bars_by_symbol: dict[str, list[HistoricalBar]] | None = None) -> list[SensitivityPoint]:

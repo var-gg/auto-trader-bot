@@ -13,9 +13,8 @@ from .models import SimulationRules
 def _event_time(ts: str) -> datetime:
     if ts:
         raw = ts.replace("Z", "+00:00")
-        if "T" in raw:
-            return datetime.fromisoformat(raw)
-        return datetime.fromisoformat(f"{raw}T00:00:00+00:00")
+        dt = datetime.fromisoformat(raw) if "T" in raw else datetime.fromisoformat(f"{raw}T00:00:00+00:00")
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
     return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -42,6 +41,7 @@ class SimulatedBroker:
         bars = list(bars)
         quote_policy = dict((plan.metadata or {}).get("quote_policy") or {}) if isinstance(plan.metadata, dict) else {}
         fill_proxy = float(quote_policy.get("fill_probability_proxy", quote_policy.get("optimizer_best", {}).get("fill_probability", 0.0)) or 0.0)
+        earliest_fill_ts = str((plan.metadata or {}).get("earliest_fill_ts") or "") if isinstance(plan.metadata, dict) else ""
         if not bars:
             return [
                 FillOutcome(
@@ -64,6 +64,8 @@ class SimulatedBroker:
         for leg in plan.legs:
             leg_filled = False
             for bar in bars:
+                if earliest_fill_ts and _event_time(bar.timestamp) < _event_time(earliest_fill_ts):
+                    continue
                 fillable, reason = self._fill_decision(requested_price=leg.limit_price, bar=bar)
                 if not fillable:
                     continue
@@ -96,6 +98,7 @@ class SimulatedBroker:
                             "fee_bps": self.rules.fee_bps,
                             "session_cutoff_mode": self.rules.session_cutoff_mode,
                             "fill_probability_proxy": fill_proxy,
+                            "earliest_fill_ts": earliest_fill_ts,
                         },
                     )
                 )

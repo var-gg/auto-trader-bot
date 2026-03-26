@@ -12,7 +12,7 @@ from shared.domain.models import MarketCode, OutcomeLabel, Side, SignalCandidate
 
 from .labeling import EventLabelingConfig, build_event_outcome_record, label_event_window
 from .models import EventOutcomeRecord, ResearchAnchor
-from .prototype import PrototypeConfig, build_anchor_prototypes
+from .prototype import PrototypeConfig, build_state_prototypes_from_event_memory
 from .repository import ExactCosineCandidateIndex
 from .scoring import CalibrationModel, CandidateScore, EVConfig, ScoringConfig, build_decision_surface, estimate_expected_value, score_candidates_exact
 
@@ -99,7 +99,7 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
             event = build_event_outcome_record(future_window, label_cfg)
             raw_embedding, feature_meta = build_query_embedding(symbol=lib_symbol, bars=history_window, bars_by_symbol=bars_by_symbol, macro_history={feature_end_date: macro_payload}, sector_map=sector_map, cutoff_date=feature_end_date)
             anchor_feature_rows.append({**feature_meta.get("shape_features", {}), **feature_meta.get("context_features", {})})
-            event_records.append(EventOutcomeRecord(symbol=lib_symbol, event_date=feature_end_date, outcome_end_date=outcome_end_date, schema_version=spec.label_version, path_summary={**event.path_summary, "path_label": event.path_label, "feature_end_date": feature_end_date}, side_outcomes=event.side_payload, diagnostics={**event.diagnostics, "decision_cutoff": decision_date, "feature_end_date": feature_end_date}))
+            event_records.append(EventOutcomeRecord(symbol=lib_symbol, event_date=feature_end_date, outcome_end_date=outcome_end_date, schema_version=spec.label_version, path_summary={**event.path_summary, "path_label": event.path_label, "feature_end_date": feature_end_date, "embedding": raw_embedding}, side_outcomes=event.side_payload, diagnostics={**event.diagnostics, "decision_cutoff": decision_date, "feature_end_date": feature_end_date, "embedding": raw_embedding, "shape_vector": raw_embedding[:3], "ctx_vector": raw_embedding[3:], "regime_code": regime_code, "sector_code": lib_sector, "liquidity_score": max(0.0, min(1.0, compute_bar_features(history_window).get("volume_mean", 0.0) / 1_000_000.0)), "quality_score": float(event.quality_score)}))
             for side_name in ("BUY", "SELL"):
                 side_payload = event.side_payload.get(side_name, {})
                 anchor_library.append(
@@ -134,7 +134,7 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
         history_window = next((bars_by_symbol[anchor.symbol][i - spec.feature_window_bars + 1 : i + 1] for i, b in enumerate(bars_by_symbol[anchor.symbol]) if str(b.timestamp)[:10] == anchor.reference_date), [])
         fv = build_multiscale_feature_vector(symbol=anchor.symbol, bars=history_window, market_bars=_market_proxy_bars(bars_by_symbol, cutoff_date=anchor.reference_date), sector_bars=_sector_proxy_bars(anchor.symbol, bars_by_symbol, sector_map, cutoff_date=anchor.reference_date), macro_history={anchor.reference_date: macro_history_by_date.get(anchor.reference_date, {})}, sector_code=anchor.sector_code, scaler=scaler)
         normalized_library.append(ResearchAnchor(symbol=anchor.symbol, anchor_code=anchor.anchor_code, reference_date=anchor.reference_date, anchor_date=anchor.anchor_date, side=anchor.side, embedding=fv.embedding, shape_vector=fv.shape_vector, ctx_vector=fv.ctx_vector, vector_version=spec.memory_version, embedding_model="manual-multiscale", vector_dim=len(fv.embedding), anchor_quality=anchor.anchor_quality, mae_pct=anchor.mae_pct, mfe_pct=anchor.mfe_pct, days_to_hit=anchor.days_to_hit, after_cost_return_pct=anchor.after_cost_return_pct, realized_return_pct=anchor.realized_return_pct, regime_code=anchor.regime_code, sector_code=anchor.sector_code, liquidity_score=anchor.liquidity_score, prototype_id=anchor.prototype_id, prototype_membership=dict(anchor.prototype_membership), metadata={**dict(anchor.metadata), "shape_dim": fv.metadata.get("shape_dim"), "ctx_dim": fv.metadata.get("ctx_dim")}))
-    prototypes = build_anchor_prototypes(normalized_library, PrototypeConfig(dedup_similarity_threshold=0.985)) if normalized_library else []
+    prototypes = build_state_prototypes_from_event_memory(event_records=event_records, as_of_date=decision_date, memory_version=spec.memory_version, spec_hash=spec.spec_hash(), config=PrototypeConfig(dedup_similarity_threshold=0.985, memory_version=spec.memory_version)) if event_records else []
     coverage = {"event_record_count": len(event_records), "anchor_count": len(normalized_library), "prototype_count": len(prototypes)}
     return {"spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "as_of_date": decision_date, "coverage": coverage, "excluded_reasons": excluded_reasons, "event_records": event_records, "anchor_library": normalized_library, "prototypes": prototypes, "scaler": scaler}
 
@@ -195,8 +195,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
         all_excluded_reasons.extend([{**r, "decision_date": decision_date} for r in memory["excluded_reasons"] + query_excluded])
         total_anchor_count += len(memory["anchor_library"])
         total_prototype_count += len(memory["prototypes"])
-        long_candidates = [p for p in memory["prototypes"] if p.side == Side.BUY.value]
-        short_candidates = [p for p in memory["prototypes"] if p.side == Side.SELL.value]
+        prototype_pool = list(memory["prototypes"])
         for symbol, q in query_panel.items():
             query_macro = dict(macro_history_by_date.get(decision_date, {}))
             regime_code = _regime_from_macro(query_macro)
@@ -204,11 +203,12 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
             query_embedding = q["embedding"]
             query_window = q["query_window"]
             execution_bar = q["execution_bar"]
-            long_scores = score_candidates_exact(query_embedding=query_embedding, candidates=long_candidates, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex())
-            short_scores = score_candidates_exact(query_embedding=query_embedding, candidates=short_candidates, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex())
-            long_ev = estimate_expected_value(side=Side.BUY.value, query_embedding=query_embedding, candidates=long_candidates, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
-            short_ev = estimate_expected_value(side=Side.SELL.value, query_embedding=query_embedding, candidates=short_candidates, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
-            surface = build_decision_surface(query_embedding=query_embedding, buy_candidates=long_candidates, sell_candidates=short_candidates, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
+            execution_date = str(execution_bar.timestamp)[:10]
+            long_scores = score_candidates_exact(query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex(), side=Side.BUY.value)
+            short_scores = score_candidates_exact(query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex(), side=Side.SELL.value)
+            long_ev = estimate_expected_value(side=Side.BUY.value, query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
+            short_ev = estimate_expected_value(side=Side.SELL.value, query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
+            surface = build_decision_surface(query_embedding=query_embedding, prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
             long_best = long_scores[0].score if long_scores else 0.0
             short_best = short_scores[0].score if short_scores else 0.0
             margin = abs(long_best - short_best)
@@ -220,13 +220,13 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
                 "decision_date": decision_date,
                 "symbol": symbol,
                 "strategy_mode": "research_similarity_v2",
-                "query": {"regime_code": regime_code, "sector_code": sector_code, "decision_date": decision_date, "decision_convention": DECISION_CONVENTION, "execution_price_source": "next_open", "macro_payload": query_macro, "query_embedding_dim": len(query_embedding), "feature_coverage_bars": len(query_window), "feature_window_bars": spec.feature_window_bars, "insufficient_history": False},
+                "query": {"regime_code": regime_code, "sector_code": sector_code, "decision_date": decision_date, "execution_date": execution_date, "decision_convention": DECISION_CONVENTION, "execution_price_source": "next_open", "price_reference_source": "next_open", "signal_timestamp": f"{decision_date}T15:30:00", "execution_start_timestamp": f"{execution_date}T09:00:00", "macro_payload": query_macro, "query_embedding_dim": len(query_embedding), "feature_coverage_bars": len(query_window), "feature_window_bars": spec.feature_window_bars, "insufficient_history": False},
                 "library": {"anchor_count": len(memory["anchor_library"]), "prototype_count": len(memory["prototypes"]), "event_record_count": len(memory["event_records"]), "max_outcome_end_before_decision": max((r.outcome_end_date for r in memory["event_records"] if r.outcome_end_date), default=None), "cache_key": cache_key},
                 "scores": {"long_score": long_best, "short_score": short_best, "score_margin": margin, "baseline_abstained": margin < abstain_margin},
                 "ev": {"long": {"calibrated_ev": long_ev.calibrated_ev, "abstained": long_ev.abstained}, "short": {"calibrated_ev": short_ev.calibrated_ev, "abstained": short_ev.abstained}},
                 "decision_surface": {"chosen_side": surface.chosen_side, "abstain": surface.abstain, "abstain_reasons": surface.abstain_reasons, "buy": {"p_target_first": surface.buy.p_target_first, "p_stop_first": surface.buy.p_stop_first, "p_flat": surface.buy.p_flat, "expected_net_return": surface.buy.expected_net_return, "expected_mae": surface.buy.expected_mae, "expected_mfe": surface.buy.expected_mfe, "q10": surface.buy.q10_return, "q50": surface.buy.q50_return, "q90": surface.buy.q90_return, "effective_sample_size": surface.buy.effective_sample_size, "regime_alignment": surface.buy.regime_alignment, "uncertainty": surface.buy.uncertainty}, "sell": {"p_target_first": surface.sell.p_target_first, "p_stop_first": surface.sell.p_stop_first, "p_flat": surface.sell.p_flat, "expected_net_return": surface.sell.expected_net_return, "expected_mae": surface.sell.expected_mae, "expected_mfe": surface.sell.expected_mfe, "q10": surface.sell.q10_return, "q50": surface.sell.q50_return, "q90": surface.sell.q90_return, "effective_sample_size": surface.sell.effective_sample_size, "regime_alignment": surface.sell.regime_alignment, "uncertainty": surface.sell.uncertainty}, "diagnostics": surface.diagnostics},
                 "top_matches": {"long": surface.buy.top_matches, "short": surface.sell.top_matches, "baseline_long": _topk(long_scores, top_k), "baseline_short": _topk(short_scores, top_k)},
-                "observed_outcome": {"label": outcome.label, "after_cost_return_pct": outcome.after_cost_return_pct, "days_to_hit": outcome.days_to_hit},
+                "observed_outcome": {"signal_generation_path": {"label": outcome.label, "after_cost_return_pct": outcome.after_cost_return_pct, "days_to_hit": outcome.days_to_hit, "path_start_date": decision_date}, "execution_realized_path": {"path_start_date": execution_date, "price_reference_source": "next_open"}},
             }
             panel_rows.append(row_diag)
             diagnostics[f"{decision_date}:{symbol}"] = row_diag
@@ -236,7 +236,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
             row_diag["scores"]["abstained"] = False
             chosen_side = Side.BUY if surface.chosen_side == Side.BUY.value else Side.SELL
             chosen = long_scores[0] if chosen_side == Side.BUY and long_scores else short_scores[0] if short_scores else None
-            out.append(SignalCandidate(symbol=symbol, ticker_id=None, market=MarketCode(market), side_bias=chosen_side, signal_strength=float((long_ev.calibrated_ev if chosen_side == Side.BUY else short_ev.calibrated_ev) if chosen else 0.0), confidence=float(long_ev.calibrated_win_prob if chosen_side == Side.BUY else short_ev.calibrated_win_prob), anchor_date=decision_date, reference_date=decision_date, current_price=float(execution_bar.open), atr_pct=float(max(0.01, compute_bar_features(query_window).get("range_pct", 0.02) / 3.0)), target_return_pct=spec.target_return_pct, max_reverse_pct=spec.stop_return_pct, expected_horizon_days=spec.horizon_days, outcome_label=OutcomeLabel.UNKNOWN, provenance={"strategy_mode": "research_similarity_v2", "decision_date": decision_date, "query_embedding_dim": len(query_embedding), "macro_payload": query_macro, "spec_hash": spec.spec_hash()}, diagnostics=row_diag, notes=["generated_by=research_similarity_v2", f"prototype_id={(chosen.prototype_id if chosen else '')}"]))
+            out.append(SignalCandidate(symbol=symbol, ticker_id=None, market=MarketCode(market), side_bias=chosen_side, signal_strength=float((long_ev.calibrated_ev if chosen_side == Side.BUY else short_ev.calibrated_ev) if chosen else 0.0), confidence=float(long_ev.calibrated_win_prob if chosen_side == Side.BUY else short_ev.calibrated_win_prob), anchor_date=decision_date, reference_date=decision_date, current_price=float(execution_bar.open), atr_pct=float(max(0.01, compute_bar_features(query_window).get("range_pct", 0.02) / 3.0)), target_return_pct=spec.target_return_pct, max_reverse_pct=spec.stop_return_pct, expected_horizon_days=spec.horizon_days, outcome_label=OutcomeLabel.UNKNOWN, provenance={"strategy_mode": "research_similarity_v2", "decision_date": decision_date, "execution_date": execution_date, "signal_timestamp": f"{decision_date}T15:30:00", "execution_start_timestamp": f"{execution_date}T09:00:00", "price_reference_source": "next_open", "query_embedding_dim": len(query_embedding), "macro_payload": query_macro, "spec_hash": spec.spec_hash()}, diagnostics=row_diag, notes=["generated_by=research_similarity_v2", f"prototype_id={(chosen.prototype_id if chosen else '')}"]))
 
     diagnostics["signal_panel"] = panel_rows
     diagnostics["signal_panel_jsonl"] = "\n".join(str(row) for row in panel_rows)

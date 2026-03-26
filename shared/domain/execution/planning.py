@@ -33,6 +33,9 @@ def build_order_plan_from_candidate(
     legs, desc = generate_pm_ladder(candidate, qty_cap, market, tuning, gain_pct=gain_pct, side=side)
     if not legs:
         return None, {"code": "NO_LEGS", "note": f"[{candidate.symbol}] no legs"}
+    signal_ts = ((candidate.provenance or {}).get("signal_timestamp") if hasattr(candidate, "provenance") else None) or (((candidate.diagnostics or {}).get("query") or {}).get("signal_timestamp") if isinstance(candidate.diagnostics, dict) else None)
+    execution_start_ts = ((candidate.provenance or {}).get("execution_start_timestamp") if hasattr(candidate, "provenance") else None) or (((candidate.diagnostics or {}).get("query") or {}).get("execution_start_timestamp") if isinstance(candidate.diagnostics, dict) else None)
+    executable_from_date = ((candidate.provenance or {}).get("execution_date") if hasattr(candidate, "provenance") else None) or (((candidate.diagnostics or {}).get("query") or {}).get("execution_date") if isinstance(candidate.diagnostics, dict) else None)
     plan = OrderPlan(
         plan_id=f"{candidate.symbol.lower()}-{side.value.lower()}-{generated_at.strftime('%Y%m%d%H%M%S')}",
         symbol=candidate.symbol,
@@ -56,6 +59,11 @@ def build_order_plan_from_candidate(
             "regime_code": ((candidate.diagnostics or {}).get("query") or {}).get("regime_code") if isinstance(candidate.diagnostics, dict) else None,
             "sector_code": ((candidate.diagnostics or {}).get("query") or {}).get("sector_code") if isinstance(candidate.diagnostics, dict) else None,
             "decision_surface_summary": ((candidate.diagnostics or {}).get("decision_surface") or {}) if isinstance(candidate.diagnostics, dict) else {},
+            "signal_timestamp": signal_ts,
+            "execution_start_timestamp": execution_start_ts,
+            "earliest_fill_ts": execution_start_ts,
+            "executable_from_date": executable_from_date,
+            "price_reference_source": ((candidate.provenance or {}).get("price_reference_source") if hasattr(candidate, "provenance") else None) or (((candidate.diagnostics or {}).get("query") or {}).get("price_reference_source") if isinstance(candidate.diagnostics, dict) else None),
             "chosen_policy_reason": quote_policy.get("chosen_policy_reason"),
             "quote_policy": quote_policy,
         },
