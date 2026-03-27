@@ -134,7 +134,7 @@ def _build_query_panel(*, decision_dates: list[str], spec: ResearchExperimentSpe
     return out, excluded_reasons
 
 
-def fit_train_artifacts(*, run_id: str, artifact_store: JsonResearchArtifactStore, train_end: str, test_start: str, purge: int, embargo: int, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, calibration_artifact: dict | None = None, quote_policy_calibration: dict | None = None) -> dict:
+def fit_train_artifacts(*, run_id: str, artifact_store: JsonResearchArtifactStore, train_end: str, test_start: str, purge: int, embargo: int, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, calibration_artifact: dict | None = None, quote_policy_calibration: dict | None = None, metadata: dict | None = None) -> dict:
     memory = build_event_memory_asof(decision_date=train_end, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market)
     max_train_date = max((r.event_date for r in memory["event_records"]), default=None)
     max_outcome_end = max((r.outcome_end_date for r in memory["event_records"] if r.outcome_end_date), default=None)
@@ -142,10 +142,10 @@ def fit_train_artifacts(*, run_id: str, artifact_store: JsonResearchArtifactStor
         raise AssertionError("future event/outcome mixed into train artifact")
     snapshot_id = f"{run_id}:{train_end}:{spec.spec_hash()}"
     artifact_store.save_prototype_snapshot(run_id=run_id, as_of_date=train_end, memory_version=spec.memory_version, payload={"spec_hash": spec.spec_hash(), "snapshot_id": snapshot_id, "prototype_count": len(memory["prototypes"]), "prototypes": [p.__dict__ for p in memory["prototypes"]]})
-    return {"run_id": run_id, "snapshot_id": snapshot_id, "spec_hash": spec.spec_hash(), "as_of_date": train_end, "train_end": train_end, "test_start": test_start, "purge": purge, "embargo": embargo, "memory_version": spec.memory_version, "prototype_snapshot_name": "prototype_snapshot", "max_train_date": max_train_date, "max_outcome_end_date": max_outcome_end, "prototypes": [p.__dict__ for p in memory["prototypes"]], "scaler": memory["scaler"], "calibration": dict(calibration_artifact or {"method": "logistic", "slope": 1.0, "intercept": 0.0, "ev_slope": 1.0, "ev_intercept": 0.0}), "quote_policy_calibration": dict(quote_policy_calibration or {"ev_threshold": 0.005, "uncertainty_cap": 0.12, "min_effective_sample_size": 1.5, "min_fill_probability": 0.1}), "snapshot_ids": {"prototype_snapshot_id": snapshot_id}}
+    return {"run_id": run_id, "snapshot_id": snapshot_id, "spec_hash": spec.spec_hash(), "as_of_date": train_end, "train_end": train_end, "test_start": test_start, "purge": purge, "embargo": embargo, "memory_version": spec.memory_version, "prototype_snapshot_name": "prototype_snapshot", "max_train_date": max_train_date, "max_outcome_end_date": max_outcome_end, "prototypes": [p.__dict__ for p in memory["prototypes"]], "scaler": memory["scaler"], "calibration": dict(calibration_artifact or {"method": "logistic", "slope": 1.0, "intercept": 0.0, "ev_slope": 1.0, "ev_intercept": 0.0}), "quote_policy_calibration": dict(quote_policy_calibration or {"ev_threshold": 0.005, "uncertainty_cap": 0.12, "min_effective_sample_size": 1.5, "min_fill_probability": 0.1, "abstain_margin": 0.05}), "metadata": dict(metadata or {}), "snapshot_ids": {"prototype_snapshot_id": snapshot_id}}
 
 
-def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: JsonResearchArtifactStore, decision_dates: list[str], spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, top_k: int = 3) -> dict:
+def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: JsonResearchArtifactStore, decision_dates: list[str], spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, top_k: int | None = None) -> dict:
     if not train_artifact:
         raise AssertionError("train artifact required")
     min_test_decision_date = min(decision_dates) if decision_dates else None
@@ -160,7 +160,9 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
     query_panel, excluded = _build_query_panel(decision_dates=decision_dates, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=train_artifact.get("scaler"))
     scoring_cfg = ScoringConfig(min_liquidity_score=0.0)
     qp = train_artifact.get("quote_policy_calibration") or {}
-    ev_cfg = EVConfig(top_k=top_k, min_effective_sample_size=float(qp.get("min_effective_sample_size", 1.5)), max_uncertainty=float(qp.get("uncertainty_cap", 0.12)), min_expected_utility=float(qp.get("ev_threshold", 0.005)))
+    metadata = train_artifact.get("metadata") or {}
+    effective_top_k = int(top_k or metadata.get("portfolio_top_n", 3) or 3)
+    ev_cfg = EVConfig(top_k=effective_top_k, min_effective_sample_size=float(qp.get("min_effective_sample_size", 1.5)), max_uncertainty=float(qp.get("uncertainty_cap", 0.12)), min_expected_utility=float(qp.get("ev_threshold", 0.005)))
     cal_payload = train_artifact.get("calibration") or {}
     calibration = CalibrationModel(method=str(cal_payload.get("method", "logistic")), slope=float(cal_payload.get("slope", 1.0)), intercept=float(cal_payload.get("intercept", 0.0)))
     ev_slope = float(cal_payload.get("ev_slope", 1.0))
@@ -168,7 +170,7 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
     panel_rows = []
     candidates = []
     broker = SimulatedBroker(rules=SimulationRules(slippage_bps=spec.slippage_bps, fee_bps=spec.fee_bps, allow_partial_fills=True))
-    portfolio_cfg = PortfolioConfig(top_n=max(1, top_k))
+    portfolio_cfg = PortfolioConfig(top_n=max(1, int(metadata.get("portfolio_top_n", effective_top_k) or effective_top_k)), risk_budget_fraction=float(metadata.get("portfolio_risk_budget_fraction", 0.95) or 0.95))
     tuning = {"MIN_TICK_GAP": 1, "ADAPTIVE_BASE_LEGS": 2, "ADAPTIVE_LEG_BOOST": 1.0, "MIN_TOTAL_SPREAD_PCT": 0.01, "ADAPTIVE_STRENGTH_SCALE": 0.1, "FIRST_LEG_BASE_PCT": 0.012, "FIRST_LEG_MIN_PCT": 0.006, "FIRST_LEG_MAX_PCT": 0.05, "FIRST_LEG_GAIN_WEIGHT": 0.6, "FIRST_LEG_ATR_WEIGHT": 0.5, "FIRST_LEG_REQ_FLOOR_PCT": 0.012, "MIN_FIRST_LEG_GAP_PCT": 0.03, "STRICT_MIN_FIRST_GAP": True, "ADAPTIVE_MAX_STEP_PCT": 0.06, "ADAPTIVE_FRAC_ALPHA": 1.25, "ADAPTIVE_GAIN_SCALE": 0.1, "MIN_LOT_QTY": 1}
     grouped_candidates = {}
     for decision_date, items in query_panel.items():
@@ -179,7 +181,7 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
             surface = build_decision_surface(query_embedding=q["embedding"], prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
             long_scores = score_candidates_exact(query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex(), side=Side.BUY.value)
             short_scores = score_candidates_exact(query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex(), side=Side.SELL.value)
-            panel_rows.append({"decision_date": decision_date, "symbol": symbol, "prototype_snapshot_id": train_artifact["snapshot_ids"]["prototype_snapshot_id"], "prototype_count": len(prototype_pool), "chosen_side": surface.chosen_side, "top_matches": {"long": _topk(long_scores, top_k), "short": _topk(short_scores, top_k)}})
+            panel_rows.append({"decision_date": decision_date, "symbol": symbol, "prototype_snapshot_id": train_artifact["snapshot_ids"]["prototype_snapshot_id"], "prototype_count": len(prototype_pool), "chosen_side": surface.chosen_side, "top_matches": {"long": _topk(long_scores, effective_top_k), "short": _topk(short_scores, effective_top_k)}})
             if surface.abstain:
                 continue
             chosen_side = Side.BUY if surface.chosen_side == Side.BUY.value else Side.SELL

@@ -7,6 +7,7 @@ from backtest_app.research.artifacts import JsonResearchArtifactStore
 from backtest_app.research.pipeline import fit_train_artifacts, run_test_with_frozen_artifacts
 from backtest_app.research_runtime.engine import run_backtest
 from backtest_app.validation import _calibration_targets, build_cpcv_folds, build_walk_forward_splits, compute_performance_metrics, compute_purge_embargo, rejection_reasons, run_fold_validation, sensitivity_sweep
+from scripts.research_first_batch import direct_metrics
 from shared.domain.models import ExecutionVenue, FillOutcome, FillStatus, OrderPlan, Side
 
 
@@ -178,3 +179,38 @@ def test_candidate_free_days_still_process_planned_exit_and_scenario_end_liquida
     assert result["portfolio"]["date_artifacts"][-1]["open_position_count"] == 0
     if result["plans"]:
         assert any(p["metadata"].get("forced_liquidation") for p in result["plans"])
+
+
+def test_legacy_direct_metrics_are_comparable():
+    plans = [_plan("a1", Side.BUY, 0.3, horizon_days=3)]
+    fills = [_fill("a1", Side.BUY)]
+    result = {"plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "bars_by_symbol": {"A1": _bars("A1", [100, 102, 103, 104, 105])}}
+    metrics = direct_metrics(result, 1)
+    assert metrics["trade_count"] == 1
+    assert metrics["fill_rate"] > 0.0
+    assert "expectancy_after_cost" in metrics and "psr" in metrics and "dsr" in metrics and "max_drawdown" in metrics
+
+
+def test_frozen_validation_uses_metadata_policy_knobs(monkeypatch):
+    request = RunnerRequest(scenario=BacktestScenario(scenario_id="s3", market="US", start_date="2026-01-01", end_date="2026-01-08", symbols=["A1"]), config=BacktestConfig(initial_capital=10000.0, research_spec=ResearchExperimentSpec(horizon_days=2, feature_window_bars=2), metadata={"portfolio_top_n": "2", "portfolio_risk_budget_fraction": "0.45", "quote_ev_threshold": "0.007", "quote_uncertainty_cap": "0.08", "quote_min_effective_sample_size": "1.7", "quote_min_fill_probability": "0.15", "abstain_margin": "0.03"}))
+    captured = {}
+    def fake_runner_fn(*, request, data_path, data_source, scenario_id, strategy_mode, enable_validation=False):
+        dates = [f"2026-01-0{i}" for i in range(1, 9) if request.scenario.start_date <= f"2026-01-0{i}" <= request.scenario.end_date]
+        plans = [_plan(f"a{i}", Side.BUY, 0.1 * i, anchor_date=d) for i, d in enumerate(dates, start=1)]
+        fills = [_fill(p.plan_id, p.side, day=min(i, 8)) for i, p in enumerate(plans, start=1)]
+        bars = {p.symbol: _bars(p.symbol, [100 + j for j in range(12)]) for p in plans}
+        return {"portfolio": {"decisions": [{"decision_date": d} for d in dates]}, "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "bars_by_symbol": bars, "historical_context": {"bars_by_symbol": bars, "trading_dates": dates, "macro_history_by_date": {}, "sector_map": {}}}
+    def fake_frozen(**kwargs):
+        captured.update(kwargs["train_artifact"])
+        return {"plans": [], "fills": [], "test_executed_from_frozen_train_artifacts": True}
+    monkeypatch.setattr("backtest_app.validation.run_test_with_frozen_artifacts", fake_frozen)
+    run_fold_validation(request=request, data_path=None, data_source="local-db", scenario_id="s3", strategy_mode="research_similarity_v2", runner_fn=fake_runner_fn, mode="walk_forward")
+    assert captured["metadata"]["portfolio_top_n"] == "2"
+    assert captured["quote_policy_calibration"]["ev_threshold"] == 0.007
+    assert captured["quote_policy_calibration"]["abstain_margin"] == 0.03
+
+
+def test_holdout_direct_metrics_are_distinct_from_fold_aggregate():
+    holdout_result = {"plans": [_plan("a1", Side.BUY, 0.2, horizon_days=3).to_dict()], "fills": [_fill("a1", Side.BUY).to_dict()], "bars_by_symbol": {"A1": _bars("A1", [100, 101, 102, 103, 104])}, "validation": {"fold_engine": {"aggregate": {"expectancy_after_cost": 9.99}}}}
+    direct = direct_metrics(holdout_result, 1)
+    assert direct["expectancy_after_cost"] != holdout_result["validation"]["fold_engine"]["aggregate"]["expectancy_after_cost"]

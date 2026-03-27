@@ -94,6 +94,19 @@ python scripts/research_first_batch.py --experiment-group first_batch_manual_202
 python scripts/research_first_batch.py --skip-holdout
 ```
 
+## Matrix batch runner
+
+For policy × portfolio decomposition after the first batch:
+
+```powershell
+python scripts/research_matrix_batch.py
+```
+
+This writes the normal per-run ledger plus group-level outputs:
+- `comparison_table.csv`
+- `comparison.md`
+- `axis_effect_summary.json`
+
 ## How to interpret the ledger
 
 Use `leaderboard.csv` to answer, in order:

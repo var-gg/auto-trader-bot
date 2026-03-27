@@ -14,6 +14,8 @@ from sqlalchemy import text
 from backtest_app.configs.models import BacktestConfig, BacktestScenario, ResearchExperimentSpec, RunnerRequest
 from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory, guard_backtest_local_only
 from backtest_app.research_runtime.engine import run_backtest
+from backtest_app.validation import compute_performance_metrics
+from shared.domain.models import FillOutcome, OrderPlan
 
 UNIVERSE = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "XOM", "LLY", "UNH", "COST", "PG"]
 
@@ -107,6 +109,25 @@ def summarize_regime_split(decisions: list[dict]) -> dict[str, int]:
     return out
 
 
+def _plan_obj(payload: dict) -> OrderPlan:
+    return OrderPlan.from_dict(payload)
+
+
+def _fill_obj(payload: dict) -> FillOutcome:
+    return FillOutcome.from_dict(payload)
+
+
+def direct_metrics(result: dict, total_symbols: int) -> dict:
+    plans = [_plan_obj(p) for p in (result.get("plans") or [])]
+    fills = [_fill_obj(f) for f in (result.get("fills") or [])]
+    bars_by_symbol = result.get("bars_by_symbol") or (result.get("historical_context") or {}).get("bars_by_symbol") or (result.get("artifacts") or {}).get("historical_context", {}).get("bars_by_symbol") or {}
+    metrics = compute_performance_metrics(plans=plans, fills=fills, bars_by_symbol=bars_by_symbol, total_symbols=total_symbols)
+    metrics["trade_count"] = len(plans)
+    metrics["fill_count"] = len(fills)
+    metrics["fill_rate"] = (sum(1 for p in plans if any(f.plan_id == p.plan_id for f in fills)) / max(len(plans), 1)) if plans else 0.0
+    return metrics
+
+
 def write_csv(path: Path, rows: list[dict]):
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -138,15 +159,18 @@ def build_report_md(*, run_card: dict, discovery: dict, holdout: dict, previous_
         f"- strategy_mode: {run_card['strategy_mode']}",
         f"- discovery: {run_card['discovery_start']} ~ {run_card['discovery_end']}",
         f"- holdout: {run_card['holdout_start']} ~ {run_card['holdout_end']}",
-        f"- trade_count: {run_card['trade_count']}",
-        f"- fill_count: {run_card['fill_count']}",
-        f"- coverage: {run_card['coverage']}",
-        f"- no_trade_ratio: {run_card['no_trade_ratio']}",
-        f"- expectancy_after_cost: {run_card['expectancy_after_cost']}",
-        f"- psr/dsr: {run_card['psr']} / {run_card['dsr']}",
-        f"- calibration_error: {run_card['calibration_error']}",
-        f"- monotonicity: {run_card['monotonicity']}",
-        f"- max_drawdown: {run_card['max_drawdown']}",
+        f"- discovery_cv_expectancy_after_cost: {run_card['discovery_cv_expectancy_after_cost']}",
+        f"- holdout_direct_expectancy_after_cost: {run_card['holdout_direct_expectancy_after_cost']}",
+        f"- holdout_fold_expectancy_after_cost: {run_card['holdout_fold_expectancy_after_cost']}",
+        f"- trade_count: {run_card['holdout_direct_trade_count']}",
+        f"- fill_count: {run_card['holdout_direct_fill_count']}",
+        f"- fill_rate: {run_card['holdout_direct_fill_rate']}",
+        f"- holdout_direct_coverage: {run_card['holdout_direct_coverage']}",
+        f"- holdout_direct_no_trade_ratio: {run_card['holdout_direct_no_trade_ratio']}",
+        f"- holdout_direct_psr/dsr: {run_card['holdout_direct_psr']} / {run_card['holdout_direct_dsr']}",
+        f"- discovery_cv_calibration_error: {run_card['discovery_cv_calibration_error']}",
+        f"- discovery_cv_monotonicity: {run_card['discovery_cv_monotonicity']}",
+        f"- holdout_direct_max_drawdown: {run_card['holdout_direct_max_drawdown']}",
         "",
         "## What improved",
     ]
@@ -164,7 +188,7 @@ def build_report_md(*, run_card: dict, discovery: dict, holdout: dict, previous_
         f"- fold_non_empty: {bool(discovery.get('validation', {}).get('fold_engine', {}).get('folds'))}",
         f"- frozen_validation: {all(bool(f.get('artifact', {}).get('test_executed_from_frozen_train_artifacts', False)) for f in discovery.get('validation', {}).get('fold_engine', {}).get('folds', []))}",
         f"- scenario_end_open_positions_zero: {discovery.get('portfolio', {}).get('date_artifacts', [{}])[-1].get('open_position_count', 0) == 0 if discovery.get('portfolio', {}).get('date_artifacts') else True}",
-        f"- holdout_expectancy_after_cost: {(holdout.get('validation', {}).get('fold_engine', {}).get('aggregate', {}) or {}).get('expectancy_after_cost', holdout.get('summary', {}).get('metadata', {}).get('expectancy_after_cost'))}",
+        f"- holdout_direct_vs_fold_gap: {run_card['holdout_direct_expectancy_after_cost']} vs {run_card['holdout_fold_expectancy_after_cost']}",
         "",
         "## Recommendation",
         "- Use leaderboard.csv to compare policy variants first.",
@@ -267,8 +291,10 @@ def main() -> int:
 
         aggregate = fold_engine.get("aggregate") or {}
         holdout_aggregate = ((holdout_result.get("validation") or {}).get("fold_engine") or {}).get("aggregate") or {}
-        side_split = summarize_side_split(discovery_result.get("plans") or [])
-        regime_split = summarize_regime_split(((discovery_result.get("portfolio") or {}).get("decisions") or []))
+        discovery_direct = direct_metrics(discovery_result, len(UNIVERSE))
+        holdout_direct = direct_metrics(holdout_result, len(UNIVERSE)) if holdout_result else {}
+        side_split = summarize_side_split(holdout_result.get("plans") or discovery_result.get("plans") or [])
+        regime_split = summarize_regime_split(((holdout_result.get("portfolio") or {}).get("decisions") or (discovery_result.get("portfolio") or {}).get("decisions") or []))
         run_card = {
             "run_id": run_id,
             "strategy_mode": cfg["strategy_mode"],
@@ -285,20 +311,25 @@ def main() -> int:
             "flat_return_band_pct": spec.flat_return_band_pct,
             "top_n": cfg["metadata"].get("portfolio_top_n", "3"),
             "risk_budget_fraction": cfg["metadata"].get("portfolio_risk_budget_fraction", "0.60"),
-            "trade_count": len(discovery_result.get("plans") or []),
-            "fill_count": len(discovery_result.get("fills") or []),
-            "coverage": aggregate.get("coverage", (discovery_result.get("validation") or {}).get("coverage", 0.0)),
-            "no_trade_ratio": aggregate.get("no_trade_ratio", (discovery_result.get("validation") or {}).get("no_trade_ratio", 0.0)),
-            "expectancy_after_cost": aggregate.get("expectancy_after_cost", 0.0),
-            "psr": aggregate.get("psr", 0.0),
-            "dsr": aggregate.get("dsr", 0.0),
-            "calibration_error": aggregate.get("calibration_error", 0.0),
-            "monotonicity": aggregate.get("score_decile_monotonicity", False),
-            "max_drawdown": (discovery_result.get("summary") or {}).get("max_drawdown", 0.0),
+            "discovery_cv_expectancy_after_cost": aggregate.get("expectancy_after_cost", discovery_direct.get("expectancy_after_cost", 0.0)),
+            "discovery_cv_psr": aggregate.get("psr", discovery_direct.get("psr", 0.0)),
+            "discovery_cv_dsr": aggregate.get("dsr", discovery_direct.get("dsr", 0.0)),
+            "discovery_cv_calibration_error": aggregate.get("calibration_error") if fold_engine.get("folds") else None,
+            "discovery_cv_monotonicity": aggregate.get("score_decile_monotonicity") if fold_engine.get("folds") else None,
+            "discovery_cv_max_drawdown": discovery_direct.get("max_drawdown", 0.0),
+            "holdout_direct_trade_count": holdout_direct.get("trade_count", 0),
+            "holdout_direct_fill_count": holdout_direct.get("fill_count", 0),
+            "holdout_direct_fill_rate": holdout_direct.get("fill_rate", 0.0),
+            "holdout_direct_coverage": holdout_direct.get("coverage", 0.0),
+            "holdout_direct_no_trade_ratio": holdout_direct.get("no_trade_ratio", 0.0),
+            "holdout_direct_expectancy_after_cost": holdout_direct.get("expectancy_after_cost", 0.0),
+            "holdout_direct_psr": holdout_direct.get("psr", 0.0),
+            "holdout_direct_dsr": holdout_direct.get("dsr", 0.0),
+            "holdout_direct_max_drawdown": holdout_direct.get("max_drawdown", 0.0),
+            "holdout_fold_expectancy_after_cost": holdout_aggregate.get("expectancy_after_cost", 0.0),
             "long_split": side_split.get("long", 0),
             "short_split": side_split.get("short", 0),
             "regime_split": json.dumps(regime_split, ensure_ascii=False),
-            "holdout_expectancy_after_cost": holdout_aggregate.get("expectancy_after_cost", 0.0),
             "universe_hash": universe_hash,
             "spec_hash": spec_hash,
             "data_snapshot_id": manifest["data_snapshot_id"],
