@@ -19,7 +19,7 @@
       "refresh_strategy": "cursor_upsert",
       "cursor_column": "updated_at",
       "fallback_cursor_column": "trade_date",
-      "source_sql": "SELECT o.ticker_id, t.symbol, o.trade_date, o.open, o.high, o.low, o.close, o.volume, o.updated_at FROM trading.ohlcv_daily o JOIN trading.ticker t ON t.id = o.ticker_id",
+      "source_sql": "SELECT o.ticker_id, t.symbol, o.trade_date, o.open, o.high, o.low, o.close, o.volume, o.updated_at FROM trading.ohlcv_daily o JOIN trading.ticker t ON t.id = o.ticker_id WHERE o.open IS NOT NULL AND o.high IS NOT NULL AND o.low IS NOT NULL AND o.close IS NOT NULL",
       "insert_sql": "INSERT INTO trading.bt_mirror_ohlcv_daily(ticker_id, symbol, trade_date, open, high, low, close, volume) VALUES (:ticker_id, :symbol, :trade_date, :open, :high, :low, :close, :volume) ON CONFLICT (ticker_id, trade_date) DO UPDATE SET symbol = EXCLUDED.symbol, open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close, volume = EXCLUDED.volume"
     },
     {
@@ -30,8 +30,9 @@
       "refresh_strategy": "resync",
       "cursor_column": "updated_at",
       "fallback_cursor_column": "id",
-      "source_sql": "SELECT * FROM trading.macro_data_series",
-      "insert_sql": "INSERT INTO trading.macro_data_series(id, fred_series_id, name, frequency, unit, is_active, created_at, updated_at) VALUES (:id, :fred_series_id, :name, :frequency, :unit, :is_active, :created_at, :updated_at) ON CONFLICT (id) DO UPDATE SET fred_series_id = EXCLUDED.fred_series_id, name = EXCLUDED.name, frequency = EXCLUDED.frequency, unit = EXCLUDED.unit, is_active = EXCLUDED.is_active, updated_at = EXCLUDED.updated_at"
+      "source_sql": "SELECT id, title AS name, frequency, units AS unit, is_active, created_at, updated_at FROM trading.macro_data_series",
+      "insert_sql": "INSERT INTO trading.macro_data_series(id, name, frequency, unit, is_active, created_at, updated_at) VALUES (:id, :name, :frequency, :unit, :is_active, :created_at, :updated_at) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, frequency = EXCLUDED.frequency, unit = EXCLUDED.unit, is_active = EXCLUDED.is_active, updated_at = EXCLUDED.updated_at",
+      "truncate_sql": "TRUNCATE TABLE trading.macro_data_series"
     },
     {
       "name": "macro_data_series_value",
@@ -39,32 +40,10 @@
       "target_table": "trading.macro_data_series_value",
       "refresh_group": "market",
       "refresh_strategy": "cursor_upsert",
-      "cursor_column": "updated_at",
+      "cursor_column": "obs_date",
       "fallback_cursor_column": "obs_date",
-      "source_sql": "SELECT * FROM trading.macro_data_series_value",
+      "source_sql": "SELECT id, series_id, obs_date, value, ingested_at AS created_at, ingested_at AS updated_at FROM trading.macro_data_series_value",
       "insert_sql": "INSERT INTO trading.macro_data_series_value(id, series_id, obs_date, value, created_at, updated_at) VALUES (:id, :series_id, :obs_date, :value, :created_at, :updated_at) ON CONFLICT (id) DO UPDATE SET series_id = EXCLUDED.series_id, obs_date = EXCLUDED.obs_date, value = EXCLUDED.value, updated_at = EXCLUDED.updated_at"
-    },
-    {
-      "name": "macro_group_series",
-      "source_table": "trading.macro_group_series",
-      "target_table": "trading.macro_group_series",
-      "refresh_group": "reference",
-      "refresh_strategy": "resync",
-      "cursor_column": "updated_at",
-      "fallback_cursor_column": "id",
-      "source_sql": "SELECT * FROM trading.macro_group_series",
-      "insert_sql": "INSERT INTO trading.macro_group_series(id, group_id, series_id, sort_order, is_active, created_at, updated_at) VALUES (:id, :group_id, :series_id, :sort_order, :is_active, :created_at, :updated_at) ON CONFLICT (id) DO UPDATE SET group_id = EXCLUDED.group_id, series_id = EXCLUDED.series_id, sort_order = EXCLUDED.sort_order, is_active = EXCLUDED.is_active, updated_at = EXCLUDED.updated_at"
-    },
-    {
-      "name": "news_anchor_vector",
-      "source_table": "trading.news_anchor_vector",
-      "target_table": "trading.news_anchor_vector",
-      "refresh_group": "reference",
-      "refresh_strategy": "resync",
-      "cursor_column": "updated_at",
-      "fallback_cursor_column": "id",
-      "source_sql": "SELECT * FROM trading.news_anchor_vector",
-      "insert_sql": "INSERT INTO trading.news_anchor_vector(id, code, name_ko, name_en, description, model_name, embedding_vector, created_at, updated_at) VALUES (:id, :code, :name_ko, :name_en, :description, :model_name, :embedding_vector, :created_at, :updated_at) ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code, name_ko = EXCLUDED.name_ko, name_en = EXCLUDED.name_en, description = EXCLUDED.description, model_name = EXCLUDED.model_name, embedding_vector = EXCLUDED.embedding_vector, updated_at = EXCLUDED.updated_at"
     }
   ],
   "exclude_prefixes": [
