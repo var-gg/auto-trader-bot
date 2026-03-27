@@ -76,6 +76,7 @@ class OptunaSearchConfig:
     holdout_end_date: str = ""
     pruner: str = "median"
     retry_failed_trials: int = 1
+    search_space: Dict[str, Dict[str, object]] = field(default_factory=dict)
     constraints: OptunaConstraintConfig = field(default_factory=OptunaConstraintConfig)
     objective: OptunaObjectiveConfig = field(default_factory=OptunaObjectiveConfig)
 

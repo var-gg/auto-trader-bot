@@ -326,29 +326,21 @@ def _calibration_targets(result: dict) -> tuple[list[float], list[int], list[flo
     return raw_scores, win_targets, return_targets
 
 
-def _apply_fold_calibration(test_result: dict, fold_id: str, raw_scores: list[float], win_targets: list[int], return_targets: list[float]) -> tuple[dict, dict]:
+def _fit_fold_calibration(fold_id: str, raw_scores: list[float], win_targets: list[int], return_targets: list[float]) -> dict:
     if not raw_scores or not win_targets:
-        fold = fit_calibration_on_fold(fold_id=fold_id, raw_scores=[0.0], targets=[0], train_indices=[0], test_indices=[0], method="identity")
+        fold = fit_calibration_on_fold(fold_id=fold_id, raw_scores=[0.0], targets=[0], train_indices=[0], test_indices=[0], method="logistic")
         ev_slope = 1.0
         ev_intercept = 0.0
     else:
-        fold = fit_calibration_on_fold(fold_id=fold_id, raw_scores=raw_scores, targets=win_targets, train_indices=list(range(len(raw_scores))), test_indices=list(range(len(test_result.get("plans") or []))), method="logistic")
+        fold = fit_calibration_on_fold(fold_id=fold_id, raw_scores=raw_scores, targets=win_targets, train_indices=list(range(len(raw_scores))), test_indices=list(range(len(raw_scores))), method="logistic")
         x_mean = sum(raw_scores) / max(len(raw_scores), 1)
         y_mean = sum(return_targets) / max(len(return_targets), 1)
         cov = sum((x - x_mean) * (y - y_mean) for x, y in zip(raw_scores, return_targets)) / max(len(raw_scores), 1)
         var = sum((x - x_mean) ** 2 for x in raw_scores) / max(len(raw_scores), 1)
         ev_slope = 1.0 if var <= 1e-12 else cov / var
         ev_intercept = y_mean - ev_slope * x_mean
-    test_raw_scores = [float((p.get("metadata") or {}).get("signal_strength", 0.0) or 0.0) for p in (test_result.get("plans") or [])]
-    test_raw_probs = [max(0.0, min(1.0, s)) for s in test_raw_scores]
-    applied = apply_calibration_to_test(raw_scores=test_raw_scores, raw_probs=test_raw_probs, fold=fold)
-    calibrated_prob = {row["index"]: row["calibrated_prob"] for row in applied["calibrated_probs"]}
-    calibrated_ev = {idx: ev_slope * score + ev_intercept for idx, score in enumerate(test_raw_scores)}
-    for idx, plan in enumerate(test_result.get("plans") or []):
-        meta = plan.setdefault("metadata", {})
-        meta["calibrated_signal_strength"] = calibrated_ev.get(idx, meta.get("signal_strength", 0.0))
-        meta["calibrated_win_prob"] = calibrated_prob.get(idx, max(0.0, min(1.0, meta.get("signal_strength", 0.0) or 0.0)))
-    return test_result, {"fold_id": fold_id, **applied["artifact"], "ev_slope": ev_slope, "ev_intercept": ev_intercept}
+    applied = apply_calibration_to_test(raw_scores=raw_scores or [0.0], raw_probs=[max(0.0, min(1.0, s)) for s in (raw_scores or [0.0])], fold=fold)
+    return {"fold_id": fold_id, **applied["artifact"], "ev_slope": ev_slope, "ev_intercept": ev_intercept}
 
 
 def run_fold_validation(*, request: RunnerRequest, data_path: str | None, data_source: str, scenario_id: str | None, strategy_mode: str, runner_fn: Callable[..., dict], holding_overlap: float = 1.0, mode: str = "walk_forward") -> dict:
@@ -387,16 +379,18 @@ def run_fold_validation(*, request: RunnerRequest, data_path: str | None, data_s
         if any(d not in set(split["test_dates"]) for d in test_returned_dates):
             raise AssertionError(f"test leakage detected: {fold_id}")
         train_raw_scores, train_win_targets, train_return_targets = _calibration_targets(train_result)
-        train_artifact = fit_train_artifacts(run_id=fold_id, artifact_store=artifact_store, train_end=split["train_dates"][-1], test_start=split["test_dates"][0], purge=split["purge"], embargo=split["embargo"], spec=request.config.research_spec, bars_by_symbol=train_result.get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or {}, macro_history_by_date=train_result.get("macro_history_by_date") or {}, sector_map=train_result.get("sector_map") or {}, market=request.scenario.market)
+        calibration_artifact = _fit_fold_calibration(fold_id, train_raw_scores, train_win_targets, train_return_targets)
+        train_artifact = fit_train_artifacts(run_id=fold_id, artifact_store=artifact_store, train_end=split["train_dates"][-1], test_start=split["test_dates"][0], purge=split["purge"], embargo=split["embargo"], spec=request.config.research_spec, bars_by_symbol=train_result.get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or {}, macro_history_by_date=train_result.get("macro_history_by_date") or {}, sector_map=train_result.get("sector_map") or {}, market=request.scenario.market, calibration_artifact=calibration_artifact, quote_policy_calibration={"ev_threshold": 0.005, "uncertainty_cap": 0.12, "min_effective_sample_size": 1.5, "min_fill_probability": 0.1})
         frozen_eval = run_test_with_frozen_artifacts(train_artifact=train_artifact, artifact_store=artifact_store, decision_dates=split["test_dates"], spec=request.config.research_spec, bars_by_symbol=test_result.get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or {}, macro_history_by_date=test_result.get("macro_history_by_date") or {}, sector_map=test_result.get("sector_map") or {}, market=request.scenario.market)
-        test_result, calibration_artifact = _apply_fold_calibration(test_result, fold_id, train_raw_scores, train_win_targets, train_return_targets)
         leakage_ok = not split["train_dates"] or not split["test_dates"] or ((train_artifact.get("max_train_date") or split["train_dates"][-1]) < split["test_dates"][0])
         if not leakage_ok:
             raise AssertionError(f"fold leakage detected: {fold_id}")
         train_metrics = compute_performance_metrics(plans=[_dict_to_plan(p) for p in train_result.get("plans") or []], fills=[_dict_to_fill(f) for f in train_result.get("fills") or []], bars_by_symbol=bootstrap.get("artifacts", {}).get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or {}, total_symbols=len(request.scenario.symbols)) if train_result.get("plans") is not None else {}
-        test_metrics = compute_performance_metrics(plans=[_dict_to_plan(p) for p in test_result.get("plans") or []], fills=[_dict_to_fill(f) for f in test_result.get("fills") or []], bars_by_symbol=bootstrap.get("artifacts", {}).get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or {}, total_symbols=len(request.scenario.symbols)) if test_result.get("plans") is not None else {}
+        if not frozen_eval.get("test_executed_from_frozen_train_artifacts"):
+            raise AssertionError(f"frozen path required: {fold_id}")
+        test_metrics = compute_performance_metrics(plans=[_dict_to_plan(p) for p in frozen_eval.get("plans") or []], fills=[_dict_to_fill(f) for f in frozen_eval.get("fills") or []], bars_by_symbol=bootstrap.get("artifacts", {}).get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or {}, total_symbols=len(request.scenario.symbols))
         test_metrics_rows.append(test_metrics)
-        fold_row = {"fold_id": fold_id, "split": split, "train_metrics": train_metrics, "test_metrics": test_metrics, "leakage_ok": leakage_ok, "rejection_reasons": rejection_reasons(test_metrics), "calibration": calibration_artifact, "artifact": {"spec_hash": train_artifact.get("spec_hash"), "as_of_date": train_artifact.get("as_of_date"), "train_end": train_artifact.get("train_end"), "test_start": train_artifact.get("test_start"), "purge": train_artifact.get("purge"), "embargo": train_artifact.get("embargo"), "snapshot_ids": train_artifact.get("snapshot_ids")}}
+        fold_row = {"fold_id": fold_id, "split": split, "train_metrics": train_metrics, "test_metrics": test_metrics, "leakage_ok": leakage_ok, "rejection_reasons": rejection_reasons(test_metrics), "calibration": calibration_artifact, "artifact": {"spec_hash": train_artifact.get("spec_hash"), "as_of_date": train_artifact.get("as_of_date"), "train_end": train_artifact.get("train_end"), "test_start": train_artifact.get("test_start"), "purge": train_artifact.get("purge"), "embargo": train_artifact.get("embargo"), "snapshot_ids": train_artifact.get("snapshot_ids"), "test_executed_from_frozen_train_artifacts": True}}
         folds.append(fold_row)
         train_artifacts.append({"fold_id": fold_id, "kind": "train_only", "dates": split["train_dates"], "calibration_fit": calibration_artifact, "artifact": train_artifact, "result": train_result})
         test_artifacts.append({"fold_id": fold_id, "kind": "test_only", "dates": split["test_dates"], "frozen_from_train": True, "artifact": {**train_artifact, "frozen_eval": frozen_eval}, "result": test_result})

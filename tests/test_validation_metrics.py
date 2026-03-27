@@ -81,6 +81,9 @@ def test_fit_train_artifact_and_test_use_same_snapshot_id_and_block_future_mix()
     train_artifact = fit_train_artifacts(run_id="fold_1", artifact_store=store, train_end="2026-01-05", test_start="2026-01-06", purge=1, embargo=1, spec=spec, bars_by_symbol=bars, macro_history_by_date={}, sector_map={}, market="US")
     frozen = run_test_with_frozen_artifacts(train_artifact=train_artifact, artifact_store=store, decision_dates=["2026-01-06"], spec=spec, bars_by_symbol=bars, macro_history_by_date={}, sector_map={}, market="US")
     assert frozen["frozen_snapshot_id"] == train_artifact["snapshot_ids"]["prototype_snapshot_id"]
+    assert frozen["test_executed_from_frozen_train_artifacts"] is True
+    assert isinstance(frozen["plans"], list)
+    assert isinstance(frozen["fills"], list)
     bad_artifact = dict(train_artifact)
     bad_artifact["max_outcome_end_date"] = "2026-01-06"
     try:
@@ -105,6 +108,25 @@ def test_run_fold_validation_emits_fold_native_artifacts():
     assert report["train_artifacts"]
     assert report["test_artifacts"]
     assert report["train_artifacts"][0]["artifact"]["snapshot_ids"]["prototype_snapshot_id"] == report["test_artifacts"][0]["artifact"]["snapshot_ids"]["prototype_snapshot_id"]
+    assert report["test_artifacts"][0]["artifact"]["frozen_eval"]["test_executed_from_frozen_train_artifacts"] is True
+    assert report["folds"][0]["artifact"]["test_executed_from_frozen_train_artifacts"] is True
+
+
+def test_run_fold_validation_fails_if_frozen_path_not_used(monkeypatch):
+    request = RunnerRequest(scenario=BacktestScenario(scenario_id="s2", market="US", start_date="2026-01-01", end_date="2026-01-08", symbols=["A1"]), config=BacktestConfig(initial_capital=10000.0, research_spec=ResearchExperimentSpec(horizon_days=2, feature_window_bars=2)))
+    def fake_runner_fn(*, request, data_path, data_source, scenario_id, strategy_mode, enable_validation=False):
+        dates = [f"2026-01-0{i}" for i in range(1, 9) if request.scenario.start_date <= f"2026-01-0{i}" <= request.scenario.end_date]
+        plans = [_plan(f"a{i}", Side.BUY, 0.1 * i, anchor_date=d) for i, d in enumerate(dates, start=1)]
+        fills = [_fill(p.plan_id, p.side, day=min(i, 8)) for i, p in enumerate(plans, start=1)]
+        bars = {p.symbol: _bars(p.symbol, [100 + j for j in range(12)]) for p in plans}
+        return {"portfolio": {"decisions": [{"decision_date": d} for d in dates]}, "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "bars_by_symbol": bars}
+    monkeypatch.setattr("backtest_app.validation.run_test_with_frozen_artifacts", lambda **kwargs: {"plans": [], "fills": [], "test_executed_from_frozen_train_artifacts": False})
+    try:
+        run_fold_validation(request=request, data_path=None, data_source="local-db", scenario_id="s2", strategy_mode="research_similarity_v2", runner_fn=fake_runner_fn, mode="walk_forward")
+    except AssertionError:
+        assert True
+    else:
+        assert False, "expected frozen-path enforcement failure"
 
 
 def test_rejection_reasons_flags_bad_validation_profile():
