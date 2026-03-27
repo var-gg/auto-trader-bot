@@ -152,13 +152,15 @@ def build_spec() -> ResearchExperimentSpec:
     )
 
 
-def run_configs() -> list[dict]:
-    return [
-        {"label": "legacy_event_window", "strategy_mode": "legacy_event_window", "metadata": {"portfolio_top_n": "3", "portfolio_risk_budget_fraction": "0.60"}},
+def run_configs(*, include_legacy: bool = True) -> list[dict]:
+    configs = [
         {"label": "research_similarity_v2_base", "strategy_mode": "research_similarity_v2", "metadata": {"portfolio_top_n": "3", "portfolio_risk_budget_fraction": "0.60", "quote_ev_threshold": "0.005", "quote_uncertainty_cap": "0.12", "quote_min_fill_probability": "0.10", "abstain_margin": "0.00"}},
         {"label": "research_similarity_v2_conservative", "strategy_mode": "research_similarity_v2", "metadata": {"portfolio_top_n": "2", "portfolio_risk_budget_fraction": "0.45", "quote_ev_threshold": "0.007", "quote_uncertainty_cap": "0.08", "quote_min_fill_probability": "0.15", "abstain_margin": "0.03"}},
         {"label": "research_similarity_v2_aggressive", "strategy_mode": "research_similarity_v2", "metadata": {"portfolio_top_n": "4", "portfolio_risk_budget_fraction": "0.75", "quote_ev_threshold": "0.003", "quote_uncertainty_cap": "0.14", "quote_min_fill_probability": "0.05", "abstain_margin": "0.00"}},
     ]
+    if include_legacy:
+        return [{"label": "legacy_event_window", "strategy_mode": "legacy_event_window", "metadata": {"portfolio_top_n": "3", "portfolio_risk_budget_fraction": "0.60"}}, *configs]
+    return configs
 
 
 def build_request(*, scenario_id: str, start_date: str, end_date: str, strategy_mode: str, spec: ResearchExperimentSpec, metadata: dict[str, str]) -> RunnerRequest:
@@ -348,7 +350,7 @@ def main() -> int:
     (root / "preflight.json").write_text(json.dumps(preflight, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     leaderboard_path = root / "leaderboard.csv"
 
-    for cfg in run_configs():
+    for cfg in run_configs(include_legacy=not args.skip_legacy_reference):
         run_key = {
             "experiment_group": experiment_group,
             "label": cfg["label"],

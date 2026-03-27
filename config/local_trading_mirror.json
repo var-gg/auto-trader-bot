@@ -9,7 +9,7 @@
       "refresh_strategy": "full",
       "source_sql": "SELECT id, symbol, exchange, country FROM trading.ticker",
       "insert_sql": "INSERT INTO trading.bt_mirror_ticker(ticker_id, symbol, exchange, country) VALUES (:id, :symbol, :exchange, :country)",
-      "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_ticker"
+      "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_ticker CASCADE"
     },
     {
       "name": "sector",
@@ -17,11 +17,11 @@
       "target_table": "trading.bt_mirror_sector",
       "refresh_group": "reference",
       "refresh_strategy": "resync",
-      "cursor_column": "updated_at",
+      "cursor_column": "id",
       "fallback_cursor_column": "id",
-      "source_sql": "SELECT id, code, name, created_at, updated_at FROM trading.sector",
+      "source_sql": "SELECT id, code, system AS name, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at FROM trading.sector",
       "insert_sql": "INSERT INTO trading.bt_mirror_sector(sector_id, code, name, created_at, updated_at) VALUES (:id, :code, :name, :created_at, :updated_at) ON CONFLICT (sector_id) DO UPDATE SET code = EXCLUDED.code, name = EXCLUDED.name, updated_at = EXCLUDED.updated_at",
-      "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_sector"
+      "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_sector CASCADE"
     },
     {
       "name": "industry",
@@ -29,11 +29,11 @@
       "target_table": "trading.bt_mirror_industry",
       "refresh_group": "reference",
       "refresh_strategy": "resync",
-      "cursor_column": "updated_at",
+      "cursor_column": "id",
       "fallback_cursor_column": "id",
-      "source_sql": "SELECT id, sector_id, code, name, created_at, updated_at FROM trading.industry",
+      "source_sql": "SELECT id, sector_id, code, system AS name, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at FROM trading.industry",
       "insert_sql": "INSERT INTO trading.bt_mirror_industry(industry_id, sector_id, code, name, created_at, updated_at) VALUES (:id, :sector_id, :code, :name, :created_at, :updated_at) ON CONFLICT (industry_id) DO UPDATE SET sector_id = EXCLUDED.sector_id, code = EXCLUDED.code, name = EXCLUDED.name, updated_at = EXCLUDED.updated_at",
-      "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_industry"
+      "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_industry CASCADE"
     },
     {
       "name": "ticker_industry",
@@ -41,9 +41,9 @@
       "target_table": "trading.bt_mirror_ticker_industry",
       "refresh_group": "reference",
       "refresh_strategy": "resync",
-      "cursor_column": "updated_at",
-      "fallback_cursor_column": "ticker_id",
-      "source_sql": "SELECT ticker_id, industry_id, is_primary, created_at, updated_at FROM trading.ticker_industry",
+      "cursor_column": "id",
+      "fallback_cursor_column": "id",
+      "source_sql": "SELECT id, ticker_id, industry_id, TRUE AS is_primary, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at FROM trading.ticker_industry",
       "insert_sql": "INSERT INTO trading.bt_mirror_ticker_industry(ticker_id, industry_id, is_primary, created_at, updated_at) VALUES (:ticker_id, :industry_id, :is_primary, :created_at, :updated_at) ON CONFLICT (ticker_id, industry_id) DO UPDATE SET is_primary = EXCLUDED.is_primary, updated_at = EXCLUDED.updated_at",
       "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_ticker_industry"
     },
