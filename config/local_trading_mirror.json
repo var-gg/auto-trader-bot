@@ -12,6 +12,42 @@
       "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_ticker"
     },
     {
+      "name": "sector",
+      "source_table": "trading.sector",
+      "target_table": "trading.bt_mirror_sector",
+      "refresh_group": "reference",
+      "refresh_strategy": "resync",
+      "cursor_column": "updated_at",
+      "fallback_cursor_column": "id",
+      "source_sql": "SELECT id, code, name, created_at, updated_at FROM trading.sector",
+      "insert_sql": "INSERT INTO trading.bt_mirror_sector(sector_id, code, name, created_at, updated_at) VALUES (:id, :code, :name, :created_at, :updated_at) ON CONFLICT (sector_id) DO UPDATE SET code = EXCLUDED.code, name = EXCLUDED.name, updated_at = EXCLUDED.updated_at",
+      "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_sector"
+    },
+    {
+      "name": "industry",
+      "source_table": "trading.industry",
+      "target_table": "trading.bt_mirror_industry",
+      "refresh_group": "reference",
+      "refresh_strategy": "resync",
+      "cursor_column": "updated_at",
+      "fallback_cursor_column": "id",
+      "source_sql": "SELECT id, sector_id, code, name, created_at, updated_at FROM trading.industry",
+      "insert_sql": "INSERT INTO trading.bt_mirror_industry(industry_id, sector_id, code, name, created_at, updated_at) VALUES (:id, :sector_id, :code, :name, :created_at, :updated_at) ON CONFLICT (industry_id) DO UPDATE SET sector_id = EXCLUDED.sector_id, code = EXCLUDED.code, name = EXCLUDED.name, updated_at = EXCLUDED.updated_at",
+      "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_industry"
+    },
+    {
+      "name": "ticker_industry",
+      "source_table": "trading.ticker_industry",
+      "target_table": "trading.bt_mirror_ticker_industry",
+      "refresh_group": "reference",
+      "refresh_strategy": "resync",
+      "cursor_column": "updated_at",
+      "fallback_cursor_column": "ticker_id",
+      "source_sql": "SELECT ticker_id, industry_id, is_primary, created_at, updated_at FROM trading.ticker_industry",
+      "insert_sql": "INSERT INTO trading.bt_mirror_ticker_industry(ticker_id, industry_id, is_primary, created_at, updated_at) VALUES (:ticker_id, :industry_id, :is_primary, :created_at, :updated_at) ON CONFLICT (ticker_id, industry_id) DO UPDATE SET is_primary = EXCLUDED.is_primary, updated_at = EXCLUDED.updated_at",
+      "truncate_sql": "TRUNCATE TABLE trading.bt_mirror_ticker_industry"
+    },
+    {
       "name": "ohlcv_daily",
       "source_table": "trading.ohlcv_daily",
       "target_table": "trading.bt_mirror_ohlcv_daily",

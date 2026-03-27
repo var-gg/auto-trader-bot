@@ -16,6 +16,47 @@ CREATE TABLE IF NOT EXISTS trading.bt_mirror_ticker (
 CREATE UNIQUE INDEX IF NOT EXISTS ix_bt_mirror_ticker_symbol_exchange
     ON trading.bt_mirror_ticker(symbol, exchange);
 
+CREATE TABLE IF NOT EXISTS trading.bt_mirror_sector (
+    sector_id INTEGER PRIMARY KEY,
+    code TEXT NOT NULL,
+    name TEXT,
+    created_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_bt_mirror_sector_code
+    ON trading.bt_mirror_sector(code);
+
+CREATE TABLE IF NOT EXISTS trading.bt_mirror_industry (
+    industry_id INTEGER PRIMARY KEY,
+    sector_id INTEGER NOT NULL REFERENCES trading.bt_mirror_sector(sector_id),
+    code TEXT NOT NULL,
+    name TEXT,
+    created_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS ix_bt_mirror_industry_sector_id
+    ON trading.bt_mirror_industry(sector_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_bt_mirror_industry_code
+    ON trading.bt_mirror_industry(code);
+
+CREATE TABLE IF NOT EXISTS trading.bt_mirror_ticker_industry (
+    ticker_id INTEGER NOT NULL REFERENCES trading.bt_mirror_ticker(ticker_id),
+    industry_id INTEGER NOT NULL REFERENCES trading.bt_mirror_industry(industry_id),
+    is_primary BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    PRIMARY KEY (ticker_id, industry_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_bt_mirror_ticker_industry_industry_id
+    ON trading.bt_mirror_ticker_industry(industry_id);
+
+CREATE INDEX IF NOT EXISTS ix_bt_mirror_ticker_industry_ticker_primary
+    ON trading.bt_mirror_ticker_industry(ticker_id, is_primary);
+
 CREATE TABLE IF NOT EXISTS trading.bt_mirror_ohlcv_daily (
     ticker_id INTEGER NOT NULL,
     symbol TEXT NOT NULL,
@@ -64,3 +105,25 @@ CREATE INDEX IF NOT EXISTS ix_bt_event_window_scenario_market_refdate
 
 CREATE INDEX IF NOT EXISTS ix_bt_event_window_symbol_event_time
     ON trading.bt_event_window(symbol, event_time);
+
+CREATE SCHEMA IF NOT EXISTS meta;
+
+CREATE TABLE IF NOT EXISTS meta.bt_scenario_snapshot_manifest (
+    snapshot_id TEXT PRIMARY KEY,
+    scenario_id TEXT NOT NULL UNIQUE,
+    phase TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    market TEXT NOT NULL,
+    window_start DATE NOT NULL,
+    window_end DATE NOT NULL,
+    universe_hash TEXT NOT NULL,
+    spec_hash TEXT NOT NULL,
+    row_count INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    notes TEXT,
+    source_path TEXT,
+    copied_from_scenario_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_bt_scenario_snapshot_manifest_phase_market
+    ON meta.bt_scenario_snapshot_manifest(phase, market, window_start, window_end);

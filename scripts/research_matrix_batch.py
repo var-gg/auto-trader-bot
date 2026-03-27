@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 from copy import deepcopy
 from datetime import date
 from pathlib import Path
 from typing import Any
 
+from backtest_app.research_runtime.engine import run_backtest
 from scripts.research_first_batch import (
+    MISSING_LEGACY_SNAPSHOT_MESSAGE,
     UNIVERSE,
     append_leaderboard,
     build_report_md,
@@ -17,13 +18,12 @@ from scripts.research_first_batch import (
     direct_metrics,
     load_leaderboard_rows,
     preflight_local_db,
+    resolve_legacy_scenarios,
     stable_hash,
     summarize_regime_split,
     summarize_side_split,
     write_csv,
 )
-from backtest_app.research_runtime.engine import run_backtest
-
 
 POLICY_PRESETS = {
     "P1_conservative": {
@@ -97,9 +97,11 @@ def _quote_gap_distribution(result: dict) -> tuple[float, float]:
     if not gaps:
         return 0.0, 0.0
     gaps = sorted(gaps)
+
     def pct(q: float) -> float:
         idx = min(len(gaps) - 1, max(0, int(round((len(gaps) - 1) * q))))
         return float(gaps[idx])
+
     return pct(0.50), pct(0.90)
 
 
@@ -117,7 +119,7 @@ def _abstain_reason_distribution(result: dict) -> dict[str, int]:
     return out
 
 
-def _build_manifest(*, experiment_group: str, run_id: str, label: str, strategy_mode: str, spec, preflight: dict, metadata: dict, discovery_result: dict, holdout_result: dict) -> dict:
+def _build_manifest(*, experiment_group: str, run_id: str, label: str, strategy_mode: str, spec, preflight: dict, metadata: dict, discovery_result: dict, holdout_result: dict, bt_event_window_snapshot_id: str | None) -> dict:
     return {
         "experiment_group": experiment_group,
         "run_id": run_id,
@@ -128,6 +130,7 @@ def _build_manifest(*, experiment_group: str, run_id: str, label: str, strategy_
         "spec": spec.to_dict(),
         "spec_hash": spec.spec_hash(),
         "data_snapshot_id": (discovery_result.get("manifest") or {}).get("data_snapshot_id"),
+        "bt_event_window_snapshot_id": bt_event_window_snapshot_id,
         "discovery_manifest": discovery_result.get("manifest"),
         "holdout_manifest": holdout_result.get("manifest"),
         "preflight": preflight,
@@ -135,7 +138,7 @@ def _build_manifest(*, experiment_group: str, run_id: str, label: str, strategy_
     }
 
 
-def _run_one(*, root: Path, leaderboard_path: Path, experiment_group: str, preflight: dict, spec, label: str, strategy_mode: str, metadata: dict) -> dict:
+def _run_one(*, root: Path, leaderboard_path: Path, experiment_group: str, preflight: dict, spec, label: str, strategy_mode: str, metadata: dict, discovery_scenario_id: str, holdout_scenario_id: str, bt_event_window_snapshot_id: str | None) -> dict:
     universe_hash = stable_hash(UNIVERSE)
     spec_hash = spec.spec_hash()
     run_key = {
@@ -146,17 +149,20 @@ def _run_one(*, root: Path, leaderboard_path: Path, experiment_group: str, prefl
         "spec_hash": spec_hash,
         "window": [preflight["discovery_start"], preflight["discovery_end"], preflight["holdout_start"], preflight["holdout_end"]],
         "metadata": metadata,
+        "legacy_discovery_scenario_id": discovery_scenario_id,
+        "legacy_holdout_scenario_id": holdout_scenario_id,
+        "bt_event_window_snapshot_id": bt_event_window_snapshot_id,
     }
     run_id = f"{label}_{stable_hash(run_key, 12)}"
     run_dir = root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    discovery_request = build_request(scenario_id=f"{run_id}_discovery", start_date=preflight["discovery_start"], end_date=preflight["discovery_end"], strategy_mode=strategy_mode, spec=spec, metadata=metadata)
+    discovery_request = build_request(scenario_id=discovery_scenario_id if strategy_mode == "legacy_event_window" else f"{run_id}_discovery", start_date=preflight["discovery_start"], end_date=preflight["discovery_end"], strategy_mode=strategy_mode, spec=spec, metadata=metadata)
     discovery_result = run_backtest(request=discovery_request, data_path=None, data_source="local-db", scenario_id=discovery_request.scenario.scenario_id, strategy_mode=strategy_mode, output_dir=str(run_dir), enable_validation=(strategy_mode == "research_similarity_v2"))
-    holdout_request = build_request(scenario_id=f"{run_id}_holdout", start_date=preflight["holdout_start"], end_date=preflight["holdout_end"], strategy_mode=strategy_mode, spec=spec, metadata=metadata)
+    holdout_request = build_request(scenario_id=holdout_scenario_id if strategy_mode == "legacy_event_window" else f"{run_id}_holdout", start_date=preflight["holdout_start"], end_date=preflight["holdout_end"], strategy_mode=strategy_mode, spec=spec, metadata=metadata)
     holdout_result = run_backtest(request=holdout_request, data_path=None, data_source="local-db", scenario_id=holdout_request.scenario.scenario_id, strategy_mode=strategy_mode, output_dir=str(run_dir), enable_validation=(strategy_mode == "research_similarity_v2"))
 
-    manifest = _build_manifest(experiment_group=experiment_group, run_id=run_id, label=label, strategy_mode=strategy_mode, spec=spec, preflight=preflight, metadata=metadata, discovery_result=discovery_result, holdout_result=holdout_result)
+    manifest = _build_manifest(experiment_group=experiment_group, run_id=run_id, label=label, strategy_mode=strategy_mode, spec=spec, preflight=preflight, metadata=metadata, discovery_result=discovery_result, holdout_result=holdout_result, bt_event_window_snapshot_id=bt_event_window_snapshot_id)
     (run_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
     fold_report = {
@@ -242,7 +248,12 @@ def _run_one(*, root: Path, leaderboard_path: Path, experiment_group: str, prefl
         "universe_hash": universe_hash,
         "spec_hash": spec_hash,
         "data_snapshot_id": manifest["data_snapshot_id"],
+        "bt_event_window_snapshot_id": bt_event_window_snapshot_id,
         "experiment_group": experiment_group,
+        "ohlcv_common_coverage": preflight.get("ohlcv_common_coverage"),
+        "macro_coverage": preflight.get("macro_coverage"),
+        "sector_coverage": preflight.get("sector_coverage"),
+        "legacy_snapshot_ready": preflight.get("legacy_snapshot_ready"),
     }
     (run_dir / "run_card.json").write_text(json.dumps(run_card, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
@@ -267,6 +278,11 @@ def _run_one(*, root: Path, leaderboard_path: Path, experiment_group: str, prefl
         "discovery_cv_calibration_error": (discovery_cv.get("calibration_error") if discovery_fold.get("folds") else None),
         "discovery_cv_monotonicity": (discovery_cv.get("score_decile_monotonicity") if discovery_fold.get("folds") else None),
         "holdout_direct_max_drawdown": run_card["max_drawdown"],
+        "ohlcv_common_coverage": run_card["ohlcv_common_coverage"],
+        "macro_coverage": run_card["macro_coverage"],
+        "sector_coverage": run_card["sector_coverage"],
+        "legacy_snapshot_ready": run_card["legacy_snapshot_ready"],
+        "bt_event_window_snapshot_id": bt_event_window_snapshot_id,
     }, discovery=discovery_result, holdout=holdout_result, previous_rows=previous_rows)
     (run_dir / "report.md").write_text(report_md, encoding="utf-8")
     append_leaderboard(leaderboard_path, run_card)
@@ -307,6 +323,7 @@ def _comparison_md(rows: list[dict], axis_summary: dict) -> str:
         f"- best_policy: {axis_summary.get('best_policy')}",
         f"- best_portfolio: {axis_summary.get('best_portfolio')}",
         f"- failed_runs: {'|'.join(failures) if failures else 'none'}",
+        f"- legacy_snapshot_message: {MISSING_LEGACY_SNAPSHOT_MESSAGE}",
         "",
         "## References",
         f"- legacy_reference holdout_direct_expectancy: {legacy.get('holdout_direct_expectancy') if legacy else 'n/a'}",
@@ -329,28 +346,38 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run policy x portfolio research matrix batch")
     parser.add_argument("--output-root", default="runs/research_ledger")
     parser.add_argument("--experiment-group", default="")
+    parser.add_argument("--allow-unknown-sector", action="store_true")
+    parser.add_argument("--legacy-discovery-scenario-id", default="legacy_discovery")
+    parser.add_argument("--legacy-holdout-scenario-id", default="legacy_holdout")
+    parser.add_argument("--skip-legacy-reference", action="store_true")
     args = parser.parse_args()
 
-    preflight = preflight_local_db(UNIVERSE)
+    preflight = preflight_local_db(UNIVERSE, allow_unknown_sector=args.allow_unknown_sector)
+    legacy_ref = resolve_legacy_scenarios(preflight=preflight, discovery_scenario_id=args.legacy_discovery_scenario_id, holdout_scenario_id=args.legacy_holdout_scenario_id, skip_legacy_reference=args.skip_legacy_reference)
     spec = build_spec()
     today_tag = date.today().strftime("%Y%m%d")
     experiment_group = args.experiment_group or f"matrix_batch_{today_tag}_{preflight['window_mode']}"
     root = Path(args.output_root) / experiment_group
     root.mkdir(parents=True, exist_ok=True)
-    (root / "preflight.json").write_text(json.dumps(preflight, ensure_ascii=False, indent=2), encoding="utf-8")
+    (root / "preflight.json").write_text(json.dumps(preflight, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     leaderboard_path = root / "leaderboard.csv"
 
     rows = []
-    rows.append(_run_one(root=root, leaderboard_path=leaderboard_path, experiment_group=experiment_group, preflight=preflight, spec=spec, label="legacy_reference", strategy_mode="legacy_event_window", metadata={"portfolio_top_n": "3", "portfolio_risk_budget_fraction": "0.60"}))
+    if legacy_ref["skip_legacy_reference"]:
+        print(f"skip legacy reference: {MISSING_LEGACY_SNAPSHOT_MESSAGE}")
+    else:
+        rows.append(_run_one(root=root, leaderboard_path=leaderboard_path, experiment_group=experiment_group, preflight=preflight, spec=spec, label="legacy_reference", strategy_mode="legacy_event_window", metadata={"portfolio_top_n": "3", "portfolio_risk_budget_fraction": "0.60"}, discovery_scenario_id=legacy_ref["discovery"]["scenario_id"], holdout_scenario_id=legacy_ref["holdout"]["scenario_id"], bt_event_window_snapshot_id=legacy_ref["discovery"]["snapshot_id"]))
     base_meta = {**POLICY_PRESETS["P2_base"], **PORTFOLIO_PRESETS["Q2"], "policy_preset": "P2_base", "portfolio_preset": "Q2"}
-    rows.append(_run_one(root=root, leaderboard_path=leaderboard_path, experiment_group=experiment_group, preflight=preflight, spec=spec, label="tobe_base_reference", strategy_mode="research_similarity_v2", metadata=base_meta))
+    rows.append(_run_one(root=root, leaderboard_path=leaderboard_path, experiment_group=experiment_group, preflight=preflight, spec=spec, label="tobe_base_reference", strategy_mode="research_similarity_v2", metadata=base_meta, discovery_scenario_id=args.legacy_discovery_scenario_id, holdout_scenario_id=args.legacy_holdout_scenario_id, bt_event_window_snapshot_id=legacy_ref["discovery"]["snapshot_id"] if legacy_ref["discovery"] else None))
 
     for policy_name, policy_meta in POLICY_PRESETS.items():
         for portfolio_name, portfolio_meta in PORTFOLIO_PRESETS.items():
             meta = {**policy_meta, **portfolio_meta, "policy_preset": policy_name, "portfolio_preset": portfolio_name}
-            rows.append(_run_one(root=root, leaderboard_path=leaderboard_path, experiment_group=experiment_group, preflight=preflight, spec=spec, label=f"matrix_{policy_name}_{portfolio_name}", strategy_mode="research_similarity_v2", metadata=meta))
+            rows.append(_run_one(root=root, leaderboard_path=leaderboard_path, experiment_group=experiment_group, preflight=preflight, spec=spec, label=f"matrix_{policy_name}_{portfolio_name}", strategy_mode="research_similarity_v2", metadata=meta, discovery_scenario_id=args.legacy_discovery_scenario_id, holdout_scenario_id=args.legacy_holdout_scenario_id, bt_event_window_snapshot_id=legacy_ref["discovery"]["snapshot_id"] if legacy_ref["discovery"] else None))
 
-    legacy = next(r for r in rows if r["label"] == "legacy_reference")
+    if not rows:
+        raise SystemExit(MISSING_LEGACY_SNAPSHOT_MESSAGE)
+    legacy = next((r for r in rows if r["label"] == "legacy_reference"), rows[0])
     base = next(r for r in rows if r["label"] == "tobe_base_reference")
     comparison_rows = []
     for row in rows:

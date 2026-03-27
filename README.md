@@ -93,28 +93,51 @@ bash start.sh
 ```
 
 ## Local backtest bootstrap (official)
-Use **one supported bootstrap path** only.
+Local Postgres research/backtest now has **two official local-db execution paths**.
 
-### 1) Apply SQL-first bootstrap/patches to local Postgres
+### Path A — mirror-only TOBE path (default)
+Use this when you want a fresh local mirror setup and the current TOBE research runtime.
+This path does **not** require a legacy `bt_event_window` scenario snapshot.
+
+#### 1) Apply SQL-first bootstrap/patches to local Postgres
 ```bash
 python scripts/db_apply_sql.py --db-url "env:BACKTEST_DB_URL"
 ```
 
-### 2) Build the dump-first local trading mirror
+#### 2) Build the dump-first local trading mirror
 ```bash
 python scripts/refresh_local_trading.py init-full
 ```
 
-### 3) Normal refresh loop
+#### 3) Normal refresh loop
 ```bash
 python scripts/refresh_local_trading.py refresh-reference
 python scripts/refresh_local_trading.py refresh-market
 ```
 
-### 4) Run local-db backtest
+#### 4) Run local-db TOBE backtest
 ```bash
-python -m backtest_app.runner --data-source local-db --scenario-id scn_001 --market US --start-date 2026-01-01 --end-date 2026-01-31 --symbols AAPL,MSFT
+python -m backtest_app.runner --data-source local-db --strategy-mode research_similarity_v2 --scenario-id scn_001 --market US --start-date 2026-01-01 --end-date 2026-01-31 --symbols AAPL,MSFT
 ```
+
+`--strategy-mode research_similarity_v2` is the default README example for local-db because it works on a fresh mirror without pre-materialized legacy scenario rows.
+
+### Path B — snapshot-backed legacy path
+Use this only when you need legacy parity/comparison with reusable scenario snapshots.
+This path requires `legacy_event_window` plus a pre-materialized `bt_event_window` snapshot for the scenario id you run.
+
+#### 1) Materialize discovery / holdout snapshots
+```bash
+python scripts/materialize_bt_event_window.py --scenario-id legacy_discovery --phase discovery --source-json runs/legacy_discovery.json
+python scripts/materialize_bt_event_window.py --scenario-id legacy_holdout --phase holdout --source-json runs/legacy_holdout.json
+```
+
+#### 2) Run legacy local-db backtest against a materialized scenario
+```bash
+python -m backtest_app.runner --data-source local-db --strategy-mode legacy_event_window --scenario-id legacy_discovery --market US --start-date 2026-01-01 --end-date 2026-01-31 --symbols AAPL,MSFT
+```
+
+If you try Path B without a matching snapshot, the CLI now fails immediately with guidance to either switch back to `research_similarity_v2` or materialize the legacy snapshot first.
 
 Deprecated bootstrap helpers:
 - `python scripts/apply_local_sql.py ...`
@@ -123,6 +146,7 @@ Deprecated bootstrap helpers:
 See also:
 - `docs/local-backtest-postgres.md`
 - `docs/runbook-local-backtest.md`
+- `docs/research_run_protocol.md`
 - `docs/local-trading-mirror.md`
 - `docs/db-sql-first.md`
 

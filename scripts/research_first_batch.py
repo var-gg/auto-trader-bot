@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import json
+import warnings
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -18,17 +19,19 @@ from backtest_app.validation import compute_performance_metrics
 from shared.domain.models import FillOutcome, OrderPlan
 
 UNIVERSE = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "XOM", "LLY", "UNH", "COST", "PG"]
+MISSING_LEGACY_SNAPSHOT_MESSAGE = "materialize_bt_event_window 먼저 실행 또는 --skip-legacy-reference 사용"
+MANIFEST_TABLE = "meta.bt_scenario_snapshot_manifest"
 
 
 def stable_hash(payload: Any, length: int = 16) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")).hexdigest()[:length]
 
 
-def preflight_local_db(symbols: list[str]) -> dict:
+def preflight_local_db(symbols: list[str], *, allow_unknown_sector: bool = False) -> dict:
     cfg = LocalBacktestDbConfig.from_env()
     guard_backtest_local_only(cfg.url)
     session_factory = create_backtest_session_factory(cfg)
-    sql = text(
+    common_ohlcv_sql = text(
         f"""
         SELECT trade_date, COUNT(DISTINCT symbol) AS n
         FROM {cfg.schema}.bt_mirror_ohlcv_daily
@@ -38,8 +41,51 @@ def preflight_local_db(symbols: list[str]) -> dict:
         ORDER BY trade_date
         """
     )
+    latest_macro_sql = text(
+        f"""
+        SELECT COUNT(*) AS macro_series_count,
+               MAX(v.obs_date) AS latest_macro_date
+          FROM {cfg.schema}.macro_data_series s
+          JOIN {cfg.schema}.macro_data_series_value v ON v.series_id = s.id
+         WHERE s.is_active IS DISTINCT FROM FALSE
+        """
+    )
+    sector_sql = text(
+        f"""
+        SELECT COUNT(DISTINCT t.symbol) AS covered_symbols
+          FROM {cfg.schema}.bt_mirror_ticker t
+          JOIN {cfg.schema}.bt_mirror_ticker_industry ti ON ti.ticker_id = t.ticker_id
+          JOIN {cfg.schema}.bt_mirror_industry i ON i.industry_id = ti.industry_id
+          JOIN {cfg.schema}.bt_mirror_sector s ON s.sector_id = i.sector_id
+         WHERE t.symbol = ANY(:symbols)
+        """
+    )
+    legacy_snapshot_sql = text(
+        f"""
+        SELECT COUNT(*) AS snapshot_rows,
+               MIN(reference_date) AS first_snapshot_date,
+               MAX(reference_date) AS latest_snapshot_date
+          FROM {cfg.schema}.bt_event_window
+         WHERE market = 'US'
+           AND symbol = ANY(:symbols)
+        """
+    )
+    manifest_exists_sql = text(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM information_schema.tables
+             WHERE table_schema = 'meta'
+               AND table_name = 'bt_scenario_snapshot_manifest'
+        ) AS manifest_exists
+        """
+    )
     with session_factory() as session:
-        rows = [r._mapping for r in session.execute(sql, {"symbols": symbols, "symbol_count": len(symbols)})]
+        rows = [r._mapping for r in session.execute(common_ohlcv_sql, {"symbols": symbols, "symbol_count": len(symbols)})]
+        macro_row = session.execute(latest_macro_sql).one()._mapping
+        sector_row = session.execute(sector_sql, {"symbols": symbols}).one()._mapping
+        legacy_row = session.execute(legacy_snapshot_sql, {"symbols": symbols}).one()._mapping
+        manifest_exists = bool(session.execute(manifest_exists_sql).one()._mapping.get("manifest_exists"))
     if not rows:
         raise RuntimeError("No common daily coverage found for requested universe in local-db")
     dates = [str(r["trade_date"]) for r in rows]
@@ -50,7 +96,14 @@ def preflight_local_db(symbols: list[str]) -> dict:
     fallback_start = (latest_dt - timedelta(days=244)).isoformat()
     fallback_disc_end = (latest_dt - timedelta(days=61)).isoformat()
     preferred_ok = preferred_start >= first_date
-    return {
+    macro_series_count = int(macro_row.get("macro_series_count") or 0)
+    latest_macro_date = str(macro_row.get("latest_macro_date") or "")
+    macro_coverage = 1.0 if macro_series_count > 0 and latest_macro_date else 0.0
+    covered_symbols = int(sector_row.get("covered_symbols") or 0)
+    sector_coverage = covered_symbols / max(len(symbols), 1)
+    snapshot_rows = int(legacy_row.get("snapshot_rows") or 0)
+    legacy_snapshot_ready = snapshot_rows > 0
+    out = {
         "db_url": cfg.url,
         "schema": cfg.schema,
         "first_date": first_date,
@@ -61,7 +114,31 @@ def preflight_local_db(symbols: list[str]) -> dict:
         "holdout_start": (datetime.fromisoformat(preferred_disc_end if preferred_ok else fallback_disc_end).date() + timedelta(days=1)).isoformat(),
         "holdout_end": latest_date,
         "window_mode": "9m_3m" if preferred_ok else "6m_2m",
+        "ohlcv_common_coverage": 1.0,
+        "ohlcv_common_first_date": first_date,
+        "ohlcv_common_latest_date": latest_date,
+        "macro_coverage": macro_coverage,
+        "macro_series_count": macro_series_count,
+        "latest_macro_date": latest_macro_date or None,
+        "sector_coverage": sector_coverage,
+        "sector_covered_symbols": covered_symbols,
+        "sector_expected_symbols": len(symbols),
+        "legacy_snapshot_ready": legacy_snapshot_ready,
+        "legacy_snapshot_rows": snapshot_rows,
+        "legacy_snapshot_first_date": str(legacy_row.get("first_snapshot_date") or "") or None,
+        "legacy_snapshot_latest_date": str(legacy_row.get("latest_snapshot_date") or "") or None,
+        "snapshot_manifest_table_ready": manifest_exists,
+        "allow_unknown_sector": allow_unknown_sector,
     }
+    if macro_coverage < 1.0:
+        raise RuntimeError("Local-db preflight failed: macro coverage is incomplete or missing")
+    if sector_coverage < 1.0:
+        message = f"Local-db preflight failed: sector coverage {sector_coverage:.3f} ({covered_symbols}/{len(symbols)}) is incomplete"
+        if allow_unknown_sector:
+            warnings.warn(message + "; continuing because --allow-unknown-sector was set")
+        else:
+            raise RuntimeError(message)
+    return out
 
 
 def build_spec() -> ResearchExperimentSpec:
@@ -171,6 +248,11 @@ def build_report_md(*, run_card: dict, discovery: dict, holdout: dict, previous_
         f"- discovery_cv_calibration_error: {run_card['discovery_cv_calibration_error']}",
         f"- discovery_cv_monotonicity: {run_card['discovery_cv_monotonicity']}",
         f"- holdout_direct_max_drawdown: {run_card['holdout_direct_max_drawdown']}",
+        f"- ohlcv_common_coverage: {run_card.get('ohlcv_common_coverage')}",
+        f"- macro_coverage: {run_card.get('macro_coverage')}",
+        f"- sector_coverage: {run_card.get('sector_coverage')}",
+        f"- legacy_snapshot_ready: {run_card.get('legacy_snapshot_ready')}",
+        f"- bt_event_window_snapshot_id: {run_card.get('bt_event_window_snapshot_id')}",
         "",
         "## What improved",
     ]
@@ -204,14 +286,58 @@ def load_leaderboard_rows(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
+def fetch_snapshot_manifest(*, scenario_id: str) -> dict | None:
+    cfg = LocalBacktestDbConfig.from_env()
+    guard_backtest_local_only(cfg.url)
+    session_factory = create_backtest_session_factory(cfg)
+    sql = text(
+        f"""
+        SELECT snapshot_id, scenario_id, phase, source_kind, market, window_start, window_end,
+               universe_hash, spec_hash, row_count, created_at, notes
+          FROM {MANIFEST_TABLE}
+         WHERE scenario_id = :scenario_id
+        """
+    )
+    try:
+        with session_factory() as session:
+            row = session.execute(sql, {"scenario_id": scenario_id}).fetchone()
+    except Exception:
+        return None
+    return dict(row._mapping) if row else None
+
+
+def require_snapshot_manifest(*, scenario_id: str, phase: str) -> dict:
+    manifest = fetch_snapshot_manifest(scenario_id=scenario_id)
+    if not manifest:
+        raise RuntimeError(f"{phase} snapshot missing for scenario_id={scenario_id}. {MISSING_LEGACY_SNAPSHOT_MESSAGE}")
+    return manifest
+
+
+def resolve_legacy_scenarios(*, preflight: dict, discovery_scenario_id: str, holdout_scenario_id: str, skip_legacy_reference: bool) -> dict:
+    if skip_legacy_reference:
+        return {"skip_legacy_reference": True, "discovery": None, "holdout": None}
+    discovery = require_snapshot_manifest(scenario_id=discovery_scenario_id, phase="discovery")
+    holdout = require_snapshot_manifest(scenario_id=holdout_scenario_id, phase="holdout")
+    preflight["legacy_snapshot_ready"] = True
+    preflight["legacy_snapshot_rows"] = int(discovery.get("row_count") or 0) + int(holdout.get("row_count") or 0)
+    preflight["legacy_snapshot_first_date"] = str(discovery.get("window_start") or preflight.get("legacy_snapshot_first_date"))
+    preflight["legacy_snapshot_latest_date"] = str(holdout.get("window_end") or preflight.get("legacy_snapshot_latest_date"))
+    return {"skip_legacy_reference": False, "discovery": discovery, "holdout": holdout}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run first research batch with standardized ledger outputs")
     parser.add_argument("--output-root", default="runs/research_ledger")
     parser.add_argument("--experiment-group", default="")
     parser.add_argument("--skip-holdout", action="store_true")
+    parser.add_argument("--allow-unknown-sector", action="store_true")
+    parser.add_argument("--legacy-discovery-scenario-id", default="legacy_discovery")
+    parser.add_argument("--legacy-holdout-scenario-id", default="legacy_holdout")
+    parser.add_argument("--skip-legacy-reference", action="store_true")
     args = parser.parse_args()
 
-    preflight = preflight_local_db(UNIVERSE)
+    preflight = preflight_local_db(UNIVERSE, allow_unknown_sector=args.allow_unknown_sector)
+    legacy_ref = resolve_legacy_scenarios(preflight=preflight, discovery_scenario_id=args.legacy_discovery_scenario_id, holdout_scenario_id=args.legacy_holdout_scenario_id, skip_legacy_reference=args.skip_legacy_reference)
     spec = build_spec()
     today_tag = date.today().strftime("%Y%m%d")
     experiment_group = args.experiment_group or f"first_batch_{today_tag}_{preflight['window_mode']}"
@@ -219,7 +345,7 @@ def main() -> int:
     spec_hash = spec.spec_hash()
     root = Path(args.output_root) / experiment_group
     root.mkdir(parents=True, exist_ok=True)
-    (root / "preflight.json").write_text(json.dumps(preflight, ensure_ascii=False, indent=2), encoding="utf-8")
+    (root / "preflight.json").write_text(json.dumps(preflight, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     leaderboard_path = root / "leaderboard.csv"
 
     for cfg in run_configs():
@@ -231,17 +357,21 @@ def main() -> int:
             "spec_hash": spec_hash,
             "window": [preflight["discovery_start"], preflight["discovery_end"], preflight["holdout_start"], preflight["holdout_end"]],
             "metadata": cfg["metadata"],
+            "legacy_reference": legacy_ref,
         }
         run_id = f"{cfg['label']}_{stable_hash(run_key, 12)}"
         run_dir = root / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        discovery_request = build_request(scenario_id=f"{run_id}_discovery", start_date=preflight["discovery_start"], end_date=preflight["discovery_end"], strategy_mode=cfg["strategy_mode"], spec=spec, metadata=cfg["metadata"])
+        discovery_scenario_id = legacy_ref["discovery"]["scenario_id"] if cfg["strategy_mode"] == "legacy_event_window" and legacy_ref["discovery"] else f"{run_id}_discovery"
+        holdout_scenario_id = legacy_ref["holdout"]["scenario_id"] if cfg["strategy_mode"] == "legacy_event_window" and legacy_ref["holdout"] else f"{run_id}_holdout"
+
+        discovery_request = build_request(scenario_id=discovery_scenario_id, start_date=preflight["discovery_start"], end_date=preflight["discovery_end"], strategy_mode=cfg["strategy_mode"], spec=spec, metadata=cfg["metadata"])
         discovery_result = run_backtest(request=discovery_request, data_path=None, data_source="local-db", scenario_id=discovery_request.scenario.scenario_id, strategy_mode=cfg["strategy_mode"], output_dir=str(run_dir), enable_validation=(cfg["strategy_mode"] == "research_similarity_v2"))
 
         holdout_result = {}
         if not args.skip_holdout:
-            holdout_request = build_request(scenario_id=f"{run_id}_holdout", start_date=preflight["holdout_start"], end_date=preflight["holdout_end"], strategy_mode=cfg["strategy_mode"], spec=spec, metadata=cfg["metadata"])
+            holdout_request = build_request(scenario_id=holdout_scenario_id, start_date=preflight["holdout_start"], end_date=preflight["holdout_end"], strategy_mode=cfg["strategy_mode"], spec=spec, metadata=cfg["metadata"])
             holdout_result = run_backtest(request=holdout_request, data_path=None, data_source="local-db", scenario_id=holdout_request.scenario.scenario_id, strategy_mode=cfg["strategy_mode"], output_dir=str(run_dir), enable_validation=(cfg["strategy_mode"] == "research_similarity_v2"))
 
         manifest = {
@@ -254,6 +384,8 @@ def main() -> int:
             "spec": asdict(spec),
             "spec_hash": spec_hash,
             "data_snapshot_id": (discovery_result.get("manifest") or {}).get("data_snapshot_id"),
+            "bt_event_window_snapshot_id": legacy_ref["discovery"].get("snapshot_id") if cfg["strategy_mode"] == "legacy_event_window" and legacy_ref["discovery"] else None,
+            "legacy_reference": legacy_ref,
             "discovery_manifest": discovery_result.get("manifest"),
             "holdout_manifest": holdout_result.get("manifest"),
             "preflight": preflight,
@@ -333,7 +465,12 @@ def main() -> int:
             "universe_hash": universe_hash,
             "spec_hash": spec_hash,
             "data_snapshot_id": manifest["data_snapshot_id"],
+            "bt_event_window_snapshot_id": manifest["bt_event_window_snapshot_id"],
             "experiment_group": experiment_group,
+            "ohlcv_common_coverage": preflight.get("ohlcv_common_coverage"),
+            "macro_coverage": preflight.get("macro_coverage"),
+            "sector_coverage": preflight.get("sector_coverage"),
+            "legacy_snapshot_ready": preflight.get("legacy_snapshot_ready"),
         }
         (run_dir / "run_card.json").write_text(json.dumps(run_card, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 

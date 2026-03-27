@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, text
 from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
 from backtest_app.runner import cli
+from scripts.research_first_batch import preflight_local_db
 
 
 ADMIN_DB_URL = os.getenv("BACKTEST_TEST_ADMIN_DB_URL", "postgresql+psycopg2://postgres:7508@127.0.0.1:5433/postgres")
@@ -42,6 +43,35 @@ def temp_backtest_db():
         conn.connection.cursor().execute(
             """
             CREATE SCHEMA trading;
+            CREATE TABLE trading.bt_mirror_ticker (
+                ticker_id INTEGER PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                country TEXT
+            );
+            CREATE TABLE trading.bt_mirror_sector (
+                sector_id INTEGER PRIMARY KEY,
+                code TEXT NOT NULL,
+                name TEXT,
+                created_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ
+            );
+            CREATE TABLE trading.bt_mirror_industry (
+                industry_id INTEGER PRIMARY KEY,
+                sector_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                name TEXT,
+                created_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ
+            );
+            CREATE TABLE trading.bt_mirror_ticker_industry (
+                ticker_id INTEGER NOT NULL,
+                industry_id INTEGER NOT NULL,
+                is_primary BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ,
+                PRIMARY KEY (ticker_id, industry_id)
+            );
             CREATE TABLE trading.bt_mirror_ohlcv_daily (
                 ticker_id INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
@@ -110,6 +140,10 @@ def temp_backtest_db():
             values.append(f"(1, 'AAPL', '{d.isoformat()}', {open_:.6f}, {high:.6f}, {low:.6f}, {close:.6f}, {int(volume)})")
             price = close
         conn.execute(text("INSERT INTO trading.bt_mirror_ohlcv_daily(ticker_id, symbol, trade_date, open, high, low, close, volume) VALUES " + ",\n".join(values)))
+        conn.execute(text("INSERT INTO trading.bt_mirror_ticker(ticker_id, symbol, exchange, country) VALUES (1, 'AAPL', 'NASDAQ', 'US')"))
+        conn.execute(text("INSERT INTO trading.bt_mirror_sector(sector_id, code, name, created_at, updated_at) VALUES (10, 'TECH', 'Technology', NOW(), NOW())"))
+        conn.execute(text("INSERT INTO trading.bt_mirror_industry(industry_id, sector_id, code, name, created_at, updated_at) VALUES (100, 10, 'SOFT', 'Software', NOW(), NOW())"))
+        conn.execute(text("INSERT INTO trading.bt_mirror_ticker_industry(ticker_id, industry_id, is_primary, created_at, updated_at) VALUES (1, 100, TRUE, NOW(), NOW())"))
         conn.execute(text("""
             INSERT INTO trading.bt_event_window(
                 scenario_id, market, symbol, ticker_id, event_time, anchor_date, reference_date,
@@ -154,6 +188,12 @@ def test_actual_local_postgres_loader_path(temp_backtest_db):
     assert historical.bars_by_symbol["AAPL"]
 
 
+def test_loader_reads_sector_map_from_local_mirror(temp_backtest_db):
+    cfg = LocalBacktestDbConfig(url=temp_backtest_db, schema="trading")
+    loader = LocalPostgresLoader(create_backtest_session_factory(cfg), schema="trading")
+    assert loader._load_sector_map(["AAPL"]) == {"AAPL": "TECH"}
+
+
 def test_same_db_same_config_same_seed_same_result(temp_backtest_db, monkeypatch):
     monkeypatch.setenv("BACKTEST_DB_URL", temp_backtest_db)
     monkeypatch.setenv("BACKTEST_DB_SCHEMA", "trading")
@@ -196,3 +236,35 @@ def test_research_similarity_v2_actual_loader_and_runner(temp_backtest_db, monke
         assert row["query"]["feature_window_bars"] >= 60
         assert row["query"]["feature_coverage_bars"] >= 60
         assert row["query"]["insufficient_history"] is False
+
+
+def test_preflight_reports_full_sector_coverage_and_snapshot_ready(temp_backtest_db, monkeypatch):
+    monkeypatch.setenv("BACKTEST_DB_URL", temp_backtest_db)
+    monkeypatch.setenv("BACKTEST_DB_SCHEMA", "trading")
+    preflight = preflight_local_db(["AAPL"])
+    assert preflight["sector_coverage"] == 1.0
+    assert preflight["macro_coverage"] == 1.0
+    assert preflight["legacy_snapshot_ready"] is True
+    assert preflight["ohlcv_common_coverage"] == 1.0
+
+
+def test_preflight_fails_when_sector_refs_missing(temp_backtest_db, monkeypatch):
+    monkeypatch.setenv("BACKTEST_DB_URL", temp_backtest_db)
+    monkeypatch.setenv("BACKTEST_DB_SCHEMA", "trading")
+    engine = create_engine(temp_backtest_db, future=True)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM trading.bt_mirror_ticker_industry"))
+    with pytest.raises(RuntimeError, match="sector coverage"):
+        preflight_local_db(["AAPL"])
+
+
+def test_preflight_warns_when_sector_refs_missing_but_override_enabled(temp_backtest_db, monkeypatch):
+    monkeypatch.setenv("BACKTEST_DB_URL", temp_backtest_db)
+    monkeypatch.setenv("BACKTEST_DB_SCHEMA", "trading")
+    engine = create_engine(temp_backtest_db, future=True)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM trading.bt_mirror_ticker_industry"))
+    with pytest.warns(UserWarning, match="allow-unknown-sector"):
+        preflight = preflight_local_db(["AAPL"], allow_unknown_sector=True)
+    assert preflight["sector_coverage"] == 0.0
+    assert preflight["allow_unknown_sector"] is True

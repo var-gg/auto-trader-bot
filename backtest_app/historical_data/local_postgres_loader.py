@@ -37,7 +37,7 @@ class LocalPostgresLoader:
             snapshot_ts = self._resolve_snapshot_ts(bars_by_symbol)
             enriched = self._enrich_candidates(candidates, features_by_symbol)
             snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False, macro_state=macro_payload)
-            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "diagnostics": research_diag})
+            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "diagnostics": research_diag, "sector_map": sector_map})
 
         if strategy_mode == "research_similarity_v2":
             macro_history = self._load_macro_history(start_date=start_date, end_date=end_date, prewarm_days=max(WARMUP_DAYS, spec.feature_window_bars * 2))
@@ -48,12 +48,12 @@ class LocalPostgresLoader:
             if decision_dates:
                 allowed_dates = {str(d)[:10] for d in decision_dates}
                 enriched = [c for c in enriched if str(c.reference_date)[:10] in allowed_dates]
-            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "train_end": train_end, "decision_dates": [str(d)[:10] for d in decision_dates] if decision_dates else None, "diagnostics": research_diag, "signal_panel_artifact": research_diag.get("signal_panel", []), "memory_snapshot_artifact": research_diag.get("artifacts", {})})
+            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "train_end": train_end, "decision_dates": [str(d)[:10] for d in decision_dates] if decision_dates else None, "diagnostics": research_diag, "signal_panel_artifact": research_diag.get("signal_panel", []), "memory_snapshot_artifact": research_diag.get("artifacts", {}), "macro_history_by_date": macro_history, "sector_map": sector_map})
 
         candidates, snapshot_ts = self._load_candidates(scenario_id=scenario_id, market=market, start_date=start_date, end_date=end_date, symbols=symbols)
         enriched = self._enrich_candidates(candidates, features_by_symbol)
         snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False)
-        return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode})
+        return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "sector_map": sector_map})
 
     def _enrich_candidates(self, candidates: List[SignalCandidate], features_by_symbol: Dict[str, Dict[str, float]]) -> List[SignalCandidate]:
         enriched: List[SignalCandidate] = []
@@ -122,18 +122,15 @@ class LocalPostgresLoader:
     def _load_sector_map(self, symbols: List[str]) -> Dict[str, str]:
         sql = text(f"""
         SELECT t.symbol, s.code AS sector_code
-          FROM {self.schema}.ticker t
-          JOIN {self.schema}.ticker_industry ti ON ti.ticker_id = t.id
-          JOIN {self.schema}.industry i ON i.id = ti.industry_id
-          JOIN {self.schema}.sector s ON s.id = i.sector_id
+          FROM {self.schema}.bt_mirror_ticker t
+          JOIN {self.schema}.bt_mirror_ticker_industry ti ON ti.ticker_id = t.ticker_id
+          JOIN {self.schema}.bt_mirror_industry i ON i.industry_id = ti.industry_id
+          JOIN {self.schema}.bt_mirror_sector s ON s.sector_id = i.sector_id
          WHERE t.symbol = ANY(:symbols)
         """)
-        try:
-            with self.session_factory() as session:
-                rows = [dict(r._mapping) for r in session.execute(sql, {"symbols": symbols})]
-            return {str(r["symbol"]): str(r["sector_code"]) for r in rows if r.get("sector_code")}
-        except Exception:
-            return {symbol: "UNKNOWN" for symbol in symbols}
+        with self.session_factory() as session:
+            rows = [dict(r._mapping) for r in session.execute(sql, {"symbols": symbols})]
+        return {str(r["symbol"]): str(r["sector_code"]) for r in rows if r.get("sector_code")}
 
     def _load_candidates(self, *, scenario_id: str, market: str, start_date: str, end_date: str, symbols: List[str]):
         sql = text(f"""

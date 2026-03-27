@@ -76,6 +76,22 @@ def _build_request(args) -> RunnerRequest:
     return RunnerRequest(scenario=BacktestScenario(scenario_id=args.scenario_id, market=args.market, start_date=args.start_date, end_date=args.end_date, symbols=[s.strip() for s in args.symbols.split(",") if s.strip()]), config=BacktestConfig(initial_capital=args.initial_capital, research_spec=research_spec, optuna=optuna_cfg), output_path=args.output or None)
 
 
+def _raise_missing_legacy_snapshot(args) -> None:
+    guidance = (
+        "local-db + legacy_event_window requires a pre-materialized bt_event_window snapshot for the requested "
+        f"scenario-id ({args.scenario_id}).\n"
+        "Resolution:\n"
+        "  1) If you want the mirror-only TOBE path, rerun with --strategy-mode research_similarity_v2.\n"
+        "  2) If you need legacy parity, materialize the snapshot first, for example:\n"
+        "     python scripts/materialize_bt_event_window.py --scenario-id legacy_discovery --phase discovery --source-json runs\\legacy_discovery.json\n"
+        "     python scripts/materialize_bt_event_window.py --scenario-id legacy_holdout --phase holdout --source-json runs\\legacy_holdout.json\n"
+        "  3) Then rerun using one of those scenario ids.\n"
+        "See docs/local-backtest-postgres.md and docs/research_run_protocol.md for the two supported local-db paths."
+    )
+    raise SystemExit(guidance)
+
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run backtest_app research runtime")
     parser.add_argument("--mode", choices=["backtest", "optuna"], default="backtest")
@@ -114,10 +130,16 @@ def main() -> int:
     parser.add_argument("--optuna-search-space-json", default="")
     args = parser.parse_args()
     request = _build_request(args)
-    if args.mode == "optuna":
-        result = execute_research_study(request=request, data_path=args.data or None, output_dir=args.results_dir or None, data_source=args.data_source, strategy_mode=args.strategy_mode)
-    else:
-        result = execute_research_backtest(request, args.data or None, output_dir=args.results_dir or None, save_json=not args.no_json_artifact, sql_db_url=args.results_db_url or None, data_source=args.data_source, scenario_id=args.scenario_id, strategy_mode=args.strategy_mode)
+    try:
+        if args.mode == "optuna":
+            result = execute_research_study(request=request, data_path=args.data or None, output_dir=args.results_dir or None, data_source=args.data_source, strategy_mode=args.strategy_mode)
+        else:
+            result = execute_research_backtest(request, args.data or None, output_dir=args.results_dir or None, save_json=not args.no_json_artifact, sql_db_url=args.results_db_url or None, data_source=args.data_source, scenario_id=args.scenario_id, strategy_mode=args.strategy_mode)
+    except ValueError as exc:
+        message = str(exc)
+        if args.data_source == "local-db" and args.strategy_mode == "legacy_event_window" and "No bt_event_window rows found for scenario_id=" in message:
+            _raise_missing_legacy_snapshot(args)
+        raise
     payload = json.dumps(result, ensure_ascii=False, indent=2)
     if request.output_path:
         Path(request.output_path).write_text(payload, encoding="utf-8")
