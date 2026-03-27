@@ -7,6 +7,8 @@ import json
 import subprocess
 import time
 import warnings
+
+from dotenv import load_dotenv
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -19,6 +21,8 @@ from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest
 from backtest_app.research_runtime.engine import run_backtest
 from backtest_app.validation import compute_performance_metrics
 from shared.domain.models import FillOutcome, OrderPlan
+
+load_dotenv()
 
 UNIVERSE = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "XOM", "LLY", "UNH", "COST", "PG"]
 MISSING_LEGACY_SNAPSHOT_MESSAGE = "materialize_bt_event_window 먼저 실행 또는 --skip-legacy-reference 사용"

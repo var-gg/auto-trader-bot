@@ -4,9 +4,12 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
 from sqlalchemy import URL, create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
+
+load_dotenv()
 
 LOCAL_HOST_ALLOWLIST = {"localhost", "127.0.0.1"}
 BACKTEST_SEARCH_PATH = "trading,bt_result,meta,public"
@@ -31,7 +34,7 @@ class LocalBacktestDbConfig:
         user = os.getenv("BACKTEST_DB_USER", "postgres")
         password = os.getenv("BACKTEST_DB_PASSWORD", "")
         host = os.getenv("BACKTEST_DB_HOST", "127.0.0.1")
-        port = int(os.getenv("BACKTEST_DB_PORT", "5432"))
+        port = int(os.getenv("BACKTEST_DB_PORT", "5433"))
         name = os.getenv("BACKTEST_DB_NAME", "auto_trader_backtest")
         url = URL.create(
             drivername="postgresql+psycopg2",
@@ -52,6 +55,7 @@ def guard_backtest_local_only(db_url: str) -> str:
         raise ValueError("Cloud SQL URLs are forbidden for backtest_app local-db mode")
     if any(k in lowered for k in ("instance_connection_name", "db_user", "db_pass")):
         raise ValueError("Live DB wiring markers detected in BACKTEST_DB_URL")
+    host = None
     if lowered.startswith("postgresql") and "@" in lowered:
         host_part = lowered.split("@", 1)[1].split("/", 1)[0]
         host = host_part.split(":", 1)[0]
@@ -59,7 +63,8 @@ def guard_backtest_local_only(db_url: str) -> str:
         if require_local and host not in LOCAL_HOST_ALLOWLIST:
             raise ValueError(f"Non-local host forbidden for backtest_app: {host}")
     if os.getenv("INSTANCE_CONNECTION_NAME") and os.getenv("BACKTEST_ALLOW_LIVE_ENV", "false").lower() != "true":
-        raise ValueError("Live Cloud SQL env detected during backtest; refusing local-db session creation")
+        if host not in LOCAL_HOST_ALLOWLIST:
+            raise ValueError("Live Cloud SQL env detected during backtest; refusing local-db session creation")
     return db_url
 
 
