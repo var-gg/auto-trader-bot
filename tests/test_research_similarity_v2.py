@@ -1,5 +1,7 @@
 from datetime import datetime
 
+import types
+
 from backtest_app.historical_data.models import HistoricalBar, HistoricalSlice
 from backtest_app.research.pipeline import DECISION_CONVENTION, generate_similarity_candidates_rolling
 from backtest_app.runner import cli
@@ -125,6 +127,29 @@ def test_simulated_broker_blocks_same_day_fill_before_execution_start_for_resear
     ]
     fills = broker.simulate_plan(plan, bars)
     assert fills[0].fill_status == FillStatus.UNFILLED
+
+
+def test_research_v2_planned_exit_uses_first_fill_date_plus_horizon(monkeypatch):
+    bars = {"AAPL": [HistoricalBar(symbol="AAPL", timestamp=f"2026-01-{i:02d}", open=100 + i, high=101 + i, low=99 + i, close=100 + i, volume=1000) for i in range(1, 12)]}
+
+    class Loader:
+        def __init__(self, *args, **kwargs):
+            pass
+        def load_for_scenario(self, **kwargs):
+            candidate = types.SimpleNamespace(symbol="AAPL", side_bias=Side.BUY, current_price=102.0, expected_horizon_days=5, diagnostics={}, reference_date="2026-01-01", anchor_date="2026-01-01")
+            return HistoricalSlice(market_snapshot=MarketSnapshot(market=MarketCode.US, as_of=datetime(2026, 1, 31), session_label="BACKTEST", is_open=False), bars_by_symbol=bars, candidates=[candidate], metadata={"diagnostics": {}, "signal_panel_artifact": []})
+
+    monkeypatch.setattr(cli, "_load_historical", lambda *args, **kwargs: Loader().load_for_scenario())
+    monkeypatch.setattr(cli, "build_portfolio_decisions", lambda **kwargs: [types.SimpleNamespace(candidate=kwargs["candidates"][0], selected=True, kill_reason=None, diagnostics={}, requested_budget=1000.0, side=Side.BUY, size_multiplier=1.0, expected_horizon_days=5)])
+    monkeypatch.setattr(cli, "compare_policy_ab", lambda *args, **kwargs: {"quote_policy_v1": {"chosen_policy_reason": "test"}})
+    def fake_plan(*args, **kwargs):
+        return OrderPlan(plan_id="p1", symbol="AAPL", ticker_id=1, side=Side.BUY, generated_at=datetime(2026, 1, 1), status="READY", rationale="x", venue=ExecutionVenue.BACKTEST, requested_budget=1000.0, requested_quantity=1, legs=[] , metadata={"executable_from_date": "2026-01-02", "quote_policy": {}}), None
+    monkeypatch.setattr(cli, "build_order_plan_from_candidate", fake_plan)
+    monkeypatch.setattr(cli.SimulatedBroker, "simulate_plan", lambda self, plan, bars: [types.SimpleNamespace(plan_id="p1", leg_id="l1", symbol="AAPL", side=Side.BUY, fill_status=FillStatus.FULL, venue=ExecutionVenue.BACKTEST, event_time=datetime(2026, 1, 2, 0, 1), requested_quantity=1, filled_quantity=1, requested_price=102.0, average_fill_price=102.0, slippage_bps=0.0, metadata={"fee_bps": 0.0}, to_dict=lambda: {"plan_id": "p1", "fill_status": "FULL", "event_time": "2026-01-02T00:01:00", "filled_quantity": 1, "average_fill_price": 102.0, "metadata": {"fee_bps": 0.0}})])
+    request = cli.RunnerRequest(scenario=cli.BacktestScenario(scenario_id="scn-r2", market="US", start_date="2026-01-01", end_date="2026-01-05", symbols=["AAPL"]), config=cli.BacktestConfig(initial_capital=10000.0))
+    result = cli.run_backtest(request, None, data_source="local-db", scenario_id="scn-r2", strategy_mode="research_similarity_v2", enable_validation=False)
+    assert result["plans"][0]["metadata"]["first_fill_date"] == "2026-01-02"
+    assert result["plans"][0]["metadata"]["planned_exit_date"] == "2026-01-07"
 
 
 def test_legacy_mode_same_day_fill_convention_is_unchanged():

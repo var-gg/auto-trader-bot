@@ -21,12 +21,13 @@ class LocalPostgresLoader:
         self.session_factory = session_factory
         self.schema = schema
 
-    def load_for_scenario(self, *, scenario_id: str, market: str, start_date: str, end_date: str, symbols: Iterable[str], strategy_mode: str = "legacy_event_window", research_spec: ResearchExperimentSpec | None = None) -> HistoricalSlice:
+    def load_for_scenario(self, *, scenario_id: str, market: str, start_date: str, end_date: str, symbols: Iterable[str], strategy_mode: str = "legacy_event_window", research_spec: ResearchExperimentSpec | None = None, train_end: str | None = None, decision_dates: Iterable[str] | None = None) -> HistoricalSlice:
         symbols = [s for s in symbols if s]
         if not symbols:
             raise ValueError("symbols required")
         spec = research_spec or ResearchExperimentSpec()
-        bars_by_symbol = self._load_bars(start_date=start_date, end_date=end_date, symbols=symbols, warmup_days=max(WARMUP_DAYS, spec.feature_window_bars * 2))
+        bars_end_date = train_end or end_date
+        bars_by_symbol = self._load_bars(start_date=start_date, end_date=bars_end_date, symbols=symbols, warmup_days=max(WARMUP_DAYS, spec.feature_window_bars * 2))
         sector_map = self._load_sector_map(symbols)
         features_by_symbol: Dict[str, Dict[str, float]] = {symbol: compute_bar_features(bars) for symbol, bars in bars_by_symbol.items()}
 
@@ -44,7 +45,10 @@ class LocalPostgresLoader:
             snapshot_ts = self._resolve_snapshot_ts(bars_by_symbol)
             enriched = self._enrich_candidates(candidates, features_by_symbol)
             snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False)
-            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "diagnostics": research_diag, "signal_panel_artifact": research_diag.get("signal_panel", []), "memory_snapshot_artifact": research_diag.get("artifacts", {})})
+            if decision_dates:
+                allowed_dates = {str(d)[:10] for d in decision_dates}
+                enriched = [c for c in enriched if str(c.reference_date)[:10] in allowed_dates]
+            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "train_end": train_end, "decision_dates": [str(d)[:10] for d in decision_dates] if decision_dates else None, "diagnostics": research_diag, "signal_panel_artifact": research_diag.get("signal_panel", []), "memory_snapshot_artifact": research_diag.get("artifacts", {})})
 
         candidates, snapshot_ts = self._load_candidates(scenario_id=scenario_id, market=market, start_date=start_date, end_date=end_date, symbols=symbols)
         enriched = self._enrich_candidates(candidates, features_by_symbol)

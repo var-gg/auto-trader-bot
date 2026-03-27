@@ -48,6 +48,39 @@ class ResearchRunManifest:
 
 
 @dataclass(frozen=True)
+class OptunaConstraintConfig:
+    min_psr: float = 0.55
+    min_dsr: float = 0.55
+    min_effective_sample_size: float = 1.0
+    min_coverage: float = 0.05
+    require_monotonicity: bool = True
+
+
+@dataclass(frozen=True)
+class OptunaObjectiveConfig:
+    lambda_std_fold_expectancy: float = 0.25
+    lambda_calibration_error: float = 0.20
+    lambda_no_trade_ratio: float = 0.15
+    lambda_drawdown: float = 0.20
+    allowed_drawdown: float = 0.15
+
+
+@dataclass(frozen=True)
+class OptunaSearchConfig:
+    experiment_id: str
+    n_trials: int = 10
+    seed: int = 42
+    discovery_start_date: str = ""
+    discovery_end_date: str = ""
+    holdout_start_date: str = ""
+    holdout_end_date: str = ""
+    pruner: str = "median"
+    retry_failed_trials: int = 1
+    constraints: OptunaConstraintConfig = field(default_factory=OptunaConstraintConfig)
+    objective: OptunaObjectiveConfig = field(default_factory=OptunaObjectiveConfig)
+
+
+@dataclass(frozen=True)
 class BacktestScenario:
     scenario_id: str
     market: str
@@ -70,6 +103,7 @@ class BacktestConfig:
     metadata: Dict[str, str] = field(default_factory=dict)
     research_spec: Optional[ResearchExperimentSpec] = None
     manifest: Optional[ResearchRunManifest] = None
+    optuna: Optional[OptunaSearchConfig] = None
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from backtest_app.configs.models import BacktestConfig, BacktestScenario, ResearchExperimentSpec, RunnerRequest
 from backtest_app.research_runtime.runner import build_data_snapshot_id, ensure_manifest
+from backtest_app.research_runtime.service import execute_research_backtest
 from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory, guard_backtest_local_only
 from backtest_app.historical_data.loader import JsonHistoricalDataLoader
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
@@ -105,7 +106,9 @@ def _close_positions_for_day(*, day: str, state: dict, bars_by_symbol: dict, con
         pnl -= qty * entry_price * ((float(config.fee_bps) + float(config.slippage_bps)) / 10000.0)
         state["cash"] += float(pos["reserved_budget"]) + pnl
         state["reserved_capital"] = max(0.0, state["reserved_capital"] - float(pos["reserved_budget"]))
-        realized.append({"symbol": symbol, "exit_date": day, "pnl": pnl, "qty": qty, "side": pos["side"]})
+        if pos.get("plan_ref") is not None:
+            pos["plan_ref"].metadata["realized_exit_date"] = day
+        realized.append({"symbol": symbol, "exit_date": day, "pnl": pnl, "qty": qty, "side": pos["side"], "entry_date": pos.get("entry_date"), "first_fill_date": pos.get("first_fill_date"), "planned_exit_date": pos.get("planned_exit_date"), "realized_exit_date": day})
         del state["open_positions"][symbol]
     return realized
 
@@ -172,16 +175,21 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
             avg_fill = (sum(float(f.average_fill_price or 0.0) * float(f.filled_quantity or 0.0) for f in fill_rows) / filled_qty) if filled_qty > 0 else 0.0
             if filled_qty > 0:
                 horizon_days = int(candidate.expected_horizon_days or 5)
-                bars_for_symbol = [b for b in historical.bars_by_symbol.get(plan.symbol, []) if str(b.timestamp)[:10] >= decision_date]
+                first_fill_date = min(str(f.event_time)[:10] for f in fill_rows)
+                bars_for_symbol = [b for b in historical.bars_by_symbol.get(plan.symbol, []) if str(b.timestamp)[:10] >= first_fill_date]
                 exit_idx = min(max(horizon_days, 1), max(len(bars_for_symbol) - 1, 0))
-                planned_exit_date = str(bars_for_symbol[exit_idx].timestamp)[:10] if bars_for_symbol else decision_date
+                planned_exit_date = str(bars_for_symbol[exit_idx].timestamp)[:10] if bars_for_symbol else first_fill_date
                 reserved = float(decision.requested_budget)
+                plan.metadata["entry_date"] = first_fill_date
+                plan.metadata["first_fill_date"] = first_fill_date
+                plan.metadata["planned_exit_date"] = planned_exit_date
+                plan.metadata.setdefault("realized_exit_date", None)
                 state["cash"] -= reserved
                 state["reserved_capital"] += reserved
-                state["open_positions"][plan.symbol] = {"side": plan.side.value, "entry_price": avg_fill or float(candidate.current_price or 0.0), "filled_quantity": filled_qty, "reserved_budget": reserved, "planned_exit_date": planned_exit_date, "decision_date": decision_date}
+                state["open_positions"][plan.symbol] = {"side": plan.side.value, "entry_price": avg_fill or float(candidate.current_price or 0.0), "filled_quantity": filled_qty, "reserved_budget": reserved, "planned_exit_date": planned_exit_date, "decision_date": decision_date, "entry_date": first_fill_date, "first_fill_date": first_fill_date, "plan_ref": plan}
                 state["turnover_used"] += 1
-                day_selected.append({"symbol": candidate.symbol, "side": decision.side.value, "requested_budget": decision.requested_budget, "size_multiplier": decision.size_multiplier, "policy_reason": active_policy.get("chosen_policy_reason"), "planned_exit_date": planned_exit_date})
-                selected_symbols.append({"symbol": candidate.symbol, "side": decision.side.value, "size_multiplier": decision.size_multiplier, "expected_horizon_days": decision.expected_horizon_days, "decision_date": decision_date})
+                day_selected.append({"symbol": candidate.symbol, "side": decision.side.value, "requested_budget": decision.requested_budget, "size_multiplier": decision.size_multiplier, "policy_reason": active_policy.get("chosen_policy_reason"), "entry_date": first_fill_date, "first_fill_date": first_fill_date, "planned_exit_date": planned_exit_date})
+                selected_symbols.append({"symbol": candidate.symbol, "side": decision.side.value, "size_multiplier": decision.size_multiplier, "expected_horizon_days": decision.expected_horizon_days, "decision_date": decision_date, "entry_date": first_fill_date, "first_fill_date": first_fill_date, "planned_exit_date": planned_exit_date})
             else:
                 day_rejected.append({"symbol": candidate.symbol, "reason": "no_fill", "diagnostics": active_policy})
 
@@ -283,7 +291,7 @@ def main() -> int:
     research_spec = ResearchExperimentSpec(**spec_payload) if spec_payload else None
 
     request = RunnerRequest(scenario=BacktestScenario(scenario_id=args.scenario_id, market=args.market, start_date=args.start_date, end_date=args.end_date, symbols=[s.strip() for s in args.symbols.split(",") if s.strip()]), config=BacktestConfig(initial_capital=args.initial_capital, research_spec=research_spec), output_path=args.output or None)
-    result = run_backtest(request, args.data or None, output_dir=args.results_dir or None, save_json=not args.no_json_artifact, sql_db_url=args.results_db_url or None, data_source=args.data_source, scenario_id=args.scenario_id, strategy_mode=args.strategy_mode)
+    result = execute_research_backtest(request, args.data or None, output_dir=args.results_dir or None, save_json=not args.no_json_artifact, sql_db_url=args.results_db_url or None, data_source=args.data_source, scenario_id=args.scenario_id, strategy_mode=args.strategy_mode)
     payload = json.dumps(result, ensure_ascii=False, indent=2)
     if request.output_path:
         Path(request.output_path).write_text(payload, encoding="utf-8")
