@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from types import SimpleNamespace
 from statistics import mean
 from time import perf_counter
 from typing import Dict, List, Tuple
@@ -166,12 +167,10 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
     ev_intercept = float(cal_payload.get("ev_intercept", 0.0))
     panel_rows = []
     candidates = []
-    decisions = []
-    plans = []
-    fills = []
     broker = SimulatedBroker(rules=SimulationRules(slippage_bps=spec.slippage_bps, fee_bps=spec.fee_bps, allow_partial_fills=True))
     portfolio_cfg = PortfolioConfig(top_n=max(1, top_k))
     tuning = {"MIN_TICK_GAP": 1, "ADAPTIVE_BASE_LEGS": 2, "ADAPTIVE_LEG_BOOST": 1.0, "MIN_TOTAL_SPREAD_PCT": 0.01, "ADAPTIVE_STRENGTH_SCALE": 0.1, "FIRST_LEG_BASE_PCT": 0.012, "FIRST_LEG_MIN_PCT": 0.006, "FIRST_LEG_MAX_PCT": 0.05, "FIRST_LEG_GAIN_WEIGHT": 0.6, "FIRST_LEG_ATR_WEIGHT": 0.5, "FIRST_LEG_REQ_FLOOR_PCT": 0.012, "MIN_FIRST_LEG_GAP_PCT": 0.03, "STRICT_MIN_FIRST_GAP": True, "ADAPTIVE_MAX_STEP_PCT": 0.06, "ADAPTIVE_FRAC_ALPHA": 1.25, "ADAPTIVE_GAIN_SCALE": 0.1, "MIN_LOT_QTY": 1}
+    grouped_candidates = {}
     for decision_date, items in query_panel.items():
         batch = []
         for symbol, q in items.items():
@@ -190,23 +189,11 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
             candidate = SignalCandidate(symbol=symbol, ticker_id=None, market=MarketCode(market), side_bias=chosen_side, signal_strength=score, confidence=confidence, anchor_date=decision_date, reference_date=decision_date, current_price=float(q["execution_bar"].open), atr_pct=float(max(0.01, compute_bar_features(q["query_window"]).get("range_pct", 0.02) / 3.0)), target_return_pct=spec.target_return_pct, max_reverse_pct=spec.stop_return_pct, expected_horizon_days=spec.horizon_days, outcome_label=OutcomeLabel.UNKNOWN, provenance={"strategy_mode": "research_similarity_v2", "decision_date": decision_date, "execution_date": str(q["execution_bar"].timestamp)[:10], "spec_hash": spec.spec_hash(), "frozen_from_train_artifacts": True}, diagnostics={"decision_surface": {"chosen_side": surface.chosen_side}, "top_matches": panel_rows[-1]["top_matches"]}, notes=["frozen_validation_path=true"])
             batch.append(candidate)
             candidates.append(candidate)
-        pstate = PortfolioState(cash=10000.0, reserved_capital=0.0, open_positions={}, turnover_used=0)
-        portfolio_decisions = build_portfolio_decisions(candidates=batch, initial_capital=10000.0, cfg=portfolio_cfg, state=pstate)
-        for decision in portfolio_decisions:
-            decisions.append({"symbol": decision.candidate.symbol, "decision_date": decision_date, "selected": decision.selected})
-            if not decision.selected:
-                continue
-            policy = compare_policy_ab(decision.candidate, QuotePolicyConfig(ev_threshold=float(qp.get("ev_threshold", 0.005)), uncertainty_cap=float(qp.get("uncertainty_cap", 0.12)), min_effective_sample_size=float(qp.get("min_effective_sample_size", 1.5)), min_fill_probability=float(qp.get("min_fill_probability", 0.1))))
-            from datetime import datetime
-            plan, _skip = build_order_plan_from_candidate(decision.candidate, generated_at=datetime.fromisoformat(f"{decision_date}T00:00:00"), market=market, side=decision.candidate.side_bias, tuning=tuning, budget=max(0.0, float(decision.requested_budget)), venue=ExecutionVenue.BACKTEST, rationale_prefix="validation:frozen", quote_policy=policy["quote_policy_v1"])
-            if not plan:
-                continue
-            execution_date = str(plan.metadata.get("executable_from_date") or decision_date)
-            day_bars = [bar for bar in bars_by_symbol.get(plan.symbol, []) if str(bar.timestamp)[:10] >= execution_date]
-            day_fills = broker.simulate_plan(plan, day_bars)
-            plans.append(plan)
-            fills.extend(day_fills)
-    return {"decision_dates": decision_dates, "panel_rows": panel_rows, "candidates": [c.to_dict() for c in candidates], "portfolio_decisions": decisions, "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "excluded_reasons": excluded, "frozen_snapshot_id": train_artifact["snapshot_ids"]["prototype_snapshot_id"], "test_executed_from_frozen_train_artifacts": True}
+        grouped_candidates[decision_date] = batch
+    from backtest_app.research_runtime.engine import execute_daily_execution_loop
+    execution = execute_daily_execution_loop(trading_dates=decision_dates, grouped_candidates=grouped_candidates, bars_by_symbol=bars_by_symbol, config=SimpleNamespace(initial_capital=10000.0, fee_bps=spec.fee_bps, slippage_bps=spec.slippage_bps, allow_partial_fills=True), market=market, strategy_mode="research_similarity_v2", portfolio_cfg=portfolio_cfg, quote_policy_cfg=QuotePolicyConfig(ev_threshold=float(qp.get("ev_threshold", 0.005)), uncertainty_cap=float(qp.get("uncertainty_cap", 0.12)), min_effective_sample_size=float(qp.get("min_effective_sample_size", 1.5)), min_fill_probability=float(qp.get("min_fill_probability", 0.1))), tuning=tuning, broker=broker)
+    decisions = [{"symbol": d.candidate.symbol, "decision_date": str(d.candidate.reference_date)[:10] if getattr(d.candidate, "reference_date", None) else str(d.candidate.anchor_date)[:10], "selected": d.selected} for d in execution["portfolio_decisions_all"]]
+    return {"decision_dates": decision_dates, "panel_rows": panel_rows, "candidates": [c.to_dict() for c in candidates], "portfolio_decisions": decisions, "plans": [p.to_dict() for p in execution["plans"]], "fills": [f.to_dict() for f in execution["fills"]], "excluded_reasons": excluded, "frozen_snapshot_id": train_artifact["snapshot_ids"]["prototype_snapshot_id"], "test_executed_from_frozen_train_artifacts": True}
 
 
 def generate_similarity_candidates(*, bars_by_symbol: Dict[str, List[HistoricalBar]], market: str, macro_payload: Dict[str, float], sector_map: Dict[str, str] | None = None, top_k: int = 3, abstain_margin: float = 0.05, spec: ResearchExperimentSpec | None = None) -> Tuple[List[SignalCandidate], Dict[str, dict]]:

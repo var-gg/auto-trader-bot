@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime
+from types import SimpleNamespace
 
 from backtest_app.configs.models import BacktestConfig, RunnerRequest
 from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory, guard_backtest_local_only
@@ -57,16 +58,23 @@ def _candidate_groups(candidates, *, start_date: str, end_date: str):
     return dict(sorted(grouped.items())), warmup
 
 
+def _scenario_trading_dates(*, bars_by_symbol: dict, start_date: str, end_date: str) -> list[str]:
+    dates = sorted({str(bar.timestamp)[:10] for bars in bars_by_symbol.values() for bar in bars if start_date <= str(bar.timestamp)[:10] <= end_date})
+    return dates
+
+
 def _tuning_config():
     return {"MIN_TICK_GAP": 1, "ADAPTIVE_BASE_LEGS": 2, "ADAPTIVE_LEG_BOOST": 1.0, "MIN_TOTAL_SPREAD_PCT": 0.01, "ADAPTIVE_STRENGTH_SCALE": 0.1, "FIRST_LEG_BASE_PCT": 0.012, "FIRST_LEG_MIN_PCT": 0.006, "FIRST_LEG_MAX_PCT": 0.05, "FIRST_LEG_GAIN_WEIGHT": 0.6, "FIRST_LEG_ATR_WEIGHT": 0.5, "FIRST_LEG_REQ_FLOOR_PCT": 0.012, "MIN_FIRST_LEG_GAP_PCT": 0.03, "STRICT_MIN_FIRST_GAP": True, "ADAPTIVE_MAX_STEP_PCT": 0.06, "ADAPTIVE_FRAC_ALPHA": 1.25, "ADAPTIVE_GAIN_SCALE": 0.1, "MIN_LOT_QTY": 1}
 
 
-def _close_positions_for_day(*, day: str, state: dict, bars_by_symbol: dict, config: BacktestConfig):
+def _close_positions_for_day(*, day: str, state: dict, bars_by_symbol: dict, config: BacktestConfig, force: bool = False, reason: str | None = None):
     realized = []
     for symbol, pos in list(state["open_positions"].items()):
         bars = bars_by_symbol.get(symbol, [])
         exit_bar = next((b for b in bars if str(b.timestamp)[:10] == day), None)
-        if not exit_bar or day < pos["planned_exit_date"]:
+        if not exit_bar:
+            continue
+        if not force and day < pos["planned_exit_date"]:
             continue
         qty = max(float(pos["filled_quantity"] or 0.0), 0.0)
         if qty <= 0:
@@ -79,7 +87,12 @@ def _close_positions_for_day(*, day: str, state: dict, bars_by_symbol: dict, con
         pnl -= qty * entry_price * ((float(config.fee_bps) + float(config.slippage_bps)) / 10000.0)
         state["cash"] += float(pos["reserved_budget"]) + pnl
         state["reserved_capital"] = max(0.0, state["reserved_capital"] - float(pos["reserved_budget"]))
-        realized.append({"symbol": symbol, "exit_date": day, "pnl": pnl})
+        if pos.get("plan_ref") is not None:
+            pos["plan_ref"].metadata["realized_exit_date"] = day
+            if force:
+                pos["plan_ref"].metadata["forced_liquidation"] = True
+                pos["plan_ref"].metadata["forced_liquidation_reason"] = reason or "scenario_end"
+        realized.append({"symbol": symbol, "exit_date": day, "pnl": pnl, "forced_liquidation": force, "reason": reason})
         del state["open_positions"][symbol]
     return realized
 
@@ -93,26 +106,20 @@ def _open_positions_market_value(*, day: str, state: dict, bars_by_symbol: dict)
     return exposure
 
 
-def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: str | None = None, save_json: bool = True, sql_db_url: str | None = None, data_source: str = "json", scenario_id: str | None = None, strategy_mode: str = "legacy_event_window", enable_validation: bool = True) -> dict:
-    historical = load_historical(request, data_path, data_source, scenario_id, strategy_mode)
-    tuning = _tuning_config()
-    portfolio_cfg = PortfolioConfig(top_n=int(request.config.metadata.get("portfolio_top_n", 5) or 5), risk_budget_fraction=float(request.config.metadata.get("portfolio_risk_budget_fraction", 0.95) or 0.95))
-    quote_policy_cfg = QuotePolicyConfig(ev_threshold=float(request.config.metadata.get("quote_ev_threshold", 0.005)), uncertainty_cap=float(request.config.metadata.get("quote_uncertainty_cap", 0.12)), min_effective_sample_size=float(request.config.metadata.get("quote_min_effective_sample_size", 1.5)), min_fill_probability=float(request.config.metadata.get("quote_min_fill_probability", 0.10)))
-    broker = SimulatedBroker(rules=SimulationRules(slippage_bps=request.config.slippage_bps, fee_bps=request.config.fee_bps, allow_partial_fills=request.config.allow_partial_fills))
-    grouped_candidates, warmup_candidates = _candidate_groups(historical.candidates, start_date=request.scenario.start_date, end_date=request.scenario.end_date)
-    all_dates = sorted(grouped_candidates.keys())
-    state = {"cash": float(request.config.initial_capital), "reserved_capital": 0.0, "open_positions": {}, "turnover_used": 0}
+def execute_daily_execution_loop(*, trading_dates: list[str], grouped_candidates: dict[str, list], bars_by_symbol: dict, config: BacktestConfig, market: str, strategy_mode: str, portfolio_cfg: PortfolioConfig, quote_policy_cfg: QuotePolicyConfig, tuning: dict, broker, initial_state: dict | None = None):
+    state = dict(initial_state or {"cash": float(config.initial_capital), "reserved_capital": 0.0, "open_positions": {}, "turnover_used": 0})
+    state["open_positions"] = dict(state.get("open_positions") or {})
     date_artifacts = []
     plans = []
     fills = []
     skipped = []
     selected_symbols = []
     portfolio_decisions_all = []
-    for decision_date in all_dates:
-        realized_today = _close_positions_for_day(day=decision_date, state=state, bars_by_symbol=historical.bars_by_symbol, config=request.config)
+    for decision_date in trading_dates:
+        realized_today = _close_positions_for_day(day=decision_date, state=state, bars_by_symbol=bars_by_symbol, config=config)
         candidates = grouped_candidates.get(decision_date, [])
         pstate = PortfolioState(cash=state["cash"], reserved_capital=state["reserved_capital"], open_positions=dict(state["open_positions"]), turnover_used=state["turnover_used"])
-        decisions = build_portfolio_decisions(candidates=candidates, initial_capital=request.config.initial_capital, cfg=portfolio_cfg, state=pstate)
+        decisions = build_portfolio_decisions(candidates=candidates, initial_capital=config.initial_capital, cfg=portfolio_cfg, state=pstate)
         day_selected = []
         day_rejected = []
         for decision in decisions:
@@ -125,14 +132,14 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
             generated_at = datetime.fromisoformat(f"{decision_date}T00:00:00")
             policy_ab = compare_policy_ab(candidate, quote_policy_cfg)
             active_policy = policy_ab["quote_policy_v1"]
-            plan, skip = build_order_plan_from_candidate(candidate, generated_at=generated_at, market=request.scenario.market, side=candidate.side_bias if strategy_mode in {"research_similarity_v1", "research_similarity_v2"} else Side.BUY, tuning=tuning, budget=max(0.0, decision.requested_budget), venue=ExecutionVenue.BACKTEST, rationale_prefix=f"{request.scenario.strategy_id}:{strategy_mode}", quote_policy=active_policy)
+            plan, skip = build_order_plan_from_candidate(candidate, generated_at=generated_at, market=market, side=candidate.side_bias if strategy_mode in {"research_similarity_v1", "research_similarity_v2"} else Side.BUY, tuning=tuning, budget=max(0.0, decision.requested_budget), venue=ExecutionVenue.BACKTEST, rationale_prefix=f"execution:{strategy_mode}", quote_policy=active_policy)
             if not plan:
                 day_rejected.append({"symbol": candidate.symbol, "reason": (skip or {}).get("code", "NO_PLAN"), "diagnostics": active_policy})
                 continue
             plan.metadata["quote_policy_ab"] = policy_ab
             plan.metadata["decision_date"] = decision_date
             execution_date = str(plan.metadata.get("executable_from_date") or decision_date)
-            bars = [bar for bar in historical.bars_by_symbol.get(plan.symbol, []) if str(bar.timestamp)[:10] >= (execution_date if strategy_mode == "research_similarity_v2" else decision_date)]
+            bars = [bar for bar in bars_by_symbol.get(plan.symbol, []) if str(bar.timestamp)[:10] >= (execution_date if strategy_mode == "research_similarity_v2" else decision_date)]
             day_fills = broker.simulate_plan(plan, bars)
             plans.append(plan)
             fills.extend(day_fills)
@@ -142,30 +149,60 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
             if filled_qty > 0:
                 horizon_days = int(candidate.expected_horizon_days or 5)
                 first_fill_date = min(str(f.event_time)[:10] for f in fill_rows)
-                bars_for_symbol = [b for b in historical.bars_by_symbol.get(plan.symbol, []) if str(b.timestamp)[:10] >= first_fill_date]
+                bars_for_symbol = [b for b in bars_by_symbol.get(plan.symbol, []) if str(b.timestamp)[:10] >= first_fill_date]
                 exit_idx = min(max(horizon_days, 1), max(len(bars_for_symbol) - 1, 0))
                 planned_exit_date = str(bars_for_symbol[exit_idx].timestamp)[:10] if bars_for_symbol else first_fill_date
                 reserved = float(decision.requested_budget)
-                plan.metadata.update({"entry_date": first_fill_date, "first_fill_date": first_fill_date, "planned_exit_date": planned_exit_date})
+                plan.metadata.update({"entry_date": first_fill_date, "first_fill_date": first_fill_date, "planned_exit_date": planned_exit_date, "realized_exit_date": None, "forced_liquidation": False, "forced_liquidation_reason": None})
                 state["cash"] -= reserved
                 state["reserved_capital"] += reserved
-                state["open_positions"][plan.symbol] = {"side": plan.side.value, "entry_price": avg_fill or float(candidate.current_price or 0.0), "filled_quantity": filled_qty, "reserved_budget": reserved, "planned_exit_date": planned_exit_date}
+                state["open_positions"][plan.symbol] = {"side": plan.side.value, "entry_price": avg_fill or float(candidate.current_price or 0.0), "filled_quantity": filled_qty, "reserved_budget": reserved, "planned_exit_date": planned_exit_date, "plan_ref": plan}
                 state["turnover_used"] += 1
                 day_selected.append({"symbol": candidate.symbol, "side": decision.side.value, "requested_budget": decision.requested_budget, "size_multiplier": decision.size_multiplier, "policy_reason": active_policy.get("chosen_policy_reason"), "entry_date": first_fill_date, "first_fill_date": first_fill_date, "planned_exit_date": planned_exit_date})
                 selected_symbols.append({"symbol": candidate.symbol, "side": decision.side.value, "size_multiplier": decision.size_multiplier, "expected_horizon_days": decision.expected_horizon_days, "decision_date": decision_date})
             else:
                 day_rejected.append({"symbol": candidate.symbol, "reason": "no_fill", "diagnostics": active_policy})
-        exposure = _open_positions_market_value(day=decision_date, state=state, bars_by_symbol=historical.bars_by_symbol)
-        date_artifacts.append({"decision_date": decision_date, "selected": day_selected, "rejected": day_rejected, "realized_today": realized_today, "cash": state["cash"], "reserved_capital": state["reserved_capital"], "exposure": exposure, "open_position_count": len(state["open_positions"])})
+        exposure = _open_positions_market_value(day=decision_date, state=state, bars_by_symbol=bars_by_symbol)
+        date_artifacts.append({"decision_date": decision_date, "selected": day_selected, "rejected": day_rejected, "realized_today": realized_today, "cash": state["cash"], "reserved_capital": state["reserved_capital"], "exposure": exposure, "open_position_count": len(state["open_positions"]), "open_positions": sorted(state["open_positions"].keys())})
+    if trading_dates:
+        forced = _close_positions_for_day(day=trading_dates[-1], state=state, bars_by_symbol=bars_by_symbol, config=config, force=True, reason="scenario_end")
+        if date_artifacts:
+            date_artifacts[-1]["realized_today"].extend(forced)
+            date_artifacts[-1]["open_position_count"] = len(state["open_positions"])
+            date_artifacts[-1]["open_positions"] = sorted(state["open_positions"].keys())
+            date_artifacts[-1]["cash"] = state["cash"]
+            date_artifacts[-1]["reserved_capital"] = state["reserved_capital"]
+            date_artifacts[-1]["exposure"] = _open_positions_market_value(day=trading_dates[-1], state=state, bars_by_symbol=bars_by_symbol)
+    return {"state": state, "date_artifacts": date_artifacts, "plans": plans, "fills": fills, "skipped": skipped, "selected_symbols": selected_symbols, "portfolio_decisions_all": portfolio_decisions_all}
+
+
+def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: str | None = None, save_json: bool = True, sql_db_url: str | None = None, data_source: str = "json", scenario_id: str | None = None, strategy_mode: str = "legacy_event_window", enable_validation: bool = True) -> dict:
+    historical = load_historical(request, data_path, data_source, scenario_id, strategy_mode)
+    tuning = _tuning_config()
+    portfolio_cfg = PortfolioConfig(top_n=int(request.config.metadata.get("portfolio_top_n", 5) or 5), risk_budget_fraction=float(request.config.metadata.get("portfolio_risk_budget_fraction", 0.95) or 0.95))
+    quote_policy_cfg = QuotePolicyConfig(ev_threshold=float(request.config.metadata.get("quote_ev_threshold", 0.005)), uncertainty_cap=float(request.config.metadata.get("quote_uncertainty_cap", 0.12)), min_effective_sample_size=float(request.config.metadata.get("quote_min_effective_sample_size", 1.5)), min_fill_probability=float(request.config.metadata.get("quote_min_fill_probability", 0.10)))
+    broker = SimulatedBroker(rules=SimulationRules(slippage_bps=request.config.slippage_bps, fee_bps=request.config.fee_bps, allow_partial_fills=request.config.allow_partial_fills))
+    grouped_candidates, warmup_candidates = _candidate_groups(historical.candidates, start_date=request.scenario.start_date, end_date=request.scenario.end_date)
+    trading_dates = _scenario_trading_dates(bars_by_symbol=historical.bars_by_symbol, start_date=request.scenario.start_date, end_date=request.scenario.end_date)
+    execution = execute_daily_execution_loop(trading_dates=trading_dates, grouped_candidates=grouped_candidates, bars_by_symbol=historical.bars_by_symbol, config=request.config, market=request.scenario.market, strategy_mode=strategy_mode, portfolio_cfg=portfolio_cfg, quote_policy_cfg=quote_policy_cfg, tuning=tuning, broker=broker)
+    state = execution["state"]
+    date_artifacts = execution["date_artifacts"]
+    plans = execution["plans"]
+    fills = execution["fills"]
+    skipped = execution["skipped"]
+    selected_symbols = execution["selected_symbols"]
+    portfolio_decisions_all = execution["portfolio_decisions_all"]
     summary = build_summary(scenario_id=request.scenario.scenario_id, plans=plans, fills=fills, bars_by_symbol=historical.bars_by_symbol, date_artifacts=date_artifacts)
     historical_metadata = getattr(historical, "metadata", {}) or {}
+    historical_context = {"bars_by_symbol": historical.bars_by_symbol, "macro_history_by_date": historical_metadata.get("macro_history_by_date", {}), "sector_map": historical_metadata.get("sector_map", {}), "trading_dates": trading_dates}
     historical_metadata["bars_by_symbol"] = historical.bars_by_symbol
+    historical_metadata["historical_context"] = historical_context
     manifest = ensure_manifest(request=request, data_source=data_source, historical_metadata=historical_metadata)
     diagnostics = historical_metadata.get("diagnostics", {})
     validation_folds = run_fold_validation(request=request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, runner_fn=run_backtest, mode="walk_forward") if strategy_mode == "research_similarity_v2" and enable_validation else {"mode": "disabled", "folds": [], "aggregate": {}, "rejection_reasons": [], "train_artifacts": [], "test_artifacts": []}
     sensitivity = [p.__dict__ for p in sensitivity_sweep(plans=plans, fills=fills, fee_grid=[0.0, request.config.fee_bps, request.config.fee_bps + 5.0], slippage_grid=[0.0, request.config.slippage_bps, request.config.slippage_bps + 5.0], total_symbols=len(request.scenario.symbols), bars_by_symbol=historical.bars_by_symbol)]
     quote_policy_sweep = {"ev_threshold": [0.003, quote_policy_cfg.ev_threshold, 0.010], "min_fill_probability": [0.05, quote_policy_cfg.min_fill_probability, 0.20], "uncertainty_caps": [0.08, quote_policy_cfg.uncertainty_cap, 0.16]}
-    result = {"scenario": request.scenario.scenario_id, "strategy_mode": strategy_mode, "manifest": manifest.to_dict(), "portfolio": {"selected_symbols": selected_symbols, "decisions": [{"symbol": d.candidate.symbol, "selected": d.selected, "side": d.side.value, "size_multiplier": d.size_multiplier, "requested_budget": d.requested_budget, "expected_horizon_days": d.expected_horizon_days, "kill_reason": d.kill_reason, "diagnostics": d.diagnostics, "decision_date": _candidate_decision_date(d.candidate)} for d in portfolio_decisions_all], "date_artifacts": date_artifacts}, "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "summary": summary.__dict__, "diagnostics": diagnostics, "artifacts": {"signal_panel": historical_metadata.get("signal_panel_artifact", []), "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates]}, "validation": {"fold_engine": validation_folds, "sensitivity_sweep": sensitivity, "quote_policy_sweep": quote_policy_sweep, "coverage": summary.metadata.get("coverage", 0.0), "no_trade_ratio": summary.metadata.get("no_trade_ratio", 0.0)}, "skipped": skipped}
+    result = {"scenario": request.scenario.scenario_id, "strategy_mode": strategy_mode, "manifest": manifest.to_dict(), "historical_context": historical_context, "bars_by_symbol": historical_context["bars_by_symbol"], "macro_history_by_date": historical_context["macro_history_by_date"], "sector_map": historical_context["sector_map"], "trading_dates": historical_context["trading_dates"], "portfolio": {"selected_symbols": selected_symbols, "decisions": [{"symbol": d.candidate.symbol, "selected": d.selected, "side": d.side.value, "size_multiplier": d.size_multiplier, "requested_budget": d.requested_budget, "expected_horizon_days": d.expected_horizon_days, "kill_reason": d.kill_reason, "diagnostics": d.diagnostics, "decision_date": _candidate_decision_date(d.candidate)} for d in portfolio_decisions_all], "date_artifacts": date_artifacts}, "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "summary": summary.__dict__, "diagnostics": diagnostics, "artifacts": {"signal_panel": historical_metadata.get("signal_panel_artifact", []), "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates], "historical_context": historical_context}, "validation": {"fold_engine": validation_folds, "sensitivity_sweep": sensitivity, "quote_policy_sweep": quote_policy_sweep, "coverage": summary.metadata.get("coverage", 0.0), "no_trade_ratio": summary.metadata.get("no_trade_ratio", 0.0)}, "skipped": skipped}
     if sql_db_url:
         snapshot_info = {"data_source": data_source, "strategy_mode": strategy_mode, "historical_metadata": historical_metadata, "date_artifacts": date_artifacts}
         result["sql_run_id"] = SqlResultStore(sql_db_url, namespace="research").save_run(run_key=manifest.manifest_id(), scenario_id=request.scenario.scenario_id, strategy_id=request.scenario.strategy_id, strategy_mode=strategy_mode, market=request.scenario.market, data_source=data_source, config_version=request.scenario.strategy_version, label_version=str(request.config.metadata.get("label_version", "v1")), vector_version=str(request.config.metadata.get("vector_version", strategy_mode)), initial_capital=request.config.initial_capital, params={"scenario_params": request.scenario.params, "scenario_notes": request.scenario.notes, "config_metadata": request.config.metadata}, summary=summary.__dict__, diagnostics=diagnostics, plans=plans, fills=fills, snapshot_info=snapshot_info, manifest=manifest.to_dict())

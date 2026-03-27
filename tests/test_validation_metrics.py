@@ -5,6 +5,7 @@ from backtest_app.configs.models import BacktestConfig, BacktestScenario, Resear
 from backtest_app.historical_data.models import HistoricalBar
 from backtest_app.research.artifacts import JsonResearchArtifactStore
 from backtest_app.research.pipeline import fit_train_artifacts, run_test_with_frozen_artifacts
+from backtest_app.research_runtime.engine import run_backtest
 from backtest_app.validation import _calibration_targets, build_cpcv_folds, build_walk_forward_splits, compute_performance_metrics, compute_purge_embargo, rejection_reasons, run_fold_validation, sensitivity_sweep
 from shared.domain.models import ExecutionVenue, FillOutcome, FillStatus, OrderPlan, Side
 
@@ -140,3 +141,40 @@ def test_sensitivity_sweep_penalizes_expectancy():
     bars_by_symbol = {"A1": _bars("A1", [100, 102, 103, 104, 105])}
     sweep = sensitivity_sweep(plans=plans, fills=fills, fee_grid=[0.0, 10.0], slippage_grid=[0.0, 10.0], total_symbols=1, bars_by_symbol=bars_by_symbol)
     assert len(sweep) == 4
+
+
+def test_run_fold_validation_uses_engine_historical_context_and_emits_nonempty_frozen_eval(monkeypatch):
+    request = RunnerRequest(scenario=BacktestScenario(scenario_id="ctx1", market="US", start_date="2026-01-01", end_date="2026-01-08", symbols=["AAPL"]), config=BacktestConfig(initial_capital=10000.0, research_spec=ResearchExperimentSpec(horizon_days=1, feature_window_bars=2)))
+
+    class Slice:
+        def __init__(self):
+            from types import SimpleNamespace
+            self.bars_by_symbol = {"AAPL": _bars("AAPL", [100, 101, 102, 103, 104, 105, 106, 107, 108])}
+            self.candidates = [
+                SimpleNamespace(symbol="AAPL", side_bias=Side.BUY, current_price=101.0, confidence=0.8, atr_pct=0.02, target_return_pct=0.04, max_reverse_pct=0.03, expected_horizon_days=2, diagnostics={"query": {"regime_code": "RISK_ON", "sector_code": "TECH"}, "ev": {"long": {"calibrated_ev": 0.05, "uncertainty": 0.01, "calibrated_win_prob": 0.8}}}, reference_date="2026-01-02", anchor_date="2026-01-02", signal_strength=0.05, provenance={}),
+                SimpleNamespace(symbol="AAPL", side_bias=Side.BUY, current_price=102.0, confidence=0.8, atr_pct=0.02, target_return_pct=0.04, max_reverse_pct=0.03, expected_horizon_days=2, diagnostics={"query": {"regime_code": "RISK_ON", "sector_code": "TECH"}, "ev": {"long": {"calibrated_ev": 0.06, "uncertainty": 0.01, "calibrated_win_prob": 0.8}}}, reference_date="2026-01-03", anchor_date="2026-01-03", signal_strength=0.06, provenance={}),
+                SimpleNamespace(symbol="AAPL", side_bias=Side.BUY, current_price=103.0, confidence=0.8, atr_pct=0.02, target_return_pct=0.04, max_reverse_pct=0.03, expected_horizon_days=2, diagnostics={"query": {"regime_code": "RISK_ON", "sector_code": "TECH"}, "ev": {"long": {"calibrated_ev": 0.07, "uncertainty": 0.01, "calibrated_win_prob": 0.8}}}, reference_date="2026-01-04", anchor_date="2026-01-04", signal_strength=0.07, provenance={}),
+                SimpleNamespace(symbol="AAPL", side_bias=Side.BUY, current_price=104.0, confidence=0.8, atr_pct=0.02, target_return_pct=0.04, max_reverse_pct=0.03, expected_horizon_days=2, diagnostics={"query": {"regime_code": "RISK_ON", "sector_code": "TECH"}, "ev": {"long": {"calibrated_ev": 0.08, "uncertainty": 0.01, "calibrated_win_prob": 0.8}}}, reference_date="2026-01-05", anchor_date="2026-01-05", signal_strength=0.08, provenance={}),
+                SimpleNamespace(symbol="AAPL", side_bias=Side.BUY, current_price=105.0, confidence=0.8, atr_pct=0.02, target_return_pct=0.04, max_reverse_pct=0.03, expected_horizon_days=2, diagnostics={"query": {"regime_code": "RISK_ON", "sector_code": "TECH"}, "ev": {"long": {"calibrated_ev": 0.09, "uncertainty": 0.01, "calibrated_win_prob": 0.8}}}, reference_date="2026-01-06", anchor_date="2026-01-06", signal_strength=0.09, provenance={}),
+            ]
+            self.metadata = {"macro_history_by_date": {f"2026-01-0{i}": {"growth": 0.2} for i in range(1, 9)}, "sector_map": {"AAPL": "TECH"}, "signal_panel_artifact": []}
+    monkeypatch.setattr("backtest_app.research_runtime.engine.load_historical", lambda *args, **kwargs: Slice())
+    report = run_fold_validation(request=request, data_path="dummy", data_source="json", scenario_id="ctx1", strategy_mode="research_similarity_v2", runner_fn=run_backtest, mode="walk_forward")
+    frozen = report["test_artifacts"][0]["artifact"]["frozen_eval"]
+    assert frozen["plans"] or frozen["panel_rows"]
+
+
+def test_candidate_free_days_still_process_planned_exit_and_scenario_end_liquidates(monkeypatch):
+    request = RunnerRequest(scenario=BacktestScenario(scenario_id="ctx2", market="US", start_date="2026-01-01", end_date="2026-01-05", symbols=["AAPL"]), config=BacktestConfig(initial_capital=10000.0, research_spec=ResearchExperimentSpec(horizon_days=3, feature_window_bars=2)))
+
+    class Slice:
+        def __init__(self):
+            from types import SimpleNamespace
+            self.bars_by_symbol = {"AAPL": _bars("AAPL", [100, 101, 102, 103, 104, 105])}
+            self.candidates = [SimpleNamespace(symbol="AAPL", side_bias=Side.BUY, current_price=101.0, confidence=0.8, atr_pct=0.02, target_return_pct=0.04, max_reverse_pct=0.03, expected_horizon_days=10, diagnostics={"query": {"regime_code": "RISK_ON", "sector_code": "TECH"}, "ev": {"long": {"calibrated_ev": 0.05, "uncertainty": 0.01, "calibrated_win_prob": 0.8}}}, reference_date="2026-01-02", anchor_date="2026-01-02", signal_strength=0.05, provenance={})]
+            self.metadata = {"macro_history_by_date": {f"2026-01-0{i}": {"growth": 0.2} for i in range(1, 6)}, "sector_map": {"AAPL": "TECH"}, "signal_panel_artifact": []}
+    monkeypatch.setattr("backtest_app.research_runtime.engine.load_historical", lambda *args, **kwargs: Slice())
+    result = run_backtest(request=request, data_path="dummy", data_source="json", strategy_mode="research_similarity_v2", enable_validation=False)
+    assert result["portfolio"]["date_artifacts"][-1]["open_position_count"] == 0
+    if result["plans"]:
+        assert any(p["metadata"].get("forced_liquidation") for p in result["plans"])
