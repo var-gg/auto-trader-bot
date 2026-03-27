@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, replace
 from math import ceil, erf, sqrt
-from typing import Callable, Iterable, List, Sequence
+from typing import Any, Callable, Iterable, List, Sequence
 
 from backtest_app.configs.models import BacktestScenario, RunnerRequest
 from backtest_app.historical_data.models import HistoricalBar
@@ -38,6 +39,31 @@ class CPCVFold:
     test_indices: list[int]
     purge: int
     embargo: int
+
+
+def _stage_timer(enabled: bool, label: str):
+    started = time.perf_counter()
+
+    def _done(extra: str = ""):
+        if enabled:
+            elapsed = time.perf_counter() - started
+            suffix = f" | {extra}" if extra else ""
+            print(f"[{label}] {elapsed:.3f}s{suffix}")
+
+    return _done
+
+
+def _lite_fold_artifact(train_artifact: dict) -> dict:
+    return {
+        "spec_hash": train_artifact.get("spec_hash"),
+        "as_of_date": train_artifact.get("as_of_date"),
+        "train_end": train_artifact.get("train_end"),
+        "test_start": train_artifact.get("test_start"),
+        "purge": train_artifact.get("purge"),
+        "embargo": train_artifact.get("embargo"),
+        "snapshot_ids": train_artifact.get("snapshot_ids"),
+        "test_executed_from_frozen_train_artifacts": True,
+    }
 
 
 def compute_purge_embargo(*, horizon_days: int, holding_overlap: float = 1.0) -> tuple[int, int]:
@@ -343,12 +369,63 @@ def _fit_fold_calibration(fold_id: str, raw_scores: list[float], win_targets: li
     return {"fold_id": fold_id, **applied["artifact"], "ev_slope": ev_slope, "ev_intercept": ev_intercept}
 
 
-def run_fold_validation(*, request: RunnerRequest, data_path: str | None, data_source: str, scenario_id: str | None, strategy_mode: str, runner_fn: Callable[..., dict], holding_overlap: float = 1.0, mode: str = "walk_forward") -> dict:
+def _runner_call(runner_fn: Callable[..., dict], **kwargs) -> dict:
+    downgraded = dict(kwargs)
+    while True:
+        try:
+            return runner_fn(**downgraded)
+        except TypeError as exc:
+            message = str(exc)
+            changed = False
+            for key in ("diagnostics_lite", "candidate_reuse_payload"):
+                if f"unexpected keyword argument '{key}'" in message and key in downgraded:
+                    downgraded.pop(key, None)
+                    changed = True
+            if not changed:
+                raise
+
+
+def _filtered_candidate_reuse_payload(payload: dict | None, *, allowed_dates: list[str] | None = None) -> dict | None:
+    if not payload:
+        return None
+    if not allowed_dates:
+        return dict(payload)
+    allowed = {str(d)[:10] for d in allowed_dates}
+    candidates = []
+    for candidate in payload.get("candidates") or []:
+        decision_date = str(getattr(candidate, "reference_date", None) or getattr(candidate, "anchor_date", None) or "")[:10]
+        if not decision_date or decision_date in allowed:
+            candidates.append(candidate)
+    warmup_candidates = [row for row in (payload.get("warmup_candidates") or []) if str((row or {}).get("decision_date") or "")[:10] in allowed]
+    candidate_counts = {k: v for k, v in (payload.get("candidate_counts") or {}).items() if str(k)[:10] in allowed}
+    return {
+        **payload,
+        "candidates": candidates,
+        "warmup_candidates": warmup_candidates,
+        "candidate_counts": candidate_counts,
+        "trading_dates": [d for d in (payload.get("trading_dates") or []) if str(d)[:10] in allowed],
+    }
+
+
+def run_fold_validation(*, request: RunnerRequest, data_path: str | None, data_source: str, scenario_id: str | None, strategy_mode: str, runner_fn: Callable[..., dict], holding_overlap: float = 1.0, mode: str = "walk_forward", max_folds: int | None = None, summary_only: bool = False, diagnostics_lite: bool = False, emit_timing_logs: bool = False, bootstrap_result: dict | None = None) -> dict:
     import tempfile
 
-    bootstrap = runner_fn(request=request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, enable_validation=False)
+    bootstrap = bootstrap_result or _runner_call(runner_fn, request=request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, enable_validation=False, diagnostics_lite=diagnostics_lite)
     artifact_store = JsonResearchArtifactStore(tempfile.mkdtemp(prefix="research-fold-"))
     bootstrap_ctx = bootstrap.get("historical_context") or bootstrap.get("artifacts", {}).get("historical_context") or {}
+    bootstrap_candidate_reuse = (bootstrap.get("artifacts") or {}).get("candidate_reuse") or {
+        "bars_by_symbol": bootstrap.get("bars_by_symbol") or bootstrap_ctx.get("bars_by_symbol") or {},
+        "candidates": [],
+        "metadata": {
+            "diagnostics": bootstrap.get("diagnostics") or {},
+            "signal_panel_artifact": (bootstrap.get("artifacts") or {}).get("signal_panel") or [],
+            "macro_history_by_date": bootstrap.get("macro_history_by_date") or bootstrap_ctx.get("macro_history_by_date") or {},
+            "sector_map": bootstrap.get("sector_map") or bootstrap_ctx.get("sector_map") or {},
+        },
+        "trading_dates": bootstrap.get("trading_dates") or bootstrap_ctx.get("trading_dates") or [],
+        "warmup_candidates": (bootstrap.get("artifacts") or {}).get("warmup_candidates") or [],
+        "candidate_counts": {},
+    }
     dates = _all_candidate_dates(bootstrap)
     horizon_days = int(request.config.research_spec.horizon_days if request.config.research_spec else 5)
     purge, embargo = compute_purge_embargo(horizon_days=horizon_days, holding_overlap=holding_overlap)
@@ -363,16 +440,19 @@ def run_fold_validation(*, request: RunnerRequest, data_path: str | None, data_s
         test_size = max(1, min(horizon_days, max(1, len(dates) - train_size - purge - embargo)))
         fold_defs = build_walk_forward_splits(n_obs=len(dates), train_size=train_size, test_size=test_size, step_size=test_size, purge=purge, embargo=embargo)
         normalized = [{"train_dates": dates[f.train_start:f.train_end], "test_dates": dates[f.test_start:f.test_end], "purge": f.purge, "embargo": f.embargo} for f in fold_defs]
+    if max_folds is not None:
+        normalized = normalized[: max(0, int(max_folds))]
     folds = []
     train_artifacts = []
     test_artifacts = []
     test_metrics_rows = []
     for idx, split in enumerate(normalized, start=1):
+        fold_timer = _stage_timer(emit_timing_logs, f"fold_{idx}")
         fold_id = f"fold_{idx}"
         train_request = _make_request_for_window(request, start_date=split["train_dates"][0], end_date=split["train_dates"][-1])
         test_request = _make_request_for_window(request, start_date=split["test_dates"][0], end_date=split["test_dates"][-1])
-        train_result = runner_fn(request=train_request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, enable_validation=False)
-        test_result = runner_fn(request=test_request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, enable_validation=False)
+        train_result = _runner_call(runner_fn, request=train_request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, enable_validation=False, diagnostics_lite=diagnostics_lite, candidate_reuse_payload=_filtered_candidate_reuse_payload(bootstrap_candidate_reuse, allowed_dates=split["train_dates"]))
+        test_result = _runner_call(runner_fn, request=test_request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, enable_validation=False, diagnostics_lite=diagnostics_lite, candidate_reuse_payload=_filtered_candidate_reuse_payload(bootstrap_candidate_reuse, allowed_dates=split["test_dates"]))
         train_returned_dates = set(_all_candidate_dates(train_result))
         test_returned_dates = set(_all_candidate_dates(test_result))
         if any(d not in set(split["train_dates"]) for d in train_returned_dates):
@@ -384,7 +464,7 @@ def run_fold_validation(*, request: RunnerRequest, data_path: str | None, data_s
         train_raw_scores, train_win_targets, train_return_targets = _calibration_targets(train_result)
         calibration_artifact = _fit_fold_calibration(fold_id, train_raw_scores, train_win_targets, train_return_targets)
         qmeta = request.config.metadata or {}
-        train_artifact = fit_train_artifacts(run_id=fold_id, artifact_store=artifact_store, train_end=split["train_dates"][-1], test_start=split["test_dates"][0], purge=split["purge"], embargo=split["embargo"], spec=request.config.research_spec, bars_by_symbol=train_result.get("bars_by_symbol") or train_ctx.get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or bootstrap_ctx.get("bars_by_symbol") or {}, macro_history_by_date=train_result.get("macro_history_by_date") or train_ctx.get("macro_history_by_date") or {}, sector_map=train_result.get("sector_map") or train_ctx.get("sector_map") or {}, market=request.scenario.market, calibration_artifact=calibration_artifact, quote_policy_calibration={"ev_threshold": float(qmeta.get("quote_ev_threshold", 0.005) or 0.005), "uncertainty_cap": float(qmeta.get("quote_uncertainty_cap", 0.12) or 0.12), "min_effective_sample_size": float(qmeta.get("quote_min_effective_sample_size", 1.5) or 1.5), "min_fill_probability": float(qmeta.get("quote_min_fill_probability", 0.1) or 0.1), "abstain_margin": float(qmeta.get("abstain_margin", 0.05) or 0.05)}, metadata={"portfolio_top_n": qmeta.get("portfolio_top_n", 3), "portfolio_risk_budget_fraction": qmeta.get("portfolio_risk_budget_fraction", 0.95), "quote_ev_threshold": qmeta.get("quote_ev_threshold", 0.005), "quote_uncertainty_cap": qmeta.get("quote_uncertainty_cap", 0.12), "quote_min_effective_sample_size": qmeta.get("quote_min_effective_sample_size", 1.5), "quote_min_fill_probability": qmeta.get("quote_min_fill_probability", 0.1), "abstain_margin": qmeta.get("abstain_margin", 0.05)})
+        train_artifact = fit_train_artifacts(run_id=fold_id, artifact_store=artifact_store, train_end=split["train_dates"][-1], test_start=split["test_dates"][0], purge=split["purge"], embargo=split["embargo"], spec=request.config.research_spec, bars_by_symbol=train_result.get("bars_by_symbol") or train_ctx.get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or bootstrap_ctx.get("bars_by_symbol") or {}, macro_history_by_date=train_result.get("macro_history_by_date") or train_ctx.get("macro_history_by_date") or {}, sector_map=train_result.get("sector_map") or train_ctx.get("sector_map") or {}, market=request.scenario.market, calibration_artifact=calibration_artifact, quote_policy_calibration={"ev_threshold": float(qmeta.get("quote_ev_threshold", 0.005) or 0.005), "uncertainty_cap": float(qmeta.get("quote_uncertainty_cap", 0.12) or 0.12), "min_effective_sample_size": float(qmeta.get("quote_min_effective_sample_size", 1.5) or 1.5), "min_fill_probability": float(qmeta.get("quote_min_fill_probability", 0.1) or 0.1), "abstain_margin": float(qmeta.get("abstain_margin", 0.05) or 0.05), "min_regime_alignment": float(qmeta.get("quote_min_regime_alignment", 0.5) or 0.5), "max_return_interval_width": float(qmeta.get("quote_max_return_interval_width", 0.08) or 0.08)}, metadata={"portfolio_top_n": qmeta.get("portfolio_top_n", 3), "portfolio_risk_budget_fraction": qmeta.get("portfolio_risk_budget_fraction", 0.95), "quote_ev_threshold": qmeta.get("quote_ev_threshold", 0.005), "quote_uncertainty_cap": qmeta.get("quote_uncertainty_cap", 0.12), "quote_min_effective_sample_size": qmeta.get("quote_min_effective_sample_size", 1.5), "quote_min_fill_probability": qmeta.get("quote_min_fill_probability", 0.1), "abstain_margin": qmeta.get("abstain_margin", 0.05), "quote_min_regime_alignment": qmeta.get("quote_min_regime_alignment", 0.5), "quote_max_return_interval_width": qmeta.get("quote_max_return_interval_width", 0.08)})
         frozen_eval = run_test_with_frozen_artifacts(train_artifact=train_artifact, artifact_store=artifact_store, decision_dates=test_ctx.get("trading_dates") or split["test_dates"], spec=request.config.research_spec, bars_by_symbol=test_result.get("bars_by_symbol") or test_ctx.get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or bootstrap_ctx.get("bars_by_symbol") or {}, macro_history_by_date=test_result.get("macro_history_by_date") or test_ctx.get("macro_history_by_date") or {}, sector_map=test_result.get("sector_map") or test_ctx.get("sector_map") or {}, market=request.scenario.market)
         leakage_ok = not split["train_dates"] or not split["test_dates"] or ((train_artifact.get("max_train_date") or split["train_dates"][-1]) < split["test_dates"][0])
         if not leakage_ok:
@@ -394,10 +474,13 @@ def run_fold_validation(*, request: RunnerRequest, data_path: str | None, data_s
             raise AssertionError(f"frozen path required: {fold_id}")
         test_metrics = compute_performance_metrics(plans=[_dict_to_plan(p) for p in frozen_eval.get("plans") or []], fills=[_dict_to_fill(f) for f in frozen_eval.get("fills") or []], bars_by_symbol=test_ctx.get("bars_by_symbol") or bootstrap_ctx.get("bars_by_symbol") or bootstrap.get("bars_by_symbol") or {}, total_symbols=len(request.scenario.symbols))
         test_metrics_rows.append(test_metrics)
-        fold_row = {"fold_id": fold_id, "split": split, "train_metrics": train_metrics, "test_metrics": test_metrics, "leakage_ok": leakage_ok, "rejection_reasons": rejection_reasons(test_metrics), "calibration": calibration_artifact, "artifact": {"spec_hash": train_artifact.get("spec_hash"), "as_of_date": train_artifact.get("as_of_date"), "train_end": train_artifact.get("train_end"), "test_start": train_artifact.get("test_start"), "purge": train_artifact.get("purge"), "embargo": train_artifact.get("embargo"), "snapshot_ids": train_artifact.get("snapshot_ids"), "test_executed_from_frozen_train_artifacts": True}}
+        artifact_summary = _lite_fold_artifact(train_artifact)
+        fold_row = {"fold_id": fold_id, "split": split, "train_metrics": train_metrics, "test_metrics": test_metrics, "leakage_ok": leakage_ok, "rejection_reasons": rejection_reasons(test_metrics), "calibration": calibration_artifact, "artifact": artifact_summary}
         folds.append(fold_row)
-        train_artifacts.append({"fold_id": fold_id, "kind": "train_only", "dates": split["train_dates"], "calibration_fit": calibration_artifact, "artifact": train_artifact, "result": train_result})
-        test_artifacts.append({"fold_id": fold_id, "kind": "test_only", "dates": split["test_dates"], "frozen_from_train": True, "artifact": {**train_artifact, "frozen_eval": frozen_eval}, "result": test_result})
+        if not summary_only:
+            train_artifacts.append({"fold_id": fold_id, "kind": "train_only", "dates": split["train_dates"], "calibration_fit": calibration_artifact, "artifact": train_artifact, "result": train_result})
+            test_artifacts.append({"fold_id": fold_id, "kind": "test_only", "dates": split["test_dates"], "frozen_from_train": True, "artifact": {**train_artifact, "frozen_eval": frozen_eval}, "result": test_result})
+        fold_timer(f"train={len(split['train_dates'])} test={len(split['test_dates'])}")
     weights = [max(float(m.get("effective_sample_size", 0.0)), float(m.get("long_count", 0.0)) + float(m.get("short_count", 0.0)), 1.0) for m in test_metrics_rows]
     total_weight = sum(weights) or 1.0
     aggregate = {"expectancy_after_cost": sum(w * float(m.get("expectancy_after_cost", 0.0)) for w, m in zip(weights, test_metrics_rows)) / total_weight, "realized_path_pnl": sum(float(m.get("realized_path_pnl", 0.0)) for m in test_metrics_rows), "psr": sum(w * float(m.get("psr", 0.0)) for w, m in zip(weights, test_metrics_rows)) / total_weight, "dsr": sum(w * float(m.get("dsr", 0.0)) for w, m in zip(weights, test_metrics_rows)) / total_weight, "calibration_error": sum(w * float(m.get("calibration_error", 0.0)) for w, m in zip(weights, test_metrics_rows)) / total_weight, "score_decile_monotonicity": all(bool(m.get("score_decile_monotonicity", False)) for m in test_metrics_rows), "baseline_excess_information": {name: sum(w * float(m.get("baseline_excess_information", {}).get(name, 0.0)) for w, m in zip(weights, test_metrics_rows)) / total_weight for name in {k for m in test_metrics_rows for k in (m.get("baseline_excess_information", {}) or {}).keys()}}, "effective_sample_size": sum(float(m.get("effective_sample_size", 0.0)) for m in test_metrics_rows), "aggregate_weighting": "effective_sample_size_or_trade_count", "regime_breakdown": [item for m in test_metrics_rows for item in (m.get("regime_breakdown") or [])], "fold_count": len(folds), "all_folds_leakage_ok": all(bool(f.get("leakage_ok", False)) for f in folds)}

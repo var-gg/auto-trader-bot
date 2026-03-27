@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Mapping, Sequence
 from .models import HistoricalBar
 
 FEATURE_VERSION = "multiscale_manual_v2"
-SHAPE_HORIZONS = (1, 3, 5, 10, 20, 60)
+DEFAULT_SHAPE_HORIZONS = (1, 3, 5, 10, 20, 60)
 CTX_SERIES = ("vix", "rate", "dollar", "oil", "breadth")
 
 
@@ -197,6 +197,7 @@ def build_multiscale_feature_vector(
     macro_history: Mapping[str, Mapping[str, float]] | None,
     sector_code: str | None,
     scaler: FeatureScaler | None = None,
+    shape_horizons: Sequence[int] | None = None,
 ) -> FeatureVector:
     bars = list(bars)
     market_bars = list(market_bars or [])
@@ -205,9 +206,10 @@ def build_multiscale_feature_vector(
     own_rets = _daily_returns(bars)
     mkt_rets = _daily_returns(market_bars) if market_bars else []
     sec_rets = _daily_returns(sector_bars) if sector_bars else []
+    resolved_shape_horizons = tuple(sorted({int(h) for h in (shape_horizons or DEFAULT_SHAPE_HORIZONS) if int(h) > 0})) or DEFAULT_SHAPE_HORIZONS
 
     shape: Dict[str, float] = {}
-    for horizon in SHAPE_HORIZONS:
+    for horizon in resolved_shape_horizons:
         shape[f"ret_{horizon}"] = _window_returns(bars, horizon)
     shape["realized_vol_20"] = _realized_vol(own_rets[-20:])
     shape["atr_pct_14"] = _atr_pct(bars, 14)
@@ -254,5 +256,6 @@ def build_multiscale_feature_vector(
             "embedding_dim": len(shape_vector) + len(ctx_vector),
             "shape_keys": shape_keys,
             "ctx_keys": ctx_keys,
+            "shape_horizons": list(resolved_shape_horizons),
         },
     )

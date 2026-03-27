@@ -32,6 +32,7 @@ def run_backtest(*args, **kwargs):
 
 def _build_request(args) -> RunnerRequest:
     spec_payload = json.loads(args.research_spec_json) if args.research_spec_json else {}
+    metadata_payload = json.loads(args.metadata_json) if args.metadata_json else {}
     if args.feature_window_bars is not None:
         spec_payload["feature_window_bars"] = args.feature_window_bars
     if args.lookback_horizons:
@@ -73,7 +74,22 @@ def _build_request(args) -> RunnerRequest:
     if optuna_payload and "experiment_id" not in optuna_payload:
         optuna_payload["experiment_id"] = args.scenario_id
     optuna_cfg = OptunaSearchConfig(**optuna_payload) if optuna_payload else None
-    return RunnerRequest(scenario=BacktestScenario(scenario_id=args.scenario_id, market=args.market, start_date=args.start_date, end_date=args.end_date, symbols=[s.strip() for s in args.symbols.split(",") if s.strip()]), config=BacktestConfig(initial_capital=args.initial_capital, research_spec=research_spec, optuna=optuna_cfg), output_path=args.output or None)
+    return RunnerRequest(
+        scenario=BacktestScenario(
+            scenario_id=args.scenario_id,
+            market=args.market,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            symbols=[s.strip() for s in args.symbols.split(",") if s.strip()],
+        ),
+        config=BacktestConfig(
+            initial_capital=args.initial_capital,
+            research_spec=research_spec,
+            optuna=optuna_cfg,
+            metadata=metadata_payload,
+        ),
+        output_path=args.output or None,
+    )
 
 
 def _raise_missing_legacy_snapshot(args) -> None:
@@ -109,6 +125,7 @@ def main() -> int:
     parser.add_argument("--results-db-url", default="")
     parser.add_argument("--no-json-artifact", action="store_true")
     parser.add_argument("--research-spec-json", default="")
+    parser.add_argument("--metadata-json", default="", help="JSON object for BacktestConfig.metadata (e.g. TOBE quote/portfolio overrides)")
     parser.add_argument("--feature-window-bars", type=int, default=None)
     parser.add_argument("--lookback-horizons", default="")
     parser.add_argument("--horizon-days", type=int, default=None)

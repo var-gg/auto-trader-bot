@@ -4,6 +4,8 @@ import argparse
 import csv
 import hashlib
 import json
+import subprocess
+import time
 import warnings
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
@@ -25,6 +27,49 @@ MANIFEST_TABLE = "meta.bt_scenario_snapshot_manifest"
 
 def stable_hash(payload: Any, length: int = 16) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")).hexdigest()[:length]
+
+
+def resolve_git_commit() -> str:
+    try:
+        proc = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+        return proc.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _stage_timer(label: str):
+    started = time.perf_counter()
+
+    def _done(extra: str = ""):
+        elapsed = time.perf_counter() - started
+        suffix = f" | {extra}" if extra else ""
+        print(f"[{label}] {elapsed:.3f}s{suffix}")
+
+    return _done
+
+
+def fold_report_summary(payload: dict | None) -> dict:
+    payload = payload or {}
+    folds = []
+    for fold in payload.get("folds") or []:
+        folds.append({
+            "fold_id": fold.get("fold_id"),
+            "split": fold.get("split"),
+            "train_metrics": fold.get("train_metrics"),
+            "test_metrics": fold.get("test_metrics"),
+            "leakage_ok": fold.get("leakage_ok"),
+            "rejection_reasons": fold.get("rejection_reasons"),
+            "calibration": fold.get("calibration"),
+            "artifact": fold.get("artifact"),
+        })
+    return {
+        "mode": payload.get("mode"),
+        "purge": payload.get("purge"),
+        "embargo": payload.get("embargo"),
+        "aggregate": payload.get("aggregate") or {},
+        "rejection_reasons": payload.get("rejection_reasons") or [],
+        "folds": folds,
+    }
 
 
 def preflight_local_db(symbols: list[str], *, allow_unknown_sector: bool = False) -> dict:
@@ -152,19 +197,21 @@ def build_spec() -> ResearchExperimentSpec:
     )
 
 
-def run_configs(*, include_legacy: bool = True) -> list[dict]:
+def run_configs(*, include_legacy: bool = True, smoke_fast: bool = False) -> list[dict]:
     configs = [
         {"label": "research_similarity_v2_base", "strategy_mode": "research_similarity_v2", "metadata": {"portfolio_top_n": "3", "portfolio_risk_budget_fraction": "0.60", "quote_ev_threshold": "0.005", "quote_uncertainty_cap": "0.12", "quote_min_fill_probability": "0.10", "abstain_margin": "0.00"}},
         {"label": "research_similarity_v2_conservative", "strategy_mode": "research_similarity_v2", "metadata": {"portfolio_top_n": "2", "portfolio_risk_budget_fraction": "0.45", "quote_ev_threshold": "0.007", "quote_uncertainty_cap": "0.08", "quote_min_fill_probability": "0.15", "abstain_margin": "0.03"}},
         {"label": "research_similarity_v2_aggressive", "strategy_mode": "research_similarity_v2", "metadata": {"portfolio_top_n": "4", "portfolio_risk_budget_fraction": "0.75", "quote_ev_threshold": "0.003", "quote_uncertainty_cap": "0.14", "quote_min_fill_probability": "0.05", "abstain_margin": "0.00"}},
     ]
+    if smoke_fast:
+        return [configs[0]]
     if include_legacy:
         return [{"label": "legacy_event_window", "strategy_mode": "legacy_event_window", "metadata": {"portfolio_top_n": "3", "portfolio_risk_budget_fraction": "0.60"}}, *configs]
     return configs
 
 
-def build_request(*, scenario_id: str, start_date: str, end_date: str, strategy_mode: str, spec: ResearchExperimentSpec, metadata: dict[str, str]) -> RunnerRequest:
-    scenario = BacktestScenario(scenario_id=scenario_id, market="US", start_date=start_date, end_date=end_date, symbols=UNIVERSE)
+def build_request(*, scenario_id: str, start_date: str, end_date: str, strategy_mode: str, spec: ResearchExperimentSpec, metadata: dict[str, str], symbols: list[str]) -> RunnerRequest:
+    scenario = BacktestScenario(scenario_id=scenario_id, market="US", start_date=start_date, end_date=end_date, symbols=symbols)
     config = BacktestConfig(initial_capital=10000.0, research_spec=spec, metadata=metadata)
     return RunnerRequest(scenario=scenario, config=config)
 
@@ -336,21 +383,49 @@ def main() -> int:
     parser.add_argument("--legacy-discovery-scenario-id", default="legacy_discovery")
     parser.add_argument("--legacy-holdout-scenario-id", default="legacy_holdout")
     parser.add_argument("--skip-legacy-reference", action="store_true")
+    parser.add_argument("--smoke-fast", action="store_true", help="PC-local survival smoke: base policy only, skip holdout, max 1 validation fold")
+    parser.add_argument("--smoke-universe-size", type=int, default=6, help="Universe size to use when --smoke-fast is enabled")
+    parser.add_argument("--smoke-lookback-days", type=int, default=45, help="Discovery lookback window in calendar days for --smoke-fast")
+    parser.add_argument("--validation-summary-only", action="store_true", help="Persist only compact fold summaries")
+    parser.add_argument("--diagnostics-lite", action="store_true", help="Persist compact diagnostics/signal summaries instead of full panels")
     args = parser.parse_args()
 
-    preflight = preflight_local_db(UNIVERSE, allow_unknown_sector=args.allow_unknown_sector)
+    if args.smoke_fast:
+        args.skip_holdout = True
+        args.skip_legacy_reference = True
+        args.validation_summary_only = True
+        args.diagnostics_lite = True
+
+    universe = UNIVERSE[: max(1, args.smoke_universe_size)] if args.smoke_fast else list(UNIVERSE)
+    preflight_timer = _stage_timer("preflight")
+    preflight = preflight_local_db(universe, allow_unknown_sector=args.allow_unknown_sector)
+    if args.smoke_fast:
+        latest_dt = datetime.fromisoformat(preflight["latest_date"]).date()
+        first_dt = datetime.fromisoformat(preflight["first_date"]).date()
+        smoke_start = max(first_dt, latest_dt - timedelta(days=max(7, args.smoke_lookback_days)))
+        preflight["discovery_start"] = smoke_start.isoformat()
+        preflight["discovery_end"] = latest_dt.isoformat()
+        preflight["holdout_start"] = latest_dt.isoformat()
+        preflight["holdout_end"] = latest_dt.isoformat()
+        preflight["window_mode"] = f"smoke_{args.smoke_lookback_days}d"
     legacy_ref = resolve_legacy_scenarios(preflight=preflight, discovery_scenario_id=args.legacy_discovery_scenario_id, holdout_scenario_id=args.legacy_holdout_scenario_id, skip_legacy_reference=args.skip_legacy_reference)
+    preflight_timer(f"symbols={len(universe)} skip_holdout={args.skip_holdout} discovery={preflight['discovery_start']}..{preflight['discovery_end']}")
     spec = build_spec()
+    git_commit = resolve_git_commit()
     today_tag = date.today().strftime("%Y%m%d")
-    experiment_group = args.experiment_group or f"first_batch_{today_tag}_{preflight['window_mode']}"
-    universe_hash = stable_hash(UNIVERSE)
+    default_group = f"first_batch_{today_tag}_{preflight['window_mode']}"
+    if args.smoke_fast:
+        default_group = f"smoke_fast_{today_tag}_{preflight['window_mode']}"
+    experiment_group = args.experiment_group or default_group
+    universe_hash = stable_hash(universe)
     spec_hash = spec.spec_hash()
     root = Path(args.output_root) / experiment_group
     root.mkdir(parents=True, exist_ok=True)
-    (root / "preflight.json").write_text(json.dumps(preflight, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    (root / "preflight.json").write_text(json.dumps({**preflight, "smoke_fast": args.smoke_fast, "smoke_universe_size": len(universe), "validation_summary_only": args.validation_summary_only, "diagnostics_lite": args.diagnostics_lite}, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     leaderboard_path = root / "leaderboard.csv"
 
-    for cfg in run_configs(include_legacy=not args.skip_legacy_reference):
+    discovery_reuse_payload = None
+    for cfg in run_configs(include_legacy=not args.skip_legacy_reference, smoke_fast=args.smoke_fast):
         run_key = {
             "experiment_group": experiment_group,
             "label": cfg["label"],
@@ -360,6 +435,7 @@ def main() -> int:
             "window": [preflight["discovery_start"], preflight["discovery_end"], preflight["holdout_start"], preflight["holdout_end"]],
             "metadata": cfg["metadata"],
             "legacy_reference": legacy_ref,
+            "smoke_fast": args.smoke_fast,
         }
         run_id = f"{cfg['label']}_{stable_hash(run_key, 12)}"
         run_dir = root / run_id
@@ -368,21 +444,36 @@ def main() -> int:
         discovery_scenario_id = legacy_ref["discovery"]["scenario_id"] if cfg["strategy_mode"] == "legacy_event_window" and legacy_ref["discovery"] else f"{run_id}_discovery"
         holdout_scenario_id = legacy_ref["holdout"]["scenario_id"] if cfg["strategy_mode"] == "legacy_event_window" and legacy_ref["holdout"] else f"{run_id}_holdout"
 
-        discovery_request = build_request(scenario_id=discovery_scenario_id, start_date=preflight["discovery_start"], end_date=preflight["discovery_end"], strategy_mode=cfg["strategy_mode"], spec=spec, metadata=cfg["metadata"])
-        discovery_result = run_backtest(request=discovery_request, data_path=None, data_source="local-db", scenario_id=discovery_request.scenario.scenario_id, strategy_mode=cfg["strategy_mode"], output_dir=str(run_dir), enable_validation=(cfg["strategy_mode"] == "research_similarity_v2"))
+        metadata = dict(cfg["metadata"])
+        metadata.update({
+            "validation_summary_only": str(args.validation_summary_only).lower(),
+            "diagnostics_lite": str(args.diagnostics_lite).lower(),
+        })
+        discovery_request = build_request(scenario_id=discovery_scenario_id, start_date=preflight["discovery_start"], end_date=preflight["discovery_end"], strategy_mode=cfg["strategy_mode"], spec=spec, metadata=metadata, symbols=universe)
+        discovery_result = run_backtest(request=discovery_request, data_path=None, data_source="local-db", scenario_id=discovery_request.scenario.scenario_id, strategy_mode=cfg["strategy_mode"], output_dir=str(run_dir), enable_validation=(cfg["strategy_mode"] == "research_similarity_v2"), validation_max_folds=1 if args.smoke_fast else None, validation_summary_only=args.validation_summary_only, diagnostics_lite=args.diagnostics_lite, candidate_reuse_payload=discovery_reuse_payload if cfg["label"] in {"research_similarity_v2_conservative", "research_similarity_v2_aggressive"} else None, emit_timing_logs=True)
+        if cfg["label"] == "research_similarity_v2_base":
+            discovery_reuse_payload = (discovery_result.get("artifacts") or {}).get("candidate_reuse")
 
         holdout_result = {}
         if not args.skip_holdout:
-            holdout_request = build_request(scenario_id=holdout_scenario_id, start_date=preflight["holdout_start"], end_date=preflight["holdout_end"], strategy_mode=cfg["strategy_mode"], spec=spec, metadata=cfg["metadata"])
-            holdout_result = run_backtest(request=holdout_request, data_path=None, data_source="local-db", scenario_id=holdout_request.scenario.scenario_id, strategy_mode=cfg["strategy_mode"], output_dir=str(run_dir), enable_validation=(cfg["strategy_mode"] == "research_similarity_v2"))
+            holdout_request = build_request(scenario_id=holdout_scenario_id, start_date=preflight["holdout_start"], end_date=preflight["holdout_end"], strategy_mode=cfg["strategy_mode"], spec=spec, metadata=metadata, symbols=universe)
+            holdout_result = run_backtest(request=holdout_request, data_path=None, data_source="local-db", scenario_id=holdout_request.scenario.scenario_id, strategy_mode=cfg["strategy_mode"], output_dir=str(run_dir), enable_validation=(cfg["strategy_mode"] == "research_similarity_v2"), validation_max_folds=1 if args.smoke_fast else None, validation_summary_only=args.validation_summary_only, diagnostics_lite=args.diagnostics_lite, emit_timing_logs=True)
 
+        diagnostic_flags = {k: v for k, v in metadata.items() if k.startswith("diagnostic_") or k in {"validation_summary_only", "diagnostics_lite"}}
         manifest = {
             "experiment_group": experiment_group,
             "run_id": run_id,
             "label": cfg["label"],
             "strategy_mode": cfg["strategy_mode"],
-            "universe": UNIVERSE,
+            "git_commit": git_commit,
+            "universe": universe,
             "universe_hash": universe_hash,
+            "window": {
+                "discovery_start": preflight["discovery_start"],
+                "discovery_end": preflight["discovery_end"],
+                "holdout_start": preflight["holdout_start"],
+                "holdout_end": preflight["holdout_end"],
+            },
             "spec": asdict(spec),
             "spec_hash": spec_hash,
             "data_snapshot_id": (discovery_result.get("manifest") or {}).get("data_snapshot_id"),
@@ -391,16 +482,23 @@ def main() -> int:
             "discovery_manifest": discovery_result.get("manifest"),
             "holdout_manifest": holdout_result.get("manifest"),
             "preflight": preflight,
-            "metadata_overrides": cfg["metadata"],
+            "metadata_overrides": metadata,
+            "metadata_json": json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            "diagnostic_flags": diagnostic_flags,
+            "snapshot_ids": {
+                "discovery_data_snapshot_id": ((discovery_result.get("manifest") or {}).get("data_snapshot_id")),
+                "holdout_data_snapshot_id": ((holdout_result.get("manifest") or {}).get("data_snapshot_id")),
+                "discovery_validation_snapshot_ids": [sid for fold in (((discovery_result.get("validation") or {}).get("fold_engine") or {}).get("folds") or []) for sid in (((fold or {}).get("artifact") or {}).get("snapshot_ids") or [])],
+                "holdout_validation_snapshot_ids": [sid for fold in (((holdout_result.get("validation") or {}).get("fold_engine") or {}).get("folds") or []) for sid in (((fold or {}).get("artifact") or {}).get("snapshot_ids") or [])],
+            },
         }
         (run_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
-        fold_engine = (discovery_result.get("validation") or {}).get("fold_engine") or {}
         fold_report = {
             "run_id": run_id,
             "strategy_mode": cfg["strategy_mode"],
-            "discovery": fold_engine,
-            "holdout": (holdout_result.get("validation") or {}).get("fold_engine") or {},
+            "discovery": fold_report_summary((discovery_result.get("validation") or {}).get("fold_engine") or {}),
+            "holdout": fold_report_summary((holdout_result.get("validation") or {}).get("fold_engine") or {}),
         }
         (run_dir / "fold_report.json").write_text(json.dumps(fold_report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
@@ -418,15 +516,16 @@ def main() -> int:
         diagnostics = {
             "discovery": discovery_result.get("diagnostics"),
             "holdout": holdout_result.get("diagnostics"),
-            "validation": discovery_result.get("validation"),
-            "holdout_validation": holdout_result.get("validation"),
+            "validation": fold_report["discovery"],
+            "holdout_validation": fold_report["holdout"],
+            "diagnostics_lite": args.diagnostics_lite,
         }
         (run_dir / "diagnostics.json").write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
-        aggregate = fold_engine.get("aggregate") or {}
+        aggregate = ((discovery_result.get("validation") or {}).get("fold_engine") or {}).get("aggregate") or {}
         holdout_aggregate = ((holdout_result.get("validation") or {}).get("fold_engine") or {}).get("aggregate") or {}
-        discovery_direct = direct_metrics(discovery_result, len(UNIVERSE))
-        holdout_direct = direct_metrics(holdout_result, len(UNIVERSE)) if holdout_result else {}
+        discovery_direct = direct_metrics(discovery_result, len(universe))
+        holdout_direct = direct_metrics(holdout_result, len(universe)) if holdout_result else {}
         side_split = summarize_side_split(holdout_result.get("plans") or discovery_result.get("plans") or [])
         regime_split = summarize_regime_split(((holdout_result.get("portfolio") or {}).get("decisions") or (discovery_result.get("portfolio") or {}).get("decisions") or []))
         run_card = {
@@ -436,7 +535,7 @@ def main() -> int:
             "discovery_end": preflight["discovery_end"],
             "holdout_start": preflight["holdout_start"],
             "holdout_end": preflight["holdout_end"],
-            "symbols": "|".join(UNIVERSE),
+            "symbols": "|".join(universe),
             "feature_window_bars": spec.feature_window_bars,
             "lookback_horizons": "|".join(map(str, spec.lookback_horizons)),
             "horizon_days": spec.horizon_days,
@@ -448,8 +547,8 @@ def main() -> int:
             "discovery_cv_expectancy_after_cost": aggregate.get("expectancy_after_cost", discovery_direct.get("expectancy_after_cost", 0.0)),
             "discovery_cv_psr": aggregate.get("psr", discovery_direct.get("psr", 0.0)),
             "discovery_cv_dsr": aggregate.get("dsr", discovery_direct.get("dsr", 0.0)),
-            "discovery_cv_calibration_error": aggregate.get("calibration_error") if fold_engine.get("folds") else None,
-            "discovery_cv_monotonicity": aggregate.get("score_decile_monotonicity") if fold_engine.get("folds") else None,
+            "discovery_cv_calibration_error": aggregate.get("calibration_error") if (discovery_result.get("validation") or {}).get("fold_engine", {}).get("folds") else None,
+            "discovery_cv_monotonicity": aggregate.get("score_decile_monotonicity") if (discovery_result.get("validation") or {}).get("fold_engine", {}).get("folds") else None,
             "discovery_cv_max_drawdown": discovery_direct.get("max_drawdown", 0.0),
             "holdout_direct_trade_count": holdout_direct.get("trade_count", 0),
             "holdout_direct_fill_count": holdout_direct.get("fill_count", 0),

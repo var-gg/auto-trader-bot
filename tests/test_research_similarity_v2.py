@@ -2,6 +2,7 @@ from datetime import datetime
 
 import types
 
+from backtest_app.configs.models import ResearchExperimentSpec
 from backtest_app.historical_data.models import HistoricalBar, HistoricalSlice
 from backtest_app.research.pipeline import DECISION_CONVENTION, generate_similarity_candidates_rolling
 from backtest_app.runner import cli
@@ -70,6 +71,52 @@ def test_generate_similarity_candidates_rolling_uses_next_open_as_current_price(
         idx = next(i for i, b in enumerate(bars) if str(b.timestamp)[:10] == decision_date)
         assert c.current_price == bars[idx + 1].open
         assert execution_date == str(bars[idx + 1].timestamp)[:10]
+
+
+def test_generate_similarity_candidates_rolling_surfaces_debug_funnel_and_spec_horizons():
+    bars_by_symbol = {"AAPL": _bars("AAPL"), "MSFT": _bars("MSFT")}
+    macro_history = {f"2026-01-{i:02d}": {"growth": 0.0} for i in range(1, 15)}
+    spec = ResearchExperimentSpec(feature_window_bars=20, horizon_days=3, lookback_horizons=[2, 4, 8])
+    _, diagnostics = generate_similarity_candidates_rolling(
+        bars_by_symbol=bars_by_symbol,
+        market="US",
+        macro_history_by_date=macro_history,
+        spec=spec,
+        abstain_margin=0.25,
+        metadata={"quote_min_effective_sample_size": "1.7", "quote_uncertainty_cap": "0.11", "quote_max_return_interval_width": "0.09", "quote_min_regime_alignment": "0.4", "quote_ev_threshold": "0.006"},
+    )
+    assert diagnostics["pipeline"]["ev_config"]["min_effective_sample_size"] == 1.7
+    assert diagnostics["pipeline"]["ev_config"]["max_uncertainty"] == 0.11
+    assert diagnostics["pipeline"]["ev_config"]["max_return_interval_width"] == 0.09
+    assert diagnostics["pipeline"]["ev_config"]["min_regime_alignment"] == 0.4
+    assert diagnostics["pipeline"]["ev_config"]["min_expected_utility"] == 0.006
+    row = diagnostics["signal_panel"][0]
+    assert row["query"]["shape_horizons"] == [2, 4, 8]
+    assert "query_panel_count" in row["query"]
+    assert "prototype_pool_size" in row["decision_surface"]
+    assert "chosen_effective_sample_size" in row["decision_surface"]
+    assert "chosen_uncertainty" in row["decision_surface"]
+    assert "buy" in row["scorer_diagnostics"]
+    assert "sell" in row["scorer_diagnostics"]
+    assert "fallback_raw_ev" in row["scorer_diagnostics"]["buy"]
+    assert "top_matches_summary" in row["scorer_diagnostics"]["buy"]
+    assert isinstance(diagnostics["artifacts"]["excluded_reasons_histogram"], dict)
+
+
+def test_generate_similarity_candidates_rolling_supports_diagnostic_lower_bound_ablation():
+    bars_by_symbol = {"AAPL": _bars("AAPL"), "MSFT": _bars("MSFT")}
+    macro_history = {f"2026-01-{i:02d}": {"growth": 0.0} for i in range(1, 15)}
+    _, diagnostics = generate_similarity_candidates_rolling(
+        bars_by_symbol=bars_by_symbol,
+        market="US",
+        macro_history_by_date=macro_history,
+        abstain_margin=0.0,
+        metadata={"diagnostic_disable_lower_bound_gate": "true"},
+    )
+    row = diagnostics["signal_panel"][0]
+    assert diagnostics["pipeline"]["ev_config"]["diagnostic_disable_lower_bound_gate"] is True
+    assert row["decision_surface"]["gate_ablation"]["diagnostic_disable_lower_bound_gate"] is True
+    assert row["decision_surface"]["decision_rule"]["diagnostic_disable_lower_bound_gate"] is True
 
 
 class FakeRollingLoader:

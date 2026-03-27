@@ -58,3 +58,19 @@ def test_decision_surface_keeps_nonzero_flat_probability():
     protos = build_state_prototypes_from_event_memory(event_records=[flat_heavy], as_of_date="2026-01-10", memory_version="memory_asof_v1", spec_hash="spec-1")
     surface = build_decision_surface(query_embedding=[1.0, 0.0], prototype_pool=protos, regime_code="RISK_ON", sector_code="TECH", ev_config=EVConfig(max_uncertainty=0.2), candidate_index=ExactCosineCandidateIndex())
     assert surface.buy.p_flat > 0.0
+
+
+def test_decision_surface_uses_abstain_margin_in_decision_rule():
+    buy_slightly_better = _event(
+        "AAPL",
+        "2026-01-01",
+        "2026-01-05",
+        [1.0, 0.0],
+        buy_counts={"target_first_count": 2, "stop_first_count": 1, "flat_count": 1, "ambiguous_count": 0, "no_trade_count": 0, "horizon_up_count": 2, "horizon_down_count": 1, "after_cost_return_pct": 0.03, "mae_pct": -0.01, "mfe_pct": 0.02},
+        sell_counts={"target_first_count": 1, "stop_first_count": 2, "flat_count": 1, "ambiguous_count": 0, "no_trade_count": 0, "horizon_up_count": 1, "horizon_down_count": 2, "after_cost_return_pct": 0.025, "mae_pct": -0.01, "mfe_pct": 0.02},
+    )
+    protos = build_state_prototypes_from_event_memory(event_records=[buy_slightly_better], as_of_date="2026-01-10", memory_version="memory_asof_v1", spec_hash="spec-1")
+    surface = build_decision_surface(query_embedding=[1.0, 0.0], prototype_pool=protos, regime_code="RISK_ON", sector_code="TECH", ev_config=EVConfig(max_uncertainty=0.2, min_effective_sample_size=1.0, abstain_margin=0.05), candidate_index=ExactCosineCandidateIndex())
+    assert surface.abstain is True
+    assert "decision_margin_too_small" in surface.abstain_reasons
+    assert surface.diagnostics["decision_rule"]["abstain_margin"] == 0.05

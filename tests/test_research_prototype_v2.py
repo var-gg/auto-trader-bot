@@ -1,3 +1,5 @@
+import pytest
+
 from backtest_app.research.artifacts import JsonResearchArtifactStore
 from backtest_app.research.models import EventOutcomeRecord, ResearchAnchor
 from backtest_app.research.prototype import PrototypeConfig, build_anchor_prototypes, build_prototype_snapshot_from_event_memory, build_state_prototypes_from_event_memory
@@ -58,3 +60,40 @@ def test_build_prototype_snapshot_from_event_memory_is_deterministic_and_keeps_l
     loaded = load_prototypes_asof(artifact_store=store, run_id="r1", as_of_date="2026-01-10", memory_version="memory_asof_v1")
     assert loaded
     assert loaded[0].prototype_id == snap1["prototypes"][0]["prototype_id"]
+
+
+@pytest.mark.parametrize(
+    ("label", "after_cost_return_pct", "flags", "expected_counts", "expected_probs"),
+    [
+        ("UP_FIRST", 0.03, {}, {"target_first_count": 1, "stop_first_count": 0, "flat_count": 0, "ambiguous_count": 0, "no_trade_count": 0, "horizon_up_count": 0, "horizon_down_count": 0}, {"p_target_first": 1.0, "p_stop_first": 0.0, "p_flat": 0.0, "p_ambiguous": 0.0, "p_no_trade": 0.0}),
+        ("DOWN_FIRST", -0.03, {}, {"target_first_count": 0, "stop_first_count": 1, "flat_count": 0, "ambiguous_count": 0, "no_trade_count": 0, "horizon_up_count": 0, "horizon_down_count": 0}, {"p_target_first": 0.0, "p_stop_first": 1.0, "p_flat": 0.0, "p_ambiguous": 0.0, "p_no_trade": 0.0}),
+        ("FLAT", 0.0, {"flat": True}, {"target_first_count": 0, "stop_first_count": 0, "flat_count": 1, "ambiguous_count": 0, "no_trade_count": 0, "horizon_up_count": 0, "horizon_down_count": 0}, {"p_target_first": 0.0, "p_stop_first": 0.0, "p_flat": 1.0, "p_ambiguous": 0.0, "p_no_trade": 0.0}),
+        ("AMBIGUOUS", 0.0, {"ambiguous": True}, {"target_first_count": 0, "stop_first_count": 0, "flat_count": 0, "ambiguous_count": 1, "no_trade_count": 0, "horizon_up_count": 0, "horizon_down_count": 0}, {"p_target_first": 0.0, "p_stop_first": 0.0, "p_flat": 0.0, "p_ambiguous": 1.0, "p_no_trade": 0.0}),
+        ("NO_TRADE", 0.0, {"no_trade": True}, {"target_first_count": 0, "stop_first_count": 0, "flat_count": 0, "ambiguous_count": 0, "no_trade_count": 1, "horizon_up_count": 0, "horizon_down_count": 0}, {"p_target_first": 0.0, "p_stop_first": 0.0, "p_flat": 0.0, "p_ambiguous": 0.0, "p_no_trade": 1.0}),
+        ("HORIZON_UP", 0.02, {}, {"target_first_count": 0, "stop_first_count": 0, "flat_count": 0, "ambiguous_count": 0, "no_trade_count": 0, "horizon_up_count": 1, "horizon_down_count": 0}, {"p_target_first": 0.0, "p_stop_first": 0.0, "p_flat": 0.0, "p_ambiguous": 0.0, "p_no_trade": 0.0}),
+        ("HORIZON_DOWN", -0.02, {}, {"target_first_count": 0, "stop_first_count": 0, "flat_count": 0, "ambiguous_count": 0, "no_trade_count": 0, "horizon_up_count": 0, "horizon_down_count": 1}, {"p_target_first": 0.0, "p_stop_first": 0.0, "p_flat": 0.0, "p_ambiguous": 0.0, "p_no_trade": 0.0}),
+    ],
+)
+def test_build_state_prototypes_reconstructs_side_counts_from_labels(label, after_cost_return_pct, flags, expected_counts, expected_probs):
+    side_payload = {
+        "first_touch_label": label,
+        "after_cost_return_pct": after_cost_return_pct,
+        "mae_pct": -0.01,
+        "mfe_pct": 0.02,
+        **flags,
+    }
+    event = EventOutcomeRecord(
+        symbol="AAPL",
+        event_date="2026-01-01",
+        outcome_end_date="2026-01-05",
+        schema_version="event_outcome_v1",
+        path_summary={"regime_code": "RISK_ON", "sector_code": "TECH", "liquidity_bucket": "HIGH", "embedding": [1.0, 0.0]},
+        side_outcomes={"BUY": side_payload, "SELL": dict(side_payload)},
+        diagnostics={"regime_code": "RISK_ON", "sector_code": "TECH", "embedding": [1.0, 0.0], "quality_score": 0.9, "liquidity_score": 0.9},
+    )
+    proto = build_state_prototypes_from_event_memory(event_records=[event], as_of_date="2026-01-10", memory_version="memory_asof_v1", spec_hash="spec-1")[0]
+    stats = proto.side_stats["BUY"]
+    for key, expected in expected_counts.items():
+        assert stats[key] == expected
+    for key, expected in expected_probs.items():
+        assert stats[key] == expected

@@ -70,13 +70,19 @@ def _state_side_stats(members: list[dict], cfg: PrototypeConfig, *, as_of_date: 
     dates = [_parse_date(m.get("event_date")) for m in members if _parse_date(m.get("event_date")) is not None]
     support_count = len(members)
     dispersion = pstdev(returns) if len(returns) > 1 else 0.0
-    target_first_count = sum(int(m.get("target_first_count", 0) or 0) for m in members)
-    stop_first_count = sum(int(m.get("stop_first_count", 0) or 0) for m in members)
-    flat_count = sum(int(m.get("flat_count", 0) or 0) for m in members)
-    ambiguous_count = sum(int(m.get("ambiguous_count", 0) or 0) for m in members)
-    no_trade_count = sum(int(m.get("no_trade_count", 0) or 0) for m in members)
-    horizon_up_count = sum(int(m.get("horizon_up_count", 0) or 0) for m in members)
-    horizon_down_count = sum(int(m.get("horizon_down_count", 0) or 0) for m in members)
+
+    def _count(member: dict, key: str, fallback: int) -> int:
+        if key in member:
+            return int(member.get(key, 0) or 0)
+        return fallback
+
+    target_first_count = sum(_count(m, "target_first_count", 1 if str(m.get("first_touch_label") or "").upper() == "UP_FIRST" else 0) for m in members)
+    stop_first_count = sum(_count(m, "stop_first_count", 1 if str(m.get("first_touch_label") or "").upper() == "DOWN_FIRST" else 0) for m in members)
+    flat_count = sum(_count(m, "flat_count", 1 if bool(m.get("flat")) or str(m.get("first_touch_label") or "").upper() == "FLAT" else 0) for m in members)
+    ambiguous_count = sum(_count(m, "ambiguous_count", 1 if bool(m.get("ambiguous")) or str(m.get("first_touch_label") or "").upper() == "AMBIGUOUS" else 0) for m in members)
+    no_trade_count = sum(_count(m, "no_trade_count", 1 if bool(m.get("no_trade")) or str(m.get("first_touch_label") or "").upper() == "NO_TRADE" else 0) for m in members)
+    horizon_up_count = sum(_count(m, "horizon_up_count", 1 if str(m.get("first_touch_label") or "").upper() == "HORIZON_UP" else 0) for m in members)
+    horizon_down_count = sum(_count(m, "horizon_down_count", 1 if str(m.get("first_touch_label") or "").upper() == "HORIZON_DOWN" else 0) for m in members)
     total_outcomes = max(target_first_count + stop_first_count + flat_count + ambiguous_count + no_trade_count, support_count, 1)
     return {
         "support_count": support_count,

@@ -35,6 +35,8 @@ class EVConfig:
     min_regime_alignment: float = 0.5
     use_kernel_weighting: bool = True
     max_return_interval_width: float = 0.08
+    abstain_margin: float = 0.05
+    diagnostic_disable_lower_bound_gate: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,6 +257,8 @@ def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iter
     buy = estimate_distribution(side="BUY", query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
     sell = estimate_distribution(side="SELL", query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
     reasons = []
+    buy_edge = float(buy.expected_net_return - sell.expected_net_return)
+    sell_edge = float(sell.expected_net_return - buy.expected_net_return)
     better = "BUY" if buy.expected_net_return >= sell.expected_net_return else "SELL"
     chosen = buy if better == "BUY" else sell
     interval_width = chosen.q90_return - chosen.q10_return
@@ -266,8 +270,10 @@ def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iter
         reasons.append("wide_interval")
     if chosen.regime_alignment < cfg.min_regime_alignment:
         reasons.append("regime_mismatch")
-    if chosen.lower_bound_return <= 0.0:
+    if chosen.lower_bound_return <= 0.0 and not cfg.diagnostic_disable_lower_bound_gate:
         reasons.append("lower_bound_non_positive")
+    if max(buy_edge, sell_edge) < cfg.abstain_margin:
+        reasons.append("decision_margin_too_small")
     if float(chosen.utility.get("p_ambiguous", 0.0)) >= 0.30:
         reasons.append("high_ambiguous_share")
     if float(chosen.utility.get("p_no_trade", 0.0)) >= 0.30:
@@ -276,7 +282,7 @@ def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iter
     why = "BUY" if better == "BUY" else "SELL"
     if abstain:
         why = "ABSTAIN"
-    return DecisionSurface(buy=buy, sell=sell, chosen_side="ABSTAIN" if abstain else better, abstain=abstain, abstain_reasons=reasons, diagnostics={"prototype_pool_size": len(list(prototype_pool)) if not isinstance(prototype_pool, list) else len(prototype_pool), "shared_neighbor_pool": True, "buy_summary": buy.utility, "sell_summary": sell.utility, "decision_rule": {"winner": better, "chosen_lower_bound": chosen.lower_bound_return, "chosen_interval_width": interval_width, "why": why, "why_summary": f"{why}: p_target={chosen.utility.get('p_target_first', 0.0):.2f}, p_stop={chosen.utility.get('p_stop_first', 0.0):.2f}, p_flat={chosen.utility.get('p_flat', 0.0):.2f}, p_ambiguous={chosen.utility.get('p_ambiguous', 0.0):.2f}, p_no_trade={chosen.utility.get('p_no_trade', 0.0):.2f}"}})
+    return DecisionSurface(buy=buy, sell=sell, chosen_side="ABSTAIN" if abstain else better, abstain=abstain, abstain_reasons=reasons, diagnostics={"prototype_pool_size": len(list(prototype_pool)) if not isinstance(prototype_pool, list) else len(prototype_pool), "shared_neighbor_pool": True, "buy_summary": buy.utility, "sell_summary": sell.utility, "gate_ablation": {"diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate}, "decision_rule": {"winner": better, "abstain_margin": cfg.abstain_margin, "buy_sell_ev_gap": buy_edge, "sell_buy_ev_gap": sell_edge, "chosen_lower_bound": chosen.lower_bound_return, "chosen_interval_width": interval_width, "chosen_effective_sample_size": chosen.effective_sample_size, "chosen_uncertainty": chosen.uncertainty, "diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate, "why": why, "why_summary": f"{why}: p_target={chosen.utility.get('p_target_first', 0.0):.2f}, p_stop={chosen.utility.get('p_stop_first', 0.0):.2f}, p_flat={chosen.utility.get('p_flat', 0.0):.2f}, p_ambiguous={chosen.utility.get('p_ambiguous', 0.0):.2f}, p_no_trade={chosen.utility.get('p_no_trade', 0.0):.2f}"}})
 
 
 def estimate_expected_value(*, side: str, query_embedding: list[float], candidates: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> EVEstimate:
