@@ -38,6 +38,8 @@ node_modules/
 runtime.json
 _logs_*.json
 ops/
+runs/
+*.log
 
 # Local/editor/workbench files
 .vscode/

@@ -37,6 +37,9 @@ class EVConfig:
     max_return_interval_width: float = 0.08
     abstain_margin: float = 0.05
     diagnostic_disable_lower_bound_gate: bool = False
+    diagnostic_disable_ess_gate: bool = False
+    diagnostic_lower_bound_formula: str = "lb_v1"
+    diagnostic_feasible_side_chooser: bool = False
 
 
 @dataclass(frozen=True)
@@ -193,6 +196,16 @@ def _weighted_quantile(values: list[float], weights: np.ndarray, q: float) -> fl
     return float(vals[np.searchsorted(cdf, q, side="left")])
 
 
+def _resolve_lower_bound(*, formula: str, q10: float, q25: float, q50: float, q90: float, expected_net_return: float, uncertainty: float) -> float:
+    interval_width = float(q90 - q10)
+    key = str(formula or "lb_v1").strip().lower()
+    if key == "lb_v3":
+        return float(q25 - 0.5 * uncertainty)
+    if key == "lb_v4":
+        return float(expected_net_return - 0.5 * interval_width)
+    return float(q10 - uncertainty)
+
+
 def estimate_distribution(*, side: str, query_embedding: list[float], candidates: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> DistributionEstimate:
     cfg = ev_config or EVConfig()
     calibration = calibration or CalibrationModel(method="identity")
@@ -243,11 +256,12 @@ def estimate_distribution(*, side: str, query_embedding: list[float], candidates
     n_eff = float(1.0 / np.sum(weights ** 2))
     values = [float(r["ret"]) for r in rows]
     q10 = _weighted_quantile(values, weights, 0.10)
+    q25 = _weighted_quantile(values, weights, 0.25)
     q50 = _weighted_quantile(values, weights, 0.50)
     q90 = _weighted_quantile(values, weights, 0.90)
-    lower_bound = q10 - uncertainty
+    lower_bound = _resolve_lower_bound(formula=cfg.diagnostic_lower_bound_formula, q10=q10, q25=q25, q50=q50, q90=q90, expected_net_return=exp_ret, uncertainty=uncertainty)
     upper_bound = q90 + uncertainty
-    utility = {"expected_net_return": exp_ret, "p_target_first": p_target, "p_stop_first": p_stop, "p_flat": p_flat, "p_ambiguous": p_ambiguous, "p_no_trade": p_no_trade, "mae_penalty": 0.5 * exp_mae, "mfe_credit": 0.25 * exp_mfe, "ambiguous_penalty": 0.5 * p_ambiguous, "no_trade_penalty": 0.75 * p_no_trade, "uncertainty_penalty": uncertainty, "fallback_raw_ev": exp_ret - 0.5 * exp_mae + 0.25 * exp_mfe - 0.5 * p_ambiguous - 0.75 * p_no_trade - uncertainty}
+    utility = {"expected_net_return": exp_ret, "p_target_first": p_target, "p_stop_first": p_stop, "p_flat": p_flat, "p_ambiguous": p_ambiguous, "p_no_trade": p_no_trade, "mae_penalty": 0.5 * exp_mae, "mfe_credit": 0.25 * exp_mfe, "ambiguous_penalty": 0.5 * p_ambiguous, "no_trade_penalty": 0.75 * p_no_trade, "uncertainty_penalty": uncertainty, "fallback_raw_ev": exp_ret - 0.5 * exp_mae + 0.25 * exp_mfe - 0.5 * p_ambiguous - 0.75 * p_no_trade - uncertainty, "q25_return": q25, "interval_width": float(q90 - q10), "lower_bound_formula": cfg.diagnostic_lower_bound_formula}
     top_matches = [{"prototype_id": r["candidate"].prototype_id, "weight": r["weight"], "why": {"similarity": r["similarity"], "support": float(r["side_stats"].get("support_count", 0.0)), "freshness_days": float(r["side_stats"].get("freshness_days", 0.0)), "target_first_count": r["side_stats"].get("target_first_count", 0), "stop_first_count": r["side_stats"].get("stop_first_count", 0), "flat_count": r["side_stats"].get("flat_count", 0), "ambiguous_count": r["side_stats"].get("ambiguous_count", 0), "no_trade_count": r["side_stats"].get("no_trade_count", 0)}, "representative_symbol": r["candidate"].representative_symbol, "expected_return": r["side_stats"].get("mean_return_pct"), "uncertainty": r["side_stats"].get("uncertainty")} for r in rows]
     return DistributionEstimate(side=side, p_target_first=calibration.calibrate_prob(p_target), p_stop_first=calibration.calibrate_prob(p_stop), p_flat=max(0.0, min(1.0, p_flat)), expected_net_return=calibration.calibrate_ev(exp_ret), expected_mae=exp_mae, expected_mfe=exp_mfe, q10_return=q10, q50_return=q50, q90_return=q90, effective_sample_size=n_eff, regime_alignment=regime_alignment, uncertainty=uncertainty, lower_bound_return=lower_bound, upper_bound_return=upper_bound, utility=utility, top_matches=top_matches)
 
@@ -256,33 +270,62 @@ def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iter
     cfg = ev_config or EVConfig()
     buy = estimate_distribution(side="BUY", query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
     sell = estimate_distribution(side="SELL", query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
-    reasons = []
+
+    def _side_reasons(dist: DistributionEstimate) -> tuple[list[str], float]:
+        side_reasons = []
+        side_interval_width = dist.q90_return - dist.q10_return
+        if dist.effective_sample_size < cfg.min_effective_sample_size:
+            side_reasons.append("low_ess")
+        if dist.uncertainty > cfg.max_uncertainty:
+            side_reasons.append("high_uncertainty")
+        if side_interval_width > cfg.max_return_interval_width:
+            side_reasons.append("wide_interval")
+        if dist.regime_alignment < cfg.min_regime_alignment:
+            side_reasons.append("regime_mismatch")
+        if dist.lower_bound_return <= 0.0 and not cfg.diagnostic_disable_lower_bound_gate:
+            side_reasons.append("lower_bound_non_positive")
+        if float(dist.utility.get("fallback_raw_ev", 0.0)) < cfg.min_expected_utility:
+            side_reasons.append("low_ev")
+        if float(dist.utility.get("p_ambiguous", 0.0)) >= 0.30:
+            side_reasons.append("high_ambiguous_share")
+        if float(dist.utility.get("p_no_trade", 0.0)) >= 0.30:
+            side_reasons.append("high_no_trade_share")
+        return side_reasons, side_interval_width
+
+    buy_reasons, buy_interval_width = _side_reasons(buy)
+    sell_reasons, sell_interval_width = _side_reasons(sell)
+    buy_pass = not buy_reasons
+    sell_pass = not sell_reasons
     buy_edge = float(buy.expected_net_return - sell.expected_net_return)
     sell_edge = float(sell.expected_net_return - buy.expected_net_return)
-    better = "BUY" if buy.expected_net_return >= sell.expected_net_return else "SELL"
+
+    if cfg.diagnostic_feasible_side_chooser:
+        if buy_pass and sell_pass:
+            better = "BUY" if buy.expected_net_return >= sell.expected_net_return else "SELL"
+        elif buy_pass:
+            better = "BUY"
+        elif sell_pass:
+            better = "SELL"
+        else:
+            better = "ABSTAIN"
+    else:
+        better = "BUY" if buy.expected_net_return >= sell.expected_net_return else "SELL"
+
     chosen = buy if better == "BUY" else sell
-    interval_width = chosen.q90_return - chosen.q10_return
-    if chosen.effective_sample_size < cfg.min_effective_sample_size:
-        reasons.append("low_ess")
-    if chosen.uncertainty > cfg.max_uncertainty:
-        reasons.append("high_uncertainty")
-    if interval_width > cfg.max_return_interval_width:
-        reasons.append("wide_interval")
-    if chosen.regime_alignment < cfg.min_regime_alignment:
-        reasons.append("regime_mismatch")
-    if chosen.lower_bound_return <= 0.0 and not cfg.diagnostic_disable_lower_bound_gate:
-        reasons.append("lower_bound_non_positive")
-    if max(buy_edge, sell_edge) < cfg.abstain_margin:
-        reasons.append("decision_margin_too_small")
-    if float(chosen.utility.get("p_ambiguous", 0.0)) >= 0.30:
-        reasons.append("high_ambiguous_share")
-    if float(chosen.utility.get("p_no_trade", 0.0)) >= 0.30:
-        reasons.append("high_no_trade_share")
+    interval_width = chosen.q90_return - chosen.q10_return if better in {"BUY", "SELL"} else max(buy_interval_width, sell_interval_width)
+    reasons = []
+    if cfg.diagnostic_feasible_side_chooser:
+        if better == "ABSTAIN":
+            reasons.append("no_feasible_side")
+            reasons.extend(sorted(set(buy_reasons + sell_reasons)))
+    else:
+        reasons.extend(buy_reasons if better == "BUY" else sell_reasons)
+        if max(buy_edge, sell_edge) < cfg.abstain_margin:
+            reasons.append("decision_margin_too_small")
+
     abstain = bool(reasons)
-    why = "BUY" if better == "BUY" else "SELL"
-    if abstain:
-        why = "ABSTAIN"
-    return DecisionSurface(buy=buy, sell=sell, chosen_side="ABSTAIN" if abstain else better, abstain=abstain, abstain_reasons=reasons, diagnostics={"prototype_pool_size": len(list(prototype_pool)) if not isinstance(prototype_pool, list) else len(prototype_pool), "shared_neighbor_pool": True, "buy_summary": buy.utility, "sell_summary": sell.utility, "gate_ablation": {"diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate}, "decision_rule": {"winner": better, "abstain_margin": cfg.abstain_margin, "buy_sell_ev_gap": buy_edge, "sell_buy_ev_gap": sell_edge, "chosen_lower_bound": chosen.lower_bound_return, "chosen_interval_width": interval_width, "chosen_effective_sample_size": chosen.effective_sample_size, "chosen_uncertainty": chosen.uncertainty, "diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate, "why": why, "why_summary": f"{why}: p_target={chosen.utility.get('p_target_first', 0.0):.2f}, p_stop={chosen.utility.get('p_stop_first', 0.0):.2f}, p_flat={chosen.utility.get('p_flat', 0.0):.2f}, p_ambiguous={chosen.utility.get('p_ambiguous', 0.0):.2f}, p_no_trade={chosen.utility.get('p_no_trade', 0.0):.2f}"}})
+    why = better if not abstain else "ABSTAIN"
+    return DecisionSurface(buy=buy, sell=sell, chosen_side="ABSTAIN" if abstain else better, abstain=abstain, abstain_reasons=reasons, diagnostics={"prototype_pool_size": len(list(prototype_pool)) if not isinstance(prototype_pool, list) else len(prototype_pool), "shared_neighbor_pool": True, "buy_summary": buy.utility, "sell_summary": sell.utility, "gate_ablation": {"diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate, "diagnostic_disable_ess_gate": cfg.diagnostic_disable_ess_gate, "diagnostic_lower_bound_formula": cfg.diagnostic_lower_bound_formula, "diagnostic_feasible_side_chooser": cfg.diagnostic_feasible_side_chooser}, "side_gate_eval": {"buy_pass": buy_pass, "sell_pass": sell_pass, "buy_reasons": buy_reasons, "sell_reasons": sell_reasons}, "decision_rule": {"winner": better, "abstain_margin": cfg.abstain_margin, "buy_sell_ev_gap": buy_edge, "sell_buy_ev_gap": sell_edge, "chosen_lower_bound": chosen.lower_bound_return if better in {"BUY", "SELL"} else None, "chosen_interval_width": interval_width, "chosen_effective_sample_size": chosen.effective_sample_size if better in {"BUY", "SELL"} else None, "chosen_uncertainty": chosen.uncertainty if better in {"BUY", "SELL"} else None, "diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate, "diagnostic_disable_ess_gate": cfg.diagnostic_disable_ess_gate, "diagnostic_lower_bound_formula": cfg.diagnostic_lower_bound_formula, "diagnostic_feasible_side_chooser": cfg.diagnostic_feasible_side_chooser, "why": why, "why_summary": f"{why}: p_target={chosen.utility.get('p_target_first', 0.0):.2f}, p_stop={chosen.utility.get('p_stop_first', 0.0):.2f}, p_flat={chosen.utility.get('p_flat', 0.0):.2f}, p_ambiguous={chosen.utility.get('p_ambiguous', 0.0):.2f}, p_no_trade={chosen.utility.get('p_no_trade', 0.0):.2f}"}})
 
 
 def estimate_expected_value(*, side: str, query_embedding: list[float], candidates: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> EVEstimate:
@@ -293,7 +336,7 @@ def estimate_expected_value(*, side: str, query_embedding: list[float], candidat
         reasons.append("low_ev")
     if dist.uncertainty > cfg.max_uncertainty:
         reasons.append("high_uncertainty")
-    if dist.effective_sample_size < cfg.min_effective_sample_size:
+    if dist.effective_sample_size < cfg.min_effective_sample_size and not cfg.diagnostic_disable_ess_gate:
         reasons.append("low_neff")
     if dist.regime_alignment < cfg.min_regime_alignment:
         reasons.append("regime_mismatch")

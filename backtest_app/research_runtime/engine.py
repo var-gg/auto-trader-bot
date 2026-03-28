@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -115,6 +117,19 @@ def _diagnostics_lite_view(diagnostics: dict | None, *, grouped_candidates: dict
     return summaries
 
 
+def _git_commit_for_path(pathspec: str | None = None) -> str | None:
+    repo_root = Path(__file__).resolve().parents[2]
+    command = ["git", "log", "-1", "--format=%H"]
+    if pathspec:
+        command.extend(["--", pathspec])
+    try:
+        result = subprocess.run(command, cwd=repo_root, capture_output=True, text=True, check=True)
+        commit = result.stdout.strip()
+        return commit or None
+    except Exception:
+        return None
+
+
 def _reproducibility_payload(*, request: RunnerRequest, manifest, raw_diagnostics: dict | None, signal_panel_payload, validation_folds: dict | None) -> dict:
     metadata = dict(request.config.metadata or {})
     diagnostic_flag_keys = sorted(k for k in metadata if k.startswith("diagnostic_") or k in {"validation_summary_only", "diagnostics_lite"})
@@ -124,8 +139,13 @@ def _reproducibility_payload(*, request: RunnerRequest, manifest, raw_diagnostic
         for snapshot_id in artifact.get("snapshot_ids") or []:
             if snapshot_id not in validation_snapshot_ids:
                 validation_snapshot_ids.append(snapshot_id)
+    runtime_head_commit = getattr(manifest, "code_commit", None) or _git_commit_for_path()
+    strategy_logic_commit = _git_commit_for_path("backtest_app") or runtime_head_commit
     return {
-        "git_commit": getattr(manifest, "code_commit", None),
+        "git_commit": runtime_head_commit,
+        "git_commit_deprecated": True,
+        "runtime_head_commit": runtime_head_commit,
+        "strategy_logic_commit": strategy_logic_commit,
         "manifest": manifest.to_dict() if hasattr(manifest, "to_dict") else dict(manifest or {}),
         "exact_research_experiment_spec": request.config.research_spec.to_dict() if request.config.research_spec else None,
         "exact_metadata_json": json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
@@ -231,7 +251,7 @@ def _open_positions_market_value(*, day: str, state: dict, bars_by_symbol: dict)
     return exposure
 
 
-def execute_daily_execution_loop(*, trading_dates: list[str], grouped_candidates: dict[str, list], bars_by_symbol: dict, config: BacktestConfig, market: str, strategy_mode: str, portfolio_cfg: PortfolioConfig, quote_policy_cfg: QuotePolicyConfig, tuning: dict, broker, initial_state: dict | None = None):
+def execute_daily_execution_loop(*, trading_dates: list[str], grouped_candidates: dict[str, list], bars_by_symbol: dict, config: BacktestConfig, market: str, strategy_mode: str, portfolio_cfg: PortfolioConfig, quote_policy_cfg: QuotePolicyConfig, tuning: dict, broker, initial_state: dict | None = None, progress_callback=None):
     state = dict(initial_state or {"cash": float(config.initial_capital), "reserved_capital": 0.0, "open_positions": {}, "turnover_used": 0})
     state["open_positions"] = dict(state.get("open_positions") or {})
     date_artifacts = []
@@ -240,7 +260,10 @@ def execute_daily_execution_loop(*, trading_dates: list[str], grouped_candidates
     skipped = []
     selected_symbols = []
     portfolio_decisions_all = []
-    for decision_date in trading_dates:
+    total_trading_dates = len(trading_dates)
+    if progress_callback:
+        progress_callback({"phase": "daily_execution", "total_trading_dates": total_trading_dates, "completed_trading_dates": 0, "current_decision_date": None, "selected_count_so_far": 0, "plans_count_so_far": 0, "fills_count_so_far": 0})
+    for idx, decision_date in enumerate(trading_dates, start=1):
         realized_today = _close_positions_for_day(day=decision_date, state=state, bars_by_symbol=bars_by_symbol, config=config)
         candidates = grouped_candidates.get(decision_date, [])
         pstate = PortfolioState(cash=state["cash"], reserved_capital=state["reserved_capital"], open_positions=dict(state["open_positions"]), turnover_used=state["turnover_used"])
@@ -289,6 +312,17 @@ def execute_daily_execution_loop(*, trading_dates: list[str], grouped_candidates
                 day_rejected.append({"symbol": candidate.symbol, "reason": "no_fill", "diagnostics": active_policy})
         exposure = _open_positions_market_value(day=decision_date, state=state, bars_by_symbol=bars_by_symbol)
         date_artifacts.append({"decision_date": decision_date, "selected": day_selected, "rejected": day_rejected, "realized_today": realized_today, "cash": state["cash"], "reserved_capital": state["reserved_capital"], "exposure": exposure, "open_position_count": len(state["open_positions"]), "open_positions": sorted(state["open_positions"].keys())})
+        if progress_callback:
+            progress_callback({
+                "phase": "daily_execution",
+                "total_trading_dates": total_trading_dates,
+                "completed_trading_dates": idx,
+                "current_decision_date": decision_date,
+                "selected_count_so_far": len(selected_symbols),
+                "plans_count_so_far": len(plans),
+                "fills_count_so_far": len(fills),
+                "open_position_count": len(state["open_positions"]),
+            })
     if trading_dates:
         forced = _close_positions_for_day(day=trading_dates[-1], state=state, bars_by_symbol=bars_by_symbol, config=config, force=True, reason="scenario_end")
         if date_artifacts:
@@ -301,24 +335,51 @@ def execute_daily_execution_loop(*, trading_dates: list[str], grouped_candidates
     return {"state": state, "date_artifacts": date_artifacts, "plans": plans, "fills": fills, "skipped": skipped, "selected_symbols": selected_symbols, "portfolio_decisions_all": portfolio_decisions_all}
 
 
-def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: str | None = None, save_json: bool = True, sql_db_url: str | None = None, data_source: str = "json", scenario_id: str | None = None, strategy_mode: str = "legacy_event_window", enable_validation: bool = True, validation_max_folds: int | None = None, validation_summary_only: bool = False, diagnostics_lite: bool = False, candidate_reuse_payload: dict | None = None, emit_timing_logs: bool = False) -> dict:
+def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: str | None = None, save_json: bool = True, sql_db_url: str | None = None, data_source: str = "json", scenario_id: str | None = None, strategy_mode: str = "legacy_event_window", enable_validation: bool = True, validation_max_folds: int | None = None, validation_summary_only: bool = False, diagnostics_lite: bool = False, candidate_reuse_payload: dict | None = None, emit_timing_logs: bool = False, progress_callback=None) -> dict:
     total_timer = _stage_timer(emit_timing_logs, "total")
     load_timer = _stage_timer(emit_timing_logs, "load_bars")
+    if progress_callback:
+        progress_callback({"phase": "load_historical", "status": "running"})
     if candidate_reuse_payload is not None:
         historical = _history_from_reuse_payload(candidate_reuse_payload)
     else:
         historical = load_historical(request, data_path, data_source, scenario_id, strategy_mode)
+    historical_metadata = getattr(historical, "metadata", {}) or {}
+    if progress_callback:
+        macro_history = historical_metadata.get("macro_history_by_date", {}) or {}
+        sector_map = historical_metadata.get("sector_map", {}) or {}
+        progress_callback({
+            "phase": "load_historical",
+            "status": "running",
+            "loaded_ohlcv_rows": sum(len(bars) for bars in (historical.bars_by_symbol or {}).values()),
+            "loaded_macro_rows": sum(len(row or {}) for row in macro_history.values()),
+            "loaded_sector_rows": len(sector_map),
+        })
     load_timer(f"symbols={len(request.scenario.symbols)} reuse={candidate_reuse_payload is not None}")
     tuning = _tuning_config()
     portfolio_cfg = PortfolioConfig(top_n=int(request.config.metadata.get("portfolio_top_n", 5) or 5), risk_budget_fraction=float(request.config.metadata.get("portfolio_risk_budget_fraction", 0.95) or 0.95))
     quote_policy_cfg = QuotePolicyConfig(ev_threshold=float(request.config.metadata.get("quote_ev_threshold", 0.005)), uncertainty_cap=float(request.config.metadata.get("quote_uncertainty_cap", 0.12)), min_effective_sample_size=float(request.config.metadata.get("quote_min_effective_sample_size", 1.5)), min_fill_probability=float(request.config.metadata.get("quote_min_fill_probability", 0.10)))
     broker = SimulatedBroker(rules=SimulationRules(slippage_bps=request.config.slippage_bps, fee_bps=request.config.fee_bps, allow_partial_fills=request.config.allow_partial_fills))
     candidate_timer = _stage_timer(emit_timing_logs, "candidate_generation")
+    if progress_callback:
+        progress_callback({"phase": "candidate_grouping", "status": "running"})
     grouped_candidates, warmup_candidates = _candidate_groups(historical.candidates, start_date=request.scenario.start_date, end_date=request.scenario.end_date)
     trading_dates = candidate_reuse_payload.get("trading_dates") if candidate_reuse_payload else None
     trading_dates = trading_dates or _scenario_trading_dates(bars_by_symbol=historical.bars_by_symbol, start_date=request.scenario.start_date, end_date=request.scenario.end_date)
     candidate_timer(f"candidate_dates={len(grouped_candidates)} warmup={len(warmup_candidates)}")
-    execution = execute_daily_execution_loop(trading_dates=trading_dates, grouped_candidates=grouped_candidates, bars_by_symbol=historical.bars_by_symbol, config=request.config, market=request.scenario.market, strategy_mode=strategy_mode, portfolio_cfg=portfolio_cfg, quote_policy_cfg=quote_policy_cfg, tuning=tuning, broker=broker)
+    if progress_callback:
+        raw_diagnostics = historical_metadata.get("diagnostics", {}) or {}
+        event_record_batches = list(raw_diagnostics.get("event_records") or [])
+        progress_callback({
+            "phase": "candidate_grouping",
+            "status": "running",
+            "event_records_built": sum(len(batch or []) for batch in event_record_batches),
+            "prototype_batches_built": len(event_record_batches),
+            "candidate_rows": len(historical.candidates or []),
+            "total_trading_dates": len(trading_dates),
+        })
+        progress_callback({"phase": "daily_execution", "status": "running", "total_trading_dates": len(trading_dates)})
+    execution = execute_daily_execution_loop(trading_dates=trading_dates, grouped_candidates=grouped_candidates, bars_by_symbol=historical.bars_by_symbol, config=request.config, market=request.scenario.market, strategy_mode=strategy_mode, portfolio_cfg=portfolio_cfg, quote_policy_cfg=quote_policy_cfg, tuning=tuning, broker=broker, progress_callback=progress_callback)
     state = execution["state"]
     date_artifacts = execution["date_artifacts"]
     plans = execution["plans"]
@@ -327,7 +388,6 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
     selected_symbols = execution["selected_symbols"]
     portfolio_decisions_all = execution["portfolio_decisions_all"]
     summary = build_summary(scenario_id=request.scenario.scenario_id, plans=plans, fills=fills, bars_by_symbol=historical.bars_by_symbol, date_artifacts=date_artifacts)
-    historical_metadata = getattr(historical, "metadata", {}) or {}
     historical_context = {"bars_by_symbol": historical.bars_by_symbol, "macro_history_by_date": historical_metadata.get("macro_history_by_date", {}), "sector_map": historical_metadata.get("sector_map", {}), "trading_dates": trading_dates}
     historical_metadata["bars_by_symbol"] = historical.bars_by_symbol
     historical_metadata["historical_context"] = historical_context
@@ -342,6 +402,8 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
             "symbols": len({str(r.get('symbol')) for r in signal_panel_payload if isinstance(r, dict) and r.get('symbol')}),
         }
     validation_bootstrap_timer = _stage_timer(emit_timing_logs, "validation_bootstrap")
+    if progress_callback:
+        progress_callback({"phase": "summary_and_validation", "status": "running", "total_trading_dates": len(trading_dates), "completed_trading_dates": len(trading_dates)})
     bootstrap_validation_result = {
         "historical_context": historical_context,
         "bars_by_symbol": historical_context["bars_by_symbol"],
@@ -364,8 +426,18 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
         snapshot_info = {"data_source": data_source, "strategy_mode": strategy_mode, "historical_metadata": historical_metadata, "date_artifacts": date_artifacts, "reproducibility": reproducibility}
         result["sql_run_id"] = SqlResultStore(sql_db_url, namespace="research").save_run(run_key=manifest.manifest_id(), scenario_id=request.scenario.scenario_id, strategy_id=request.scenario.strategy_id, strategy_mode=strategy_mode, market=request.scenario.market, data_source=data_source, config_version=request.scenario.strategy_version, label_version=str(request.config.metadata.get("label_version", "v1")), vector_version=str(request.config.metadata.get("vector_version", strategy_mode)), initial_capital=request.config.initial_capital, params={"scenario_params": request.scenario.params, "scenario_notes": request.scenario.notes, "config_metadata": request.config.metadata}, summary=summary.__dict__, diagnostics={**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, plans=plans, fills=fills, snapshot_info=snapshot_info, manifest=manifest.to_dict())
     if output_dir and save_json:
+        if progress_callback:
+            progress_callback({"phase": "write_artifacts", "status": "running", "total_trading_dates": len(trading_dates), "completed_trading_dates": len(trading_dates)})
         write_timer = _stage_timer(emit_timing_logs, "write_artifacts")
         result["result_path"] = JsonResultStore(output_dir, namespace="research").save_run(run_id=manifest.manifest_id(), plans=plans, fills=fills, summary={**summary.__dict__, "diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "strategy_mode": strategy_mode}, diagnostics={"quote_policy_sweep": quote_policy_sweep, "portfolio": result["portfolio"], "signal_diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "reproducibility": reproducibility}, manifest=manifest.to_dict())
         write_timer(result.get("result_path") or "")
+        if progress_callback:
+            try:
+                bytes_written = Path(str(result.get("result_path"))).stat().st_size if result.get("result_path") else 0
+            except Exception:
+                bytes_written = 0
+            progress_callback({"phase": "write_artifacts", "status": "running", "total_trading_dates": len(trading_dates), "completed_trading_dates": len(trading_dates), "plans_count": len(plans), "fills_count": len(fills), "candidate_rows": len(historical.candidates or []), "bytes_written": bytes_written, "result_path": result.get("result_path")})
+    if progress_callback:
+        progress_callback({"phase": "complete", "status": "ok", "total_trading_dates": len(trading_dates), "completed_trading_dates": len(trading_dates), "plans_count": len(plans), "fills_count": len(fills), "candidate_rows": len(historical.candidates or []), "result_path": result.get("result_path")})
     total_timer(f"plans={len(plans)} fills={len(fills)}")
     return result

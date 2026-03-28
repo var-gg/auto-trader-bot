@@ -30,15 +30,22 @@ DECISION_CONVENTION = "EOD_T_SIGNAL__T1_OPEN_EXECUTION"
 def _ev_config_from_metadata(metadata: dict | None = None, *, top_k: int = 3, abstain_margin: float | None = None) -> EVConfig:
     meta = metadata or {}
     resolved_abstain_margin = abstain_margin if abstain_margin is not None else meta.get("abstain_margin", 0.05)
+    resolved_top_k = int(meta.get("top_k", top_k) or top_k)
+    resolved_min_ess = float(meta.get("diagnostic_min_effective_sample_size_override", meta.get("quote_min_effective_sample_size", meta.get("min_effective_sample_size", 1.5))) or 1.5)
     return EVConfig(
-        top_k=int(top_k),
-        min_effective_sample_size=float(meta.get("quote_min_effective_sample_size", meta.get("min_effective_sample_size", 1.5)) or 1.5),
+        top_k=resolved_top_k,
+        kernel_temperature=float(meta.get("kernel_temperature", 12.0) or 12.0),
+        min_effective_sample_size=resolved_min_ess,
         max_uncertainty=float(meta.get("quote_uncertainty_cap", meta.get("max_uncertainty", 0.08)) or 0.08),
         min_expected_utility=float(meta.get("quote_ev_threshold", meta.get("min_expected_utility", 0.005)) or 0.005),
         min_regime_alignment=float(meta.get("quote_min_regime_alignment", meta.get("min_regime_alignment", 0.5)) or 0.5),
+        use_kernel_weighting=str(meta.get("use_kernel_weighting", "true")).strip().lower() in {"1", "true", "yes", "on"},
         max_return_interval_width=float(meta.get("quote_max_return_interval_width", meta.get("max_return_interval_width", 0.08)) or 0.08),
         abstain_margin=float(resolved_abstain_margin or 0.0),
         diagnostic_disable_lower_bound_gate=str(meta.get("diagnostic_disable_lower_bound_gate", meta.get("disable_lower_bound_gate", "false"))).strip().lower() in {"1", "true", "yes", "on"},
+        diagnostic_disable_ess_gate=str(meta.get("diagnostic_disable_ess_gate", "false")).strip().lower() in {"1", "true", "yes", "on"},
+        diagnostic_lower_bound_formula=str(meta.get("diagnostic_lower_bound_formula", "lb_v1") or "lb_v1"),
+        diagnostic_feasible_side_chooser=str(meta.get("diagnostic_feasible_side_chooser", "false")).strip().lower() in {"1", "true", "yes", "on"},
     )
 
 
