@@ -165,13 +165,13 @@ def _reproducibility_payload(*, request: RunnerRequest, manifest, raw_diagnostic
     }
 
 
-def load_historical(request: RunnerRequest, data_path: str | None, data_source: str, scenario_id: str | None, strategy_mode: str):
+def load_historical(request: RunnerRequest, data_path: str | None, data_source: str, scenario_id: str | None, strategy_mode: str, progress_callback=None):
     if data_source == "local-db":
         cfg = LocalBacktestDbConfig.from_env()
         guard_backtest_local_only(cfg.url)
         session_factory = create_backtest_session_factory(cfg)
         loader = LocalPostgresLoader(session_factory, schema=cfg.schema)
-        return loader.load_for_scenario(scenario_id=scenario_id or request.scenario.scenario_id, market=request.scenario.market, start_date=request.scenario.start_date, end_date=request.scenario.end_date, symbols=request.scenario.symbols, strategy_mode=strategy_mode, research_spec=request.config.research_spec, metadata=request.config.metadata)
+        return loader.load_for_scenario(scenario_id=scenario_id or request.scenario.scenario_id, market=request.scenario.market, start_date=request.scenario.start_date, end_date=request.scenario.end_date, symbols=request.scenario.symbols, strategy_mode=strategy_mode, research_spec=request.config.research_spec, metadata=request.config.metadata, progress_callback=progress_callback)
     if not data_path:
         raise ValueError("data_path is required when data_source=json")
     return JsonHistoricalDataLoader().load(data_path)
@@ -343,7 +343,7 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
     if candidate_reuse_payload is not None:
         historical = _history_from_reuse_payload(candidate_reuse_payload)
     else:
-        historical = load_historical(request, data_path, data_source, scenario_id, strategy_mode)
+        historical = load_historical(request, data_path, data_source, scenario_id, strategy_mode, progress_callback=progress_callback)
     historical_metadata = getattr(historical, "metadata", {}) or {}
     if progress_callback:
         macro_history = historical_metadata.get("macro_history_by_date", {}) or {}

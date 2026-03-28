@@ -278,7 +278,7 @@ def generate_similarity_candidates(*, bars_by_symbol: Dict[str, List[HistoricalB
     return candidates, diagnostics
 
 
-def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[HistoricalBar]], market: str, macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str] | None = None, lookback_bars: int = 5, feature_window_bars: int = 60, horizon_days: int = 5, top_k: int = 3, abstain_margin: float = 0.05, spec: ResearchExperimentSpec | None = None, metadata: dict | None = None) -> Tuple[List[SignalCandidate], Dict[str, dict]]:
+def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[HistoricalBar]], market: str, macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str] | None = None, lookback_bars: int = 5, feature_window_bars: int = 60, horizon_days: int = 5, top_k: int = 3, abstain_margin: float = 0.05, spec: ResearchExperimentSpec | None = None, metadata: dict | None = None, progress_callback=None) -> Tuple[List[SignalCandidate], Dict[str, dict]]:
     t0 = perf_counter()
     spec = spec or _default_spec(feature_window_bars=feature_window_bars, horizon_days=horizon_days)
     sector_map = sector_map or {}
@@ -293,7 +293,27 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
     total_prototype_count = 0
     all_excluded_reasons: list[dict] = []
     event_record_batches: list[dict] = []
-    for decision_date in decision_dates:
+    progress_every = max(1, min(10, len(decision_dates) or 1))
+
+    def _emit_progress(decision_dates_done: int, *, force: bool = False) -> None:
+        if not progress_callback:
+            return
+        if not force and decision_dates_done not in {0, len(decision_dates)} and decision_dates_done % progress_every != 0:
+            return
+        progress_callback({
+            "phase": "load_historical",
+            "status": "running",
+            "decision_dates_done": decision_dates_done,
+            "decision_dates_total": len(decision_dates),
+            "completed_trading_dates": decision_dates_done,
+            "total_trading_dates": len(decision_dates),
+            "event_records_built": sum(len((batch or {}).get("records") or []) for batch in event_record_batches),
+            "prototype_batches_built": len(event_record_batches),
+            "candidate_rows": len(out),
+        })
+
+    _emit_progress(0, force=True)
+    for idx, decision_date in enumerate(decision_dates, start=1):
         memory = build_event_memory_asof(decision_date=decision_date, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market, lookback_bars=lookback_bars)
         query_panel, query_excluded = _build_query_panel(decision_dates=[decision_date], spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=memory["scaler"])
         event_record_batches.append({"decision_date": decision_date, "records": [{"symbol": r.symbol, "event_date": r.event_date, "outcome_end_date": r.outcome_end_date, "side_outcomes": r.side_outcomes} for r in memory["event_records"]]})
@@ -319,6 +339,8 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
             chosen_side = Side.BUY if surface.chosen_side == Side.BUY.value else Side.SELL
             chosen = long_scores[0] if chosen_side == Side.BUY and long_scores else short_scores[0] if short_scores else None
             out.append(SignalCandidate(symbol=symbol, ticker_id=None, market=MarketCode(market), side_bias=chosen_side, signal_strength=float((long_ev.calibrated_ev if chosen_side == Side.BUY else short_ev.calibrated_ev) if chosen else 0.0), confidence=float(long_ev.calibrated_win_prob if chosen_side == Side.BUY else short_ev.calibrated_win_prob), anchor_date=decision_date, reference_date=decision_date, current_price=float(execution_bar.open), atr_pct=float(max(0.01, compute_bar_features(q["query_window"]).get("range_pct", 0.02) / 3.0)), target_return_pct=spec.target_return_pct, max_reverse_pct=spec.stop_return_pct, expected_horizon_days=spec.horizon_days, outcome_label=OutcomeLabel.UNKNOWN, provenance={"strategy_mode": "research_similarity_v2", "decision_date": decision_date, "execution_date": execution_date, "spec_hash": spec.spec_hash()}, diagnostics=row_diag, notes=[f"prototype_id={(chosen.prototype_id if chosen else '')}"]))
+        _emit_progress(idx)
+    _emit_progress(len(decision_dates), force=True)
     diagnostics["signal_panel"] = panel_rows
     diagnostics["signal_panel_jsonl"] = "\n".join(str(row) for row in panel_rows)
     diagnostics["cache_keys"] = {"library_cache_keys": [f"{d}:{spec.spec_hash()}" for d in decision_dates]}

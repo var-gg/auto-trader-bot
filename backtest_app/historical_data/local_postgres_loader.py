@@ -21,7 +21,7 @@ class LocalPostgresLoader:
         self.session_factory = session_factory
         self.schema = schema
 
-    def load_for_scenario(self, *, scenario_id: str, market: str, start_date: str, end_date: str, symbols: Iterable[str], strategy_mode: str = "legacy_event_window", research_spec: ResearchExperimentSpec | None = None, train_end: str | None = None, decision_dates: Iterable[str] | None = None, metadata: Dict[str, str] | None = None) -> HistoricalSlice:
+    def load_for_scenario(self, *, scenario_id: str, market: str, start_date: str, end_date: str, symbols: Iterable[str], strategy_mode: str = "legacy_event_window", research_spec: ResearchExperimentSpec | None = None, train_end: str | None = None, decision_dates: Iterable[str] | None = None, metadata: Dict[str, str] | None = None, progress_callback=None) -> HistoricalSlice:
         symbols = [s for s in symbols if s]
         if not symbols:
             raise ValueError("symbols required")
@@ -43,7 +43,7 @@ class LocalPostgresLoader:
             macro_history = self._load_macro_history(start_date=start_date, end_date=end_date, prewarm_days=max(WARMUP_DAYS, spec.feature_window_bars * 2))
             resolved_metadata = dict(metadata or {})
             abstain_margin = float(resolved_metadata.get("abstain_margin", 0.05) or 0.05)
-            candidates, research_diag = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market=market, macro_history_by_date=macro_history, sector_map=sector_map, spec=spec, abstain_margin=abstain_margin, metadata=resolved_metadata)
+            candidates, research_diag = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market=market, macro_history_by_date=macro_history, sector_map=sector_map, spec=spec, abstain_margin=abstain_margin, metadata=resolved_metadata, progress_callback=progress_callback)
             snapshot_ts = self._resolve_snapshot_ts(bars_by_symbol)
             enriched = self._enrich_candidates(candidates, features_by_symbol)
             snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False)

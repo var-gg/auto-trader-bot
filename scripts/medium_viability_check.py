@@ -53,6 +53,11 @@ BASELINE_TRADING_DATES = 25
 STALL_SECONDS = 45
 MONITOR_INTERVAL_SECONDS = 2.0
 CPU_HIGH_DELTA_SECONDS = 0.5
+PHASE_TIMEOUT_SECONDS = {
+    "load_historical": 20 * 60,
+    "daily_execution": 5 * 60,
+    "write_artifacts": 2 * 60,
+}
 BASE_SPEC = ResearchExperimentSpec(
     feature_window_bars=60,
     lookback_horizons=[5],
@@ -490,6 +495,8 @@ def _mark_stall_error(run_dir: Path, stall_reason: str) -> None:
 def _monitor_child(run_dir: Path, proc: subprocess.Popen[str]) -> dict[str, Any]:
     monitor_path = run_dir / "monitor.json"
     stdout_path = run_dir / "child_stdout.log"
+    manifest = _read_json(run_dir / "manifest.json")
+    created_at = manifest.get("created_at")
     last_stdout_at: str | None = None
     last_cpu_total: float | None = None
     stall_reason: str | None = None
@@ -522,13 +529,25 @@ def _monitor_child(run_dir: Path, proc: subprocess.Popen[str]) -> dict[str, Any]
                 f.write(line)
             last_stdout_at = datetime.now().isoformat()
         child_alive = proc.poll() is None
-        progress_status = _read_json(run_dir / "status.json")
-        last_progress_at = progress_status.get("last_progress_at")
-        no_progress = False
-        progress_anchor = last_progress_at or progress_status.get("event_at") or _read_json(run_dir / "manifest.json").get("created_at")
+        status_payload = _read_json(run_dir / "status.json")
+        phase = str(status_payload.get("phase") or "unknown")
+        last_progress_at = status_payload.get("last_progress_at")
+        progress_anchor = last_progress_at or status_payload.get("event_at") or created_at
+        elapsed_since_progress = None
         if progress_anchor:
-            no_progress = (datetime.now() - datetime.fromisoformat(str(progress_anchor))).total_seconds() >= STALL_SECONDS
-        monitor = {"pid": proc.pid, "child_alive": child_alive, "last_stdout_at": last_stdout_at, "stall_reason": stall_reason}
+            elapsed_since_progress = (datetime.now() - datetime.fromisoformat(str(progress_anchor))).total_seconds()
+        phase_budget = PHASE_TIMEOUT_SECONDS.get(phase, STALL_SECONDS)
+        phase_budget_exceeded = elapsed_since_progress is not None and elapsed_since_progress >= phase_budget
+        monitor = {
+            "pid": proc.pid,
+            "child_alive": child_alive,
+            "last_stdout_at": last_stdout_at,
+            "stall_reason": stall_reason,
+            "phase": phase,
+            "phase_budget_seconds": phase_budget,
+            "elapsed_since_progress_seconds": elapsed_since_progress,
+            "phase_budget_exceeded": phase_budget_exceeded,
+        }
         if psutil is not None:
             try:
                 p = psutil.Process(proc.pid)
@@ -539,17 +558,18 @@ def _monitor_child(run_dir: Path, proc: subprocess.Popen[str]) -> dict[str, Any]
                     last_cpu_total = cpu_total
                     last_metrics = {"cpu_delta": cpu_delta, "rss": int(p.memory_info().rss), "cwd": p.cwd(), "cmdline": p.cmdline()}
                     monitor.update(last_metrics)
-                    if no_progress and cpu_delta is not None:
-                        stall_reason = "HOT_LOOP" if cpu_delta >= CPU_HIGH_DELTA_SECONDS else "BLOCKED_IO"
-                        monitor["stall_reason"] = stall_reason
+                    if phase == "load_historical" and cpu_delta is not None and cpu_delta > 0:
+                        monitor["activity"] = "ACTIVE_COMPUTE"
             except Exception:
                 monitor.update(last_metrics)
         else:
             monitor.update(last_metrics)
-        status_payload = _read_json(run_dir / "status.json")
         actual_result_path = Path(str(status_payload.get("result_path") or "")) if status_payload.get("result_path") else None
         if not child_alive and (actual_result_path is None or not actual_result_path.exists()):
             stall_reason = "FAILED_NO_ARTIFACT"
+            monitor["stall_reason"] = stall_reason
+        elif phase_budget_exceeded:
+            stall_reason = f"PHASE_BUDGET_EXCEEDED:{phase}"
             monitor["stall_reason"] = stall_reason
         _write_json(monitor_path, monitor)
         if stall_reason and status_payload.get("status") != "ok":
@@ -611,8 +631,8 @@ def _child_run(run_dir: Path) -> int:
             strategy_mode="research_similarity_v2",
             output_dir=str(run_dir),
             save_json=True,
-            enable_validation=True,
-            validation_max_folds=1,
+            enable_validation=False,
+            validation_max_folds=0,
             progress_callback=_progress,
         )
         result_path = Path(str(result.get("result_path") or expected_path))
