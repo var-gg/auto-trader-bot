@@ -55,7 +55,7 @@ STALL_SECONDS = 45
 MONITOR_INTERVAL_SECONDS = 2.0
 CPU_HIGH_DELTA_SECONDS = 0.5
 PHASE_TIMEOUT_SECONDS = {
-    "load_historical": 20 * 60,
+    "load_historical": 45 * 60,
     "daily_execution": 5 * 60,
     "write_artifacts": 2 * 60,
 }
