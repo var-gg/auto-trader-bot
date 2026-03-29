@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import shutil
 import subprocess
@@ -106,6 +107,7 @@ COUNTER_KEYS = [
 ]
 SUMMARY_COLS = [
     "run_label",
+    "support_fingerprint",
     "authoritative",
     "verdict_eligible",
     "branch",
@@ -425,6 +427,27 @@ def _is_allowed_tiny_candidate(row: dict[str, Any]) -> bool:
     return extra <= ALLOWED_SUPPORT_KEYS
 
 
+def _support_metadata(metadata: dict[str, Any] | None) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for key, value in dict(metadata or {}).items():
+        if key in ALLOWED_SUPPORT_KEYS:
+            normalized[str(key)] = str(value).lower() if isinstance(value, bool) else str(value)
+    return normalized
+
+
+def _support_fingerprint(metadata: dict[str, Any] | None) -> str:
+    canonical = json.dumps(sorted(_support_metadata(metadata).items()), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+
+
+def _annotate_tiny_row(row: dict[str, Any]) -> dict[str, Any]:
+    annotated = dict(row)
+    support_metadata = _support_metadata(annotated.get("metadata"))
+    annotated["support_metadata"] = support_metadata
+    annotated["support_fingerprint"] = _support_fingerprint(support_metadata)
+    return annotated
+
+
 def _rank_key(row: dict[str, Any]):
     return (
         int(row.get("candidate_count", 0)),
@@ -440,16 +463,47 @@ def _load_tiny_rows(tiny_root: Path) -> list[dict[str, Any]]:
         raise RuntimeError(f"Tiny source root not found: {tiny_root}")
     rows = []
     for p in tiny_root.rglob("summary.json"):
-        rows.append(json.loads(p.read_text(encoding="utf-8")))
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        annotated = _annotate_tiny_row(payload)
+        annotated["summary_path"] = str(p.resolve())
+        rows.append(annotated)
     if not rows:
         raise RuntimeError(f"No tiny summary.json files found under {tiny_root}")
     return rows
 
 
 def _pick_best_two_allowed(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    filtered = [r for r in rows if _is_allowed_tiny_candidate(r)]
+    filtered = [_annotate_tiny_row(r) for r in rows if _is_allowed_tiny_candidate(r)]
     filtered.sort(key=lambda row: (-int(row.get("candidate_count", 0)), -int(row.get("fills_count", 0)), -int(row.get("trades_count", 0)), -(int(row.get("buy_pass_count", 0)) + int(row.get("sell_pass_count", 0))), str(row.get("run_label", ""))))
-    return filtered[:2]
+    selected: list[dict[str, Any]] = []
+    seen_fingerprints: set[str] = set()
+    for row in filtered:
+        fingerprint = str(row.get("support_fingerprint") or "")
+        if fingerprint in seen_fingerprints:
+            continue
+        selected.append(row)
+        seen_fingerprints.add(fingerprint)
+        if len(selected) == 2:
+            break
+    return selected
+
+
+def _support_pair_payload(best_two: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(best_two) < 2:
+        raise RuntimeError("Need two selected support rows to build support pair payload")
+    best1_meta = dict(best_two[0].get("support_metadata") or _support_metadata(best_two[0].get("metadata")))
+    best2_meta = dict(best_two[1].get("support_metadata") or _support_metadata(best_two[1].get("metadata")))
+    best1_fingerprint = str(best_two[0].get("support_fingerprint") or _support_fingerprint(best1_meta))
+    best2_fingerprint = str(best_two[1].get("support_fingerprint") or _support_fingerprint(best2_meta))
+    return {
+        "selected_best1_source_run_label": str(best_two[0].get("run_label") or ""),
+        "selected_best2_source_run_label": str(best_two[1].get("run_label") or ""),
+        "selected_best1_support_fingerprint": best1_fingerprint,
+        "selected_best2_support_fingerprint": best2_fingerprint,
+        "best1_support_metadata": best1_meta,
+        "best2_support_metadata": best2_meta,
+        "pair_distinct": best1_fingerprint != best2_fingerprint,
+    }
 
 
 def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, Any], scenario: BacktestScenario, *, result_path: str | None = None) -> dict[str, Any]:
@@ -491,6 +545,7 @@ def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, A
     metadata_application = _verify_metadata_applied(result, metadata)
     summary = {
         "run_label": run_label,
+        "support_fingerprint": _support_fingerprint(metadata),
         "scenario_id": scenario.scenario_id,
         "window": {"start_date": scenario.start_date, "end_date": scenario.end_date},
         "symbols": list(scenario.symbols),
@@ -910,6 +965,7 @@ def _run_medium_case(output_root: Path, run_label: str, scenario: BacktestScenar
         }
         summary = {
             "run_label": run_label,
+            "support_fingerprint": _support_fingerprint(metadata),
             "scenario_id": scenario.scenario_id,
             "result_path": child_summary["status"].get("result_path"),
             "metadata": metadata,
@@ -955,10 +1011,13 @@ def _main_parent(args: argparse.Namespace) -> int:
         raise RuntimeError("--output-root must be an absolute path")
     output_root.mkdir(parents=True, exist_ok=True)
     _emit_execution_start(output_root)
-    baseline_summary = _run_baseline_parent(output_root)
-    if not baseline_summary.get("baseline_run_completed"):
-        print(json.dumps({"baseline": baseline_summary, "aborted_after_baseline": True}, ensure_ascii=False, indent=2, default=_json_default))
-        return 1
+    requested = _resolve_requested_labels(args)
+    baseline_summary = None
+    if "baseline" in requested:
+        baseline_summary = _run_baseline_parent(output_root)
+        if not baseline_summary.get("baseline_run_completed"):
+            print(json.dumps({"baseline": baseline_summary, "aborted_after_baseline": True}, ensure_ascii=False, indent=2, default=_json_default))
+            return 1
 
     driver = _ensure_public_committed_driver()
     preflight = preflight_local_db(UNIVERSE)
@@ -967,15 +1026,19 @@ def _main_parent(args: argparse.Namespace) -> int:
     tiny_rows = _load_tiny_rows(Path(args.tiny_root).resolve())
     best_two = _pick_best_two_allowed(tiny_rows)
     if len(best_two) < 2:
-        raise RuntimeError(f"Expected at least 2 allowed tiny rows, found {len(best_two)}")
-    requested = _resolve_requested_labels(args)
+        distinct = sorted({str(row.get("support_fingerprint") or "") for row in tiny_rows if _is_allowed_tiny_candidate(row)})
+        raise RuntimeError(f"Expected 2 distinct support fingerprints from allowed tiny rows, found {len(distinct)} distinct fingerprint(s)")
+    pair_payload = _support_pair_payload(best_two)
     medium_rows: list[dict[str, Any]] = []
     baseline_medium_summary = None
     if "baseline" in requested:
         baseline_medium_summary = _run_medium_case(output_root, "baseline", discovery, {}, preflight, driver)
         medium_rows.append(baseline_medium_summary)
-    best1_meta = {k: v for k, v in (best_two[0].get("metadata") or {}).items() if k in ALLOWED_SUPPORT_KEYS}
-    best2_meta = {k: v for k, v in (best_two[1].get("metadata") or {}).items() if k in ALLOWED_SUPPORT_KEYS}
+    best1_meta = dict(pair_payload["best1_support_metadata"])
+    best2_meta = dict(pair_payload["best2_support_metadata"])
+    best1_fingerprint = str(pair_payload["selected_best1_support_fingerprint"])
+    best2_fingerprint = str(pair_payload["selected_best2_support_fingerprint"])
+    pair_distinct = bool(pair_payload["pair_distinct"])
     best1_summary = None
     best2_summary = None
     if "best1" in requested:
@@ -1009,10 +1072,7 @@ def _main_parent(args: argparse.Namespace) -> int:
         "driver": driver,
         "preflight": preflight,
         "baseline_contract": baseline_summary,
-        "selected_best1_source_run_label": best_two[0]["run_label"],
-        "selected_best2_source_run_label": best_two[1]["run_label"],
-        "best1_support_metadata": best1_meta,
-        "best2_support_metadata": best2_meta,
+        **pair_payload,
         "medium_runs": medium_rows,
         "eligible_medium_run_labels": [r.get("run_label") for r in eligible_best_runs],
         "verdict": verdict,
@@ -1030,10 +1090,11 @@ def _main_parent(args: argparse.Namespace) -> int:
         f"- Tiny root: `{Path(args.tiny_root).resolve()}`",
         f"- scripts/medium_viability_check.py tracked on public branch: yes",
         f"- CLI selective support: `--run-labels` and `--only`",
-        f"- Baseline run completed: `{baseline_summary.get('baseline_run_completed')}`",
-        f"- Baseline contract gate passed: `{baseline_summary.get('baseline_contract_gate_passed')}`",
-        f"- best1 source: `{best_two[0]['run_label']}` -> {json.dumps(best1_meta, ensure_ascii=False)}",
-        f"- best2 source: `{best_two[1]['run_label']}` -> {json.dumps(best2_meta, ensure_ascii=False)}",
+        f"- Baseline run completed: `{baseline_summary.get('baseline_run_completed') if baseline_summary else 'not_requested'}`",
+        f"- Baseline contract gate passed: `{baseline_summary.get('baseline_contract_gate_passed') if baseline_summary else 'not_requested'}`",
+        f"- best1 source: `{best_two[0]['run_label']}` / fingerprint=`{best1_fingerprint}` -> {json.dumps(best1_meta, ensure_ascii=False)}",
+        f"- best2 source: `{best_two[1]['run_label']}` / fingerprint=`{best2_fingerprint}` -> {json.dumps(best2_meta, ensure_ascii=False)}",
+        f"- pair_distinct: `{pair_distinct}`",
         "",
         "## Runs",
     ]

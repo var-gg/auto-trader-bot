@@ -1,218 +1,89 @@
 {
+  "policy": "C",
   "classification": "C",
-  "official_result": {
-    "policy": "Strict C",
-    "classification": "C",
-    "classification_name": "metadata_application_mismatch",
-    "can_use_completed_medium_failures_as_final_evidence": false,
-    "gate_census_blocked": true,
-    "gate_census_block_reason": "Completed best1/best2 artifacts do not expose current-schema metadata_application.expected/observed or authoritative/verdict_eligible/exclusion_reasons, and the only current-schema probe is a partial best1 rerun.",
-    "completed_runs_missing_metadata_application": [
-      "best1",
-      "best2"
-    ],
-    "completed_runs_missing_current_verdict_fields": [
-      "best1",
-      "best2"
-    ],
-    "current_schema_probe": {
-      "path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check\\20260329_e21ff63_best1_rerun\\medium_viability_summary.json",
-      "exists": true,
-      "medium_runs_present": [
-        "best1"
-      ],
-      "completed_pair_available": false,
-      "selected_best1_source_run_label": "tiny_ess_gate_disabled",
-      "selected_best2_source_run_label": "tiny_sweep_kt6_tk5_kw1_ess1p5",
-      "best1_probe": {
-        "authoritative": false,
-        "verdict_eligible": false,
-        "exclusion_reasons": [
-          "child_failed",
-          "non_authoritative",
-          "metadata_not_applied"
-        ],
-        "metadata_application": {
-          "checked": true,
-          "applied": false,
-          "expected": {
-            "diagnostic_disable_ess_gate": "true"
-          },
-          "observed": {},
-          "checks": {}
-        }
-      },
-      "best2_probe": {
-        "authoritative": null,
-        "verdict_eligible": null,
-        "exclusion_reasons": null,
-        "metadata_application": null
-      }
-    }
+  "classification_name": "metadata_application_mismatch_or_incomplete_pair",
+  "can_use_completed_medium_failures_as_final_evidence": false,
+  "current_medium_root": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check\\20260329_e21ff63_best1_rerun",
+  "tiny_root": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_parity_fix_20260329\\tiny_seed",
+  "best1_current_summary_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check\\20260329_e21ff63_best1_rerun\\best1\\summary.json",
+  "best2_current_summary_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check\\20260329_e21ff63_best1_rerun\\best2\\summary.json",
+  "best1_current_contract_presence": {
+    "summary_exists": true,
+    "medium_row_exists": true,
+    "completed": false,
+    "has_metadata_application_expected": true,
+    "has_metadata_application_observed": true,
+    "has_authoritative": true,
+    "has_verdict_eligible": true,
+    "has_exclusion_reasons": true
   },
-  "supplemental_inference": {
-    "driver_logic": {
-      "path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\scripts\\medium_viability_check.py",
-      "allowed_support_keys": [
-        "diagnostic_disable_ess_gate",
-        "kernel_temperature",
-        "min_effective_sample_size",
-        "top_k",
-        "use_kernel_weighting"
-      ],
-      "supports_current_observability_fields": true,
-      "selection_function_has_dedupe": false
-    },
-    "tiny_top2_distinct": true,
-    "tiny_top2_run_labels": [
-      "tiny_ess_gate_disabled",
-      "tiny_sweep_kt6_tk5_kw1_ess1p5"
-    ],
-    "tiny_source_root": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_parity_fix_20260329\\tiny_seed",
-    "old_medium_manifest_matches_tiny_sources": true,
-    "completed_medium_artifact_mapping": {
-      "best1": {
-        "source_run_label": "tiny_sweep_kt6_tk5_kw1_ess1p5",
-        "support_metadata": {
-          "kernel_temperature": "6",
-          "top_k": "5",
-          "use_kernel_weighting": "true",
-          "min_effective_sample_size": "1.5"
-        }
-      },
-      "best2": {
-        "source_run_label": "tiny_ess_gate_disabled",
-        "support_metadata": {
-          "diagnostic_disable_ess_gate": "true"
-        }
-      }
-    },
-    "current_rerun_probe_mapping": {
-      "selected_best1_source_run_label": "tiny_ess_gate_disabled",
-      "selected_best2_source_run_label": "tiny_sweep_kt6_tk5_kw1_ess1p5",
-      "best1_support_metadata": {
-        "diagnostic_disable_ess_gate": "true"
-      },
-      "best2_support_metadata": {
-        "kernel_temperature": "6",
-        "top_k": "5",
-        "use_kernel_weighting": "true",
-        "min_effective_sample_size": "1.5"
-      }
-    },
-    "legacy_completed_label_mapping_statement": {
-      "best1": "kernel/top_k/use_kernel_weighting/min_effective_sample_size",
-      "best2": "diagnostic_disable_ess_gate"
-    },
-    "does_not_upgrade_official_classification": true,
-    "note": "Distinct support configs are visible in the tiny source rows and the legacy completed medium manifests, but Strict C keeps the official classification at metadata_application_mismatch until both completed best1/best2 runs exist under the current observability contract."
+  "best2_current_contract_presence": {
+    "summary_exists": false,
+    "medium_row_exists": false,
+    "completed": false,
+    "has_metadata_application_expected": false,
+    "has_metadata_application_observed": false,
+    "has_authoritative": false,
+    "has_verdict_eligible": false,
+    "has_exclusion_reasons": false
   },
-  "best1": {
-    "run_label": "best1",
-    "summary_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_stallfix_20260329_best1\\best1\\summary.json",
-    "manifest_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_stallfix_20260329_best1\\best1\\manifest.json",
-    "medium_summary_json_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_stallfix_20260329_best1\\medium_viability_summary.json",
-    "medium_summary_csv_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_stallfix_20260329_best1\\medium_viability_summary.csv",
-    "medium_summary_csv_exists": true,
-    "candidate_count": 0,
-    "fills_count": 0,
-    "trades_count": 0,
-    "support_metadata_from_summary": {
-      "kernel_temperature": "6",
-      "top_k": "5",
-      "use_kernel_weighting": "true",
-      "min_effective_sample_size": "1.5"
-    },
-    "support_metadata_from_manifest": {
-      "kernel_temperature": "6",
-      "top_k": "5",
-      "use_kernel_weighting": "true",
-      "min_effective_sample_size": "1.5"
-    },
-    "support_metadata_from_medium_summary": {
-      "kernel_temperature": "6",
-      "top_k": "5",
-      "use_kernel_weighting": "true",
-      "min_effective_sample_size": "1.5"
-    },
-    "current_contract_presence": {
-      "has_metadata_application": false,
-      "has_metadata_application_expected": false,
-      "has_metadata_application_observed": false,
-      "has_authoritative": false,
-      "has_verdict_eligible": false,
-      "has_exclusion_reasons": false
-    },
-    "tiny_source_match": {
-      "matched": true,
-      "run_label": "tiny_sweep_kt6_tk5_kw1_ess1p5",
-      "path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_parity_fix_20260329\\tiny_seed\\tiny_sweep_kt6_tk5_kw1_ess1p5\\summary.json"
-    }
-  },
-  "best2": {
-    "run_label": "best2",
-    "summary_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_stallfix_20260329_best2\\best2\\summary.json",
-    "manifest_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_stallfix_20260329_best2\\best2\\manifest.json",
-    "medium_summary_json_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_stallfix_20260329_best2\\medium_viability_summary.json",
-    "medium_summary_csv_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_stallfix_20260329_best2\\medium_viability_summary.csv",
-    "medium_summary_csv_exists": true,
-    "candidate_count": 0,
-    "fills_count": 0,
-    "trades_count": 0,
-    "support_metadata_from_summary": {
+  "best1_metadata_application": {
+    "checked": true,
+    "applied": false,
+    "expected": {
       "diagnostic_disable_ess_gate": "true"
     },
-    "support_metadata_from_manifest": {
-      "diagnostic_disable_ess_gate": "true"
-    },
-    "support_metadata_from_medium_summary": {
-      "diagnostic_disable_ess_gate": "true"
-    },
-    "current_contract_presence": {
-      "has_metadata_application": false,
-      "has_metadata_application_expected": false,
-      "has_metadata_application_observed": false,
-      "has_authoritative": false,
-      "has_verdict_eligible": false,
-      "has_exclusion_reasons": false
-    },
-    "tiny_source_match": {
-      "matched": true,
-      "run_label": "tiny_ess_gate_disabled",
-      "path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_parity_fix_20260329\\tiny_seed\\tiny_ess_gate_disabled\\summary.json"
-    }
+    "observed": {},
+    "checks": {}
   },
-  "tiny_sources": {
-    "root": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_parity_fix_20260329\\tiny_seed",
-    "rows": [
-      {
-        "path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_parity_fix_20260329\\tiny_seed\\tiny_ess_gate_disabled\\summary.json",
-        "run_label": "tiny_ess_gate_disabled",
-        "candidate_count": 1,
-        "fills_count": 1,
-        "trades_count": 1,
-        "buy_pass_count": 1,
-        "sell_pass_count": 0,
-        "support_metadata": {
-          "diagnostic_disable_ess_gate": "true"
-        }
-      },
-      {
-        "path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check_parity_fix_20260329\\tiny_seed\\tiny_sweep_kt6_tk5_kw1_ess1p5\\summary.json",
-        "run_label": "tiny_sweep_kt6_tk5_kw1_ess1p5",
-        "candidate_count": 1,
-        "fills_count": 1,
-        "trades_count": 1,
-        "buy_pass_count": 1,
-        "sell_pass_count": 0,
-        "support_metadata": {
-          "kernel_temperature": "6",
-          "top_k": "5",
-          "use_kernel_weighting": "true",
-          "min_effective_sample_size": "1.5"
-        }
-      }
-    ],
-    "distinct_support_metadata": true
-  }
+  "best2_metadata_application": {},
+  "best1_authoritative": false,
+  "best2_authoritative": null,
+  "best1_verdict_eligible": false,
+  "best2_verdict_eligible": null,
+  "best1_exclusion_reasons": [
+    "child_failed",
+    "non_authoritative",
+    "metadata_not_applied"
+  ],
+  "best2_exclusion_reasons": [],
+  "selected_best1_source_run_label": "tiny_ess_gate_disabled",
+  "selected_best2_source_run_label": "tiny_sweep_kt6_tk5_kw1_ess1p5",
+  "best1_support_metadata": {
+    "diagnostic_disable_ess_gate": "true"
+  },
+  "best2_support_metadata": {
+    "kernel_temperature": "6",
+    "top_k": "5",
+    "use_kernel_weighting": "true",
+    "min_effective_sample_size": "1.5"
+  },
+  "tiny_source_best1_support_metadata": {
+    "diagnostic_disable_ess_gate": "true"
+  },
+  "tiny_source_best2_support_metadata": {
+    "kernel_temperature": "6",
+    "top_k": "5",
+    "use_kernel_weighting": "true",
+    "min_effective_sample_size": "1.5"
+  },
+  "pair_is_distinct_under_allowed_support_keys": true,
+  "medium_pair_matches_tiny_sources": true,
+  "driver_has_support_dedupe": true,
+  "unblock_recommendation": "fix_only_the_reported_block_reason_then_reaudit",
+  "blocked_reasons": [
+    "incomplete_pair",
+    "metadata_application_missing_or_verdict_fields_missing"
+  ],
+  "best1_current_support_fingerprint": "c56b97c2ebbff1635c3f12e45d490076d7975e37",
+  "best2_current_support_fingerprint": "1a75f33da4cb89eb3b38d19b89f1e65508db1bf5",
+  "tiny_source_best1_support_fingerprint": "c56b97c2ebbff1635c3f12e45d490076d7975e37",
+  "tiny_source_best2_support_fingerprint": "1a75f33da4cb89eb3b38d19b89f1e65508db1bf5",
+  "best1_manifest_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check\\20260329_e21ff63_best1_rerun\\best1\\manifest.json",
+  "best2_manifest_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check\\20260329_e21ff63_best1_rerun\\best2\\manifest.json",
+  "best1_manifest_support_metadata": {
+    "diagnostic_disable_ess_gate": "true"
+  },
+  "best2_manifest_support_metadata": {},
+  "medium_viability_summary_path": "A:\\vargg-workspace\\30_trading\\auto-trader-bot\\runs\\medium_viability_check\\20260329_e21ff63_best1_rerun\\medium_viability_summary.json"
 }
