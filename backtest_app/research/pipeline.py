@@ -409,7 +409,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
         if not force and decision_dates_done not in {0, len(decision_dates)} and decision_dates_done % progress_every != 0:
             return
         progress_callback({
-            "phase": "load_historical",
+            "phase": "candidate_generation",
             "status": "running",
             "decision_dates_done": decision_dates_done,
             "decision_dates_total": len(decision_dates),

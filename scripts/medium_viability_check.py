@@ -49,6 +49,8 @@ from sqlalchemy import text
 
 OUT_ROOT = ROOT / "runs" / "medium_viability_check"
 DEFAULT_TINY_ROOT = ROOT / "runs" / "ess_support_verification_20260328" / "tiny"
+SUPPORT_PAIR_FILENAME = "selected_support_pair.json"
+RUN_LABEL_ORDER = ["baseline", "best1", "best2", "holdout"]
 BASELINE_RUN_LABEL = "baseline"
 BASELINE_SYMBOLS = ["AAPL", "MSFT", "NVDA"]
 BASELINE_TRADING_DATES = 25
@@ -57,6 +59,7 @@ MONITOR_INTERVAL_SECONDS = 2.0
 CPU_HIGH_DELTA_SECONDS = 0.5
 PHASE_TIMEOUT_SECONDS = {
     "load_historical": 45 * 60,
+    "candidate_generation": 4 * 60 * 60,
     "daily_execution": 5 * 60,
     "write_artifacts": 2 * 60,
 }
@@ -506,6 +509,180 @@ def _support_pair_payload(best_two: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _support_pair_path(output_root: Path) -> Path:
+    return output_root / SUPPORT_PAIR_FILENAME
+
+
+def _path_identity(path: Path) -> str:
+    return str(path.resolve()).replace("/", "\\").lower()
+
+
+def _locked_pair_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "selected_best1_source_run_label": str(payload.get("selected_best1_source_run_label") or ""),
+        "selected_best2_source_run_label": str(payload.get("selected_best2_source_run_label") or ""),
+        "selected_best1_support_fingerprint": str(payload.get("selected_best1_support_fingerprint") or ""),
+        "selected_best2_support_fingerprint": str(payload.get("selected_best2_support_fingerprint") or ""),
+        "best1_support_metadata": _support_metadata(payload.get("best1_support_metadata")),
+        "best2_support_metadata": _support_metadata(payload.get("best2_support_metadata")),
+        "pair_distinct": bool(payload.get("pair_distinct")),
+    }
+
+
+def _resolve_or_lock_support_pair(*, output_root: Path, tiny_root: Path) -> dict[str, Any]:
+    pair_path = _support_pair_path(output_root)
+    normalized_tiny_root = str(tiny_root.resolve())
+    if pair_path.exists():
+        payload = _read_json(pair_path)
+        locked_tiny_root = Path(str(payload.get("tiny_root") or normalized_tiny_root))
+        if _path_identity(locked_tiny_root) != _path_identity(tiny_root):
+            raise RuntimeError(
+                f"Output root already locked to tiny root {locked_tiny_root.resolve()}, "
+                f"cannot reuse with {tiny_root.resolve()}"
+            )
+        locked_payload = _locked_pair_payload(payload)
+        if not locked_payload["selected_best1_source_run_label"] or not locked_payload["selected_best2_source_run_label"]:
+            raise RuntimeError(f"Support pair lock is incomplete: {pair_path}")
+        return {
+            **locked_payload,
+            "tiny_root": normalized_tiny_root,
+            "support_pair_lock_path": str(pair_path.resolve()),
+            "source": "locked_pair",
+        }
+    tiny_rows = _load_tiny_rows(tiny_root)
+    best_two = _pick_best_two_allowed(tiny_rows)
+    if len(best_two) < 2:
+        distinct = sorted({str(row.get("support_fingerprint") or "") for row in tiny_rows if _is_allowed_tiny_candidate(row)})
+        raise RuntimeError(f"Expected 2 distinct support fingerprints from allowed tiny rows, found {len(distinct)} distinct fingerprint(s)")
+    payload = _support_pair_payload(best_two)
+    payload.update({
+        "tiny_root": normalized_tiny_root,
+        "support_pair_lock_path": str(pair_path.resolve()),
+        "selected_best1_source_summary_path": str(best_two[0].get("summary_path") or ""),
+        "selected_best2_source_summary_path": str(best_two[1].get("summary_path") or ""),
+        "source": "fresh_selection",
+    })
+    _write_json(pair_path, payload)
+    return payload
+
+
+def _load_run_summary(output_root: Path, run_label: str) -> dict[str, Any]:
+    summary_path = output_root / run_label / "summary.json"
+    return _read_json(summary_path) if summary_path.exists() else {}
+
+
+def _collect_medium_run_summaries(output_root: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for run_label in RUN_LABEL_ORDER:
+        summary = _load_run_summary(output_root, run_label)
+        if summary:
+            rows.append(summary)
+    return rows
+
+
+def _load_baseline_contract_summary(output_root: Path) -> dict[str, Any] | None:
+    summary_path = output_root / "baseline_summary.json"
+    return _read_json(summary_path) if summary_path.exists() else None
+
+
+def _build_diagnosis_lines(*, output_root: Path, tiny_root: Path, pair_payload: dict[str, Any], medium_rows: list[dict[str, Any]], baseline_summary: dict[str, Any] | None, verdict: str, verdict_basis: str, holdout_summary: dict[str, Any] | None) -> list[str]:
+    lines = [
+        "# Medium viability check",
+        "",
+        f"- Output root: `{output_root}`",
+        f"- Tiny root: `{tiny_root.resolve()}`",
+        f"- Support pair lock: `{pair_payload.get('support_pair_lock_path')}`",
+        f"- scripts/medium_viability_check.py tracked on public branch: yes",
+        f"- CLI selective support: `--run-labels` and `--only`",
+        f"- Baseline run completed: `{baseline_summary.get('baseline_run_completed') if baseline_summary else 'not_requested'}`",
+        f"- Baseline contract gate passed: `{baseline_summary.get('baseline_contract_gate_passed') if baseline_summary else 'not_requested'}`",
+        f"- best1 source: `{pair_payload['selected_best1_source_run_label']}` / fingerprint=`{pair_payload['selected_best1_support_fingerprint']}` -> {json.dumps(pair_payload['best1_support_metadata'], ensure_ascii=False)}",
+        f"- best2 source: `{pair_payload['selected_best2_source_run_label']}` / fingerprint=`{pair_payload['selected_best2_support_fingerprint']}` -> {json.dumps(pair_payload['best2_support_metadata'], ensure_ascii=False)}",
+        f"- pair_distinct: `{pair_payload['pair_distinct']}`",
+        "",
+        "## Runs",
+    ]
+    for row in medium_rows:
+        lines.append(
+            f"- {row['run_label']}: candidates={row.get('candidate_count', 0)}, fills={row.get('fills_count', 0)}, trades={row.get('trades_count', 0)}, authoritative={row.get('authoritative')}, verdict_eligible={row.get('verdict_eligible')}, exclusion_reasons={json.dumps(row.get('exclusion_reasons') or [], ensure_ascii=False)}, result=`{row.get('result_path')}`"
+        )
+    lines.append("")
+    lines.append(f"## Verdict\n- **{verdict}**")
+    lines.append(f"- basis: {verdict_basis}")
+    if holdout_summary:
+        lines.extend(["", "## Holdout", "- executed: yes", f"- holdout: candidates={holdout_summary.get('candidate_count', 0)}, fills={holdout_summary.get('fills_count', 0)}, trades={holdout_summary.get('trades_count', 0)}, result=`{holdout_summary.get('result_path')}`"])
+    else:
+        lines.extend(["", "## Holdout", "- executed: no"])
+    return lines
+
+
+def _default_pair_payload(output_root: Path) -> dict[str, Any]:
+    return {
+        "selected_best1_source_run_label": "",
+        "selected_best2_source_run_label": "",
+        "selected_best1_support_fingerprint": "",
+        "selected_best2_support_fingerprint": "",
+        "best1_support_metadata": {},
+        "best2_support_metadata": {},
+        "pair_distinct": False,
+        "support_pair_lock_path": str(_support_pair_path(output_root).resolve()),
+    }
+
+
+def _rebuild_medium_root_outputs(*, output_root: Path, tiny_root: Path, driver: dict[str, Any], preflight: dict[str, Any], baseline_summary: dict[str, Any] | None, pair_payload: dict[str, Any] | None) -> dict[str, Any]:
+    medium_rows = _collect_medium_run_summaries(output_root)
+    persisted_baseline_summary = baseline_summary or _load_baseline_contract_summary(output_root)
+    effective_pair_payload = dict(_default_pair_payload(output_root))
+    effective_pair_payload.update(_locked_pair_payload(pair_payload or {}))
+    if pair_payload and pair_payload.get("support_pair_lock_path"):
+        effective_pair_payload["support_pair_lock_path"] = str(pair_payload["support_pair_lock_path"])
+    best_runs = [row for row in medium_rows if str(row.get("run_label")) in {"best1", "best2"}]
+    eligible_best_runs = [row for row in best_runs if row.get("verdict_eligible")]
+    holdout_summary = next((row for row in medium_rows if str(row.get("run_label")) == "holdout"), None)
+    if not best_runs:
+        viable = None
+        verdict = "best runs not requested"
+        verdict_basis = "best1/best2 were not requested, so medium verdict was not evaluated."
+    elif not eligible_best_runs:
+        viable = None
+        verdict = "authoritative rerun required"
+        verdict_basis = "best1/best2 completed without any verdict-eligible authoritative runs."
+    else:
+        viable = any(int(row.get("candidate_count", 0)) > 0 and int(row.get("fills_count", 0)) > 0 and int(row.get("trades_count", 0)) > 0 for row in eligible_best_runs)
+        verdict = "TOBE v1 viable" if viable else "current TOBE v1 fails"
+        verdict_basis = f"evaluated {len(eligible_best_runs)} authoritative run(s) after excluding non-authoritative or metadata-misaligned runs."
+    summary_payload = {
+        "output_root": str(output_root),
+        "tiny_root": str(tiny_root.resolve()),
+        "driver": driver,
+        "preflight": preflight,
+        "baseline_contract": persisted_baseline_summary,
+        **effective_pair_payload,
+        "support_pair_lock_path": str(_support_pair_path(output_root).resolve()),
+        "medium_runs": medium_rows,
+        "eligible_medium_run_labels": [row.get("run_label") for row in eligible_best_runs],
+        "verdict": verdict,
+        "verdict_basis": verdict_basis,
+        "viable": viable,
+        "holdout_executed": bool(holdout_summary),
+        "holdout_summary": holdout_summary,
+    }
+    _write_csv_simple(output_root / "medium_viability_summary.csv", medium_rows, SUMMARY_COLS)
+    _write_json(output_root / "medium_viability_summary.json", summary_payload)
+    diagnosis_lines = _build_diagnosis_lines(
+        output_root=output_root,
+        tiny_root=tiny_root,
+        pair_payload=effective_pair_payload,
+        medium_rows=medium_rows,
+        baseline_summary=persisted_baseline_summary,
+        verdict=verdict,
+        verdict_basis=verdict_basis,
+        holdout_summary=holdout_summary,
+    )
+    (output_root / "diagnosis.md").write_text("\n".join(diagnosis_lines) + "\n", encoding="utf-8")
+    return summary_payload
+
+
 def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, Any], scenario: BacktestScenario, *, result_path: str | None = None) -> dict[str, Any]:
     signal_diagnostics = _saved_signal_diagnostics(result)
     portfolio = _saved_portfolio_payload(result)
@@ -757,7 +934,7 @@ def _monitor_child(run_dir: Path, proc: subprocess.Popen[str]) -> dict[str, Any]
                     last_cpu_total = cpu_total
                     last_metrics = {"cpu_delta": cpu_delta, "rss": int(p.memory_info().rss), "cwd": p.cwd(), "cmdline": p.cmdline()}
                     monitor.update(last_metrics)
-                    if phase == "load_historical" and cpu_delta is not None and cpu_delta > 0:
+                    if phase in {"load_historical", "candidate_generation"} and cpu_delta is not None and cpu_delta > 0:
                         monitor["activity"] = "ACTIVE_COMPUTE"
             except Exception:
                 monitor.update(last_metrics)
@@ -1012,6 +1189,7 @@ def _main_parent(args: argparse.Namespace) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
     _emit_execution_start(output_root)
     requested = _resolve_requested_labels(args)
+    tiny_root = Path(args.tiny_root).resolve()
     baseline_summary = None
     if "baseline" in requested:
         baseline_summary = _run_baseline_parent(output_root)
@@ -1023,93 +1201,37 @@ def _main_parent(args: argparse.Namespace) -> int:
     preflight = preflight_local_db(UNIVERSE)
     discovery = _scenario_from_window("medium_viability_discovery_20260328", preflight["discovery_start"], preflight["discovery_end"], list(UNIVERSE))
     holdout = _scenario_from_window("medium_viability_holdout_20260328", preflight["holdout_start"], preflight["holdout_end"], list(UNIVERSE))
-    tiny_rows = _load_tiny_rows(Path(args.tiny_root).resolve())
-    best_two = _pick_best_two_allowed(tiny_rows)
-    if len(best_two) < 2:
-        distinct = sorted({str(row.get("support_fingerprint") or "") for row in tiny_rows if _is_allowed_tiny_candidate(row)})
-        raise RuntimeError(f"Expected 2 distinct support fingerprints from allowed tiny rows, found {len(distinct)} distinct fingerprint(s)")
-    pair_payload = _support_pair_payload(best_two)
-    medium_rows: list[dict[str, Any]] = []
-    baseline_medium_summary = None
+    pair_payload = None
+    if set(requested) & {"best1", "best2", "holdout"}:
+        pair_payload = _resolve_or_lock_support_pair(output_root=output_root, tiny_root=tiny_root)
     if "baseline" in requested:
-        baseline_medium_summary = _run_medium_case(output_root, "baseline", discovery, {}, preflight, driver)
-        medium_rows.append(baseline_medium_summary)
-    best1_meta = dict(pair_payload["best1_support_metadata"])
-    best2_meta = dict(pair_payload["best2_support_metadata"])
-    best1_fingerprint = str(pair_payload["selected_best1_support_fingerprint"])
-    best2_fingerprint = str(pair_payload["selected_best2_support_fingerprint"])
-    pair_distinct = bool(pair_payload["pair_distinct"])
-    best1_summary = None
-    best2_summary = None
+        _run_medium_case(output_root, "baseline", discovery, {}, preflight, driver)
     if "best1" in requested:
-        best1_summary = _run_medium_case(output_root, "best1", discovery, best1_meta, preflight, driver)
-        medium_rows.append(best1_summary)
+        assert pair_payload is not None
+        _run_medium_case(output_root, "best1", discovery, dict(pair_payload["best1_support_metadata"]), preflight, driver)
     if "best2" in requested:
-        best2_summary = _run_medium_case(output_root, "best2", discovery, best2_meta, preflight, driver)
-        medium_rows.append(best2_summary)
-    best_runs = [r for r in [best1_summary, best2_summary] if r is not None]
-    eligible_best_runs = [r for r in best_runs if r.get("verdict_eligible")]
-    if not best_runs:
-        viable = None
-        verdict = "best runs not requested"
-        verdict_basis = "best1/best2 were not requested, so medium verdict was not evaluated."
-    elif not eligible_best_runs:
-        viable = None
-        verdict = "authoritative rerun required"
-        verdict_basis = "best1/best2 completed without any verdict-eligible authoritative runs."
-    else:
+        assert pair_payload is not None
+        _run_medium_case(output_root, "best2", discovery, dict(pair_payload["best2_support_metadata"]), preflight, driver)
+    if "holdout" in requested:
+        existing_best_runs = [row for row in _collect_medium_run_summaries(output_root) if str(row.get("run_label")) in {"best1", "best2"}]
+        eligible_best_runs = [row for row in existing_best_runs if row.get("verdict_eligible")]
+        if not eligible_best_runs:
+            raise RuntimeError("Holdout requested but no verdict-eligible best1/best2 summaries exist in output root")
         viable = any(int(r.get("candidate_count", 0)) > 0 and int(r.get("fills_count", 0)) > 0 and int(r.get("trades_count", 0)) > 0 for r in eligible_best_runs)
-        verdict = "TOBE v1 viable" if viable else "current TOBE v1 fails"
-        verdict_basis = f"evaluated {len(eligible_best_runs)} authoritative run(s) after excluding non-authoritative or metadata-misaligned runs."
-    holdout_summary = None
-    if viable is True and "holdout" in requested:
+        if not viable:
+            raise RuntimeError("Holdout requested but best1/best2 do not satisfy viability gate")
         winner = sorted(eligible_best_runs, key=_rank_key, reverse=True)[0]
         winner_meta = {k: v for k, v in (winner.get("metadata") or {}).items() if k in ALLOWED_SUPPORT_KEYS}
-        holdout_summary = _run_medium_case(output_root, "holdout", holdout, winner_meta, preflight, driver)
-    summary_payload = {
-        "output_root": str(output_root),
-        "tiny_root": str(Path(args.tiny_root).resolve()),
-        "driver": driver,
-        "preflight": preflight,
-        "baseline_contract": baseline_summary,
-        **pair_payload,
-        "medium_runs": medium_rows,
-        "eligible_medium_run_labels": [r.get("run_label") for r in eligible_best_runs],
-        "verdict": verdict,
-        "verdict_basis": verdict_basis,
-        "viable": viable,
-        "holdout_executed": bool(holdout_summary),
-        "holdout_summary": holdout_summary,
-    }
-    _write_csv_simple(output_root / "medium_viability_summary.csv", medium_rows, SUMMARY_COLS)
-    _write_json(output_root / "medium_viability_summary.json", summary_payload)
-    diagnosis_lines = [
-        "# Medium viability check",
-        "",
-        f"- Output root: `{output_root}`",
-        f"- Tiny root: `{Path(args.tiny_root).resolve()}`",
-        f"- scripts/medium_viability_check.py tracked on public branch: yes",
-        f"- CLI selective support: `--run-labels` and `--only`",
-        f"- Baseline run completed: `{baseline_summary.get('baseline_run_completed') if baseline_summary else 'not_requested'}`",
-        f"- Baseline contract gate passed: `{baseline_summary.get('baseline_contract_gate_passed') if baseline_summary else 'not_requested'}`",
-        f"- best1 source: `{best_two[0]['run_label']}` / fingerprint=`{best1_fingerprint}` -> {json.dumps(best1_meta, ensure_ascii=False)}",
-        f"- best2 source: `{best_two[1]['run_label']}` / fingerprint=`{best2_fingerprint}` -> {json.dumps(best2_meta, ensure_ascii=False)}",
-        f"- pair_distinct: `{pair_distinct}`",
-        "",
-        "## Runs",
-    ]
-    for row in medium_rows:
-        diagnosis_lines.append(
-            f"- {row['run_label']}: candidates={row['candidate_count']}, fills={row['fills_count']}, trades={row['trades_count']}, authoritative={row.get('authoritative')}, verdict_eligible={row.get('verdict_eligible')}, exclusion_reasons={json.dumps(row.get('exclusion_reasons') or [], ensure_ascii=False)}, result=`{row['result_path']}`"
-        )
-    diagnosis_lines.append("")
-    diagnosis_lines.append(f"## Verdict\n- **{verdict}**")
-    diagnosis_lines.append(f"- basis: {verdict_basis}")
-    if holdout_summary:
-        diagnosis_lines.extend(["", "## Holdout", "- executed: yes", f"- holdout: candidates={holdout_summary['candidate_count']}, fills={holdout_summary['fills_count']}, trades={holdout_summary['trades_count']}, result=`{holdout_summary['result_path']}`"])
-    else:
-        diagnosis_lines.extend(["", "## Holdout", "- executed: no"])
-    (output_root / "diagnosis.md").write_text("\n".join(diagnosis_lines) + "\n", encoding="utf-8")
+        _run_medium_case(output_root, "holdout", holdout, winner_meta, preflight, driver)
+    locked_pair = pair_payload
+    summary_payload = _rebuild_medium_root_outputs(
+        output_root=output_root,
+        tiny_root=tiny_root,
+        driver=driver,
+        preflight=preflight,
+        baseline_summary=baseline_summary,
+        pair_payload=locked_pair,
+    )
     print(json.dumps(summary_payload, ensure_ascii=False, indent=2, default=_json_default))
     return 0
 

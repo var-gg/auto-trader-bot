@@ -206,3 +206,23 @@ def test_generate_similarity_candidates_rolling_records_runtime_support_metadata
     panel = diagnostics["signal_panel"]
     assert panel
     assert all((((row.get("decision_surface") or {}).get("gate_ablation") or {}).get("diagnostic_disable_ess_gate")) is True for row in panel)
+
+
+def test_generate_similarity_candidates_rolling_emits_candidate_generation_progress_phase():
+    bars = [HistoricalBar(symbol="AAA", timestamp=f"2025-11-{((i - 1) % 28) + 1:02d}" if i <= 28 else (f"2025-12-{((i - 29) % 28) + 1:02d}" if i <= 56 else f"2026-01-{((i - 57) % 28) + 1:02d}"), open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1_000_000 + i * 1000) for i in range(1, 85)]
+    progress_updates = []
+    generate_similarity_candidates_rolling(
+        bars_by_symbol={"AAA": bars},
+        market="US",
+        macro_history_by_date=_macro_history_for_bars(bars),
+        sector_map={},
+        top_k=3,
+        abstain_margin=0.01,
+        spec=ResearchExperimentSpec(feature_window_bars=20, horizon_days=3, target_return_pct=0.02, stop_return_pct=0.02),
+        metadata={"top_k": "5"},
+        progress_callback=progress_updates.append,
+    )
+
+    phases = {str(update.get("phase")) for update in progress_updates}
+    assert "candidate_generation" in phases
+    assert "load_historical" not in phases

@@ -10,6 +10,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER_PATH = ROOT / "scripts" / "medium_viability_check.py"
+SUPPORT_PAIR_FILENAME = "selected_support_pair.json"
 ALLOWED_SUPPORT_KEYS = {
     "kernel_temperature",
     "top_k",
@@ -88,6 +89,10 @@ def _load_optional_json(path: Path) -> dict[str, Any]:
     return _read_json(path) if path.exists() else {}
 
 
+def _load_selected_support_pair(medium_root: Path) -> dict[str, Any]:
+    return _load_optional_json(medium_root / SUPPORT_PAIR_FILENAME)
+
+
 def _resolve_metadata_application(summary_payload: dict[str, Any], medium_row: dict[str, Any]) -> dict[str, Any]:
     metadata_application = summary_payload.get("metadata_application")
     if isinstance(metadata_application, dict):
@@ -128,12 +133,17 @@ def _run_contract_presence(summary_payload: dict[str, Any], medium_row: dict[str
     }
 
 
-def _selected_support_from_medium_summary(summary_payload: dict[str, Any], prefix: str) -> dict[str, str]:
-    return _support_metadata(summary_payload.get(f"{prefix}_support_metadata"))
+def _selected_support_metadata(summary_payload: dict[str, Any], pair_payload: dict[str, Any], prefix: str) -> dict[str, str]:
+    summary_value = _support_metadata(summary_payload.get(f"{prefix}_support_metadata"))
+    if summary_value:
+        return summary_value
+    return _support_metadata(pair_payload.get(f"{prefix}_support_metadata"))
 
 
-def _selected_source_label(summary_payload: dict[str, Any], prefix: str) -> str | None:
+def _selected_source_label(summary_payload: dict[str, Any], pair_payload: dict[str, Any], prefix: str) -> str | None:
     value = summary_payload.get(f"selected_{prefix}_source_run_label")
+    if value is None:
+        value = pair_payload.get(f"selected_{prefix}_source_run_label")
     return str(value) if value is not None else None
 
 
@@ -151,6 +161,7 @@ def build_audit(*, tiny_root: Path, medium_root: Path, strict_policy: str) -> di
 
     medium_summary_path = medium_root / "medium_viability_summary.json"
     medium_summary = _load_optional_json(medium_summary_path)
+    selected_support_pair = _load_selected_support_pair(medium_root)
     best1_summary_path = medium_root / "best1" / "summary.json"
     best2_summary_path = medium_root / "best2" / "summary.json"
     best1_manifest_path = medium_root / "best1" / "manifest.json"
@@ -171,10 +182,10 @@ def build_audit(*, tiny_root: Path, medium_root: Path, strict_policy: str) -> di
     best2_verdict_eligible = _resolve_scalar(best2_summary, best2_medium_row, "verdict_eligible")
     best1_exclusion_reasons = list(_resolve_scalar(best1_summary, best1_medium_row, "exclusion_reasons") or [])
     best2_exclusion_reasons = list(_resolve_scalar(best2_summary, best2_medium_row, "exclusion_reasons") or [])
-    selected_best1_source_run_label = _selected_source_label(medium_summary, "best1")
-    selected_best2_source_run_label = _selected_source_label(medium_summary, "best2")
-    best1_support_metadata = _selected_support_from_medium_summary(medium_summary, "best1")
-    best2_support_metadata = _selected_support_from_medium_summary(medium_summary, "best2")
+    selected_best1_source_run_label = _selected_source_label(medium_summary, selected_support_pair, "best1")
+    selected_best2_source_run_label = _selected_source_label(medium_summary, selected_support_pair, "best2")
+    best1_support_metadata = _selected_support_metadata(medium_summary, selected_support_pair, "best1")
+    best2_support_metadata = _selected_support_metadata(medium_summary, selected_support_pair, "best2")
     tiny_rows = _load_tiny_rows(tiny_root)
     tiny_best1 = dict(tiny_rows.get(selected_best1_source_run_label or "") or {})
     tiny_best2 = dict(tiny_rows.get(selected_best2_source_run_label or "") or {})
@@ -274,6 +285,7 @@ def build_audit(*, tiny_root: Path, medium_root: Path, strict_policy: str) -> di
         "best1_manifest_support_metadata": _support_metadata(best1_manifest.get("metadata")),
         "best2_manifest_support_metadata": _support_metadata(best2_manifest.get("metadata")),
         "medium_viability_summary_path": str(medium_summary_path.resolve()),
+        "selected_support_pair_path": str((medium_root / SUPPORT_PAIR_FILENAME).resolve()),
     }
 
 
