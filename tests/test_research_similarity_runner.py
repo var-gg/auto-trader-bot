@@ -3,7 +3,9 @@ from datetime import date, datetime
 from backtest_app.configs.models import ResearchExperimentSpec
 from backtest_app.historical_data.models import HistoricalBar, HistoricalSlice
 from backtest_app.research.artifacts import JsonResearchArtifactStore
-from backtest_app.research.pipeline import build_event_memory_asof, generate_similarity_candidates
+import pytest
+
+from backtest_app.research.pipeline import build_event_memory_asof, build_query_embedding, generate_similarity_candidates, generate_similarity_candidates_rolling
 from backtest_app.runner import cli
 from shared.domain.models import MarketCode, MarketSnapshot, OutcomeLabel, Side, SignalCandidate
 
@@ -101,3 +103,106 @@ def test_build_event_memory_asof_is_reproducible_and_leak_free(tmp_path):
     assert loaded is not None
     assert loaded["spec_hash"] == spec.spec_hash()
     assert loaded["as_of_date"] == "2025-11-25"
+
+
+def _macro_history_sample():
+    return {
+        "2025-11-01": {"vix": 18.0, "rate": 4.00, "dollar": 100.0, "oil": 70.0, "breadth": 0.10},
+        "2025-11-02": {"vix": 19.0, "rate": 4.05, "dollar": 100.5, "oil": 71.0, "breadth": 0.20},
+        "2025-11-03": {"vix": 21.0, "rate": 4.10, "dollar": 101.0, "oil": 72.0, "breadth": 0.30},
+        "2025-11-04": {"vix": 20.0, "rate": 4.20, "dollar": 100.8, "oil": 73.0, "breadth": 0.25},
+        "2025-11-05": {"vix": 22.0, "rate": 4.15, "dollar": 101.2, "oil": 74.0, "breadth": 0.35},
+        "2025-11-06": {"vix": 23.0, "rate": 4.18, "dollar": 101.4, "oil": 75.0, "breadth": 0.40},
+        "2025-11-07": {"vix": 24.0, "rate": 4.22, "dollar": 101.8, "oil": 76.0, "breadth": 0.45},
+        "2025-11-08": {"vix": 25.0, "rate": 4.25, "dollar": 102.0, "oil": 77.0, "breadth": 0.50},
+        "2025-11-09": {"vix": 26.0, "rate": 4.30, "dollar": 102.5, "oil": 78.0, "breadth": 0.55},
+        "2025-11-10": {"vix": 27.0, "rate": 4.35, "dollar": 103.0, "oil": 79.0, "breadth": 0.60},
+    }
+
+
+def _macro_history_for_bars(bars):
+    out = {}
+    for idx, bar in enumerate(bars, start=1):
+        key = str(bar.timestamp)[:10]
+        out[key] = {
+            "vix": 18.0 + idx * 0.2,
+            "rate": 4.0 + idx * 0.01,
+            "dollar": 100.0 + idx * 0.15,
+            "oil": 70.0 + idx * 0.25,
+            "breadth": -0.1 + idx * 0.03,
+        }
+    return out
+
+
+def test_event_and_query_use_identical_feature_contract_for_same_date():
+    spec = ResearchExperimentSpec(feature_window_bars=5, horizon_days=2, target_return_pct=0.02, stop_return_pct=0.02)
+    bars = [HistoricalBar(symbol="AAA", timestamp=f"2025-11-{i:02d}", open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1_000_000 + i * 1000) for i in range(1, 15)]
+    bars_by_symbol = {"AAA": bars}
+    macro_history = _macro_history_sample()
+    memory = build_event_memory_asof(decision_date="2025-11-12", spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history, sector_map={}, market="US")
+    target = next(r for r in memory["event_records"] if r.event_date == "2025-11-09")
+    query_idx = next(i for i, bar in enumerate(bars) if str(bar.timestamp)[:10] == "2025-11-09")
+    query_embedding, meta = build_query_embedding(symbol="AAA", bars=bars[query_idx - spec.feature_window_bars + 1: query_idx + 1], bars_by_symbol=bars_by_symbol, macro_history={k: v for k, v in macro_history.items() if k <= "2025-11-09"}, sector_map={}, cutoff_date="2025-11-09", spec=spec, transform=memory["transform"])
+    assert memory["transform"] is not None
+    assert target.diagnostics["transform_version"] == meta["transform_version"]
+    assert target.diagnostics["raw_features"] == meta["raw_features"]
+    assert target.diagnostics["transformed_features"] == meta["transformed_features"]
+    assert target.diagnostics["embedding"] == query_embedding
+    matching_prototype = next(p for p in memory["prototypes"] if p.representative_date == target.event_date)
+    assert matching_prototype.embedding == target.diagnostics["embedding"]
+    assert matching_prototype.metadata["transformed_features"] == target.diagnostics["transformed_features"]
+
+
+def test_build_event_memory_uses_transform_scaler_alias():
+    spec = ResearchExperimentSpec(feature_window_bars=5, horizon_days=2, target_return_pct=0.02, stop_return_pct=0.02)
+    bars = [HistoricalBar(symbol="AAA", timestamp=f"2025-11-{i:02d}", open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1_000_000 + i * 1000) for i in range(1, 15)]
+    memory = build_event_memory_asof(decision_date="2025-11-12", spec=spec, bars_by_symbol={"AAA": bars}, macro_history_by_date=_macro_history_sample(), sector_map={}, market="US")
+    assert memory["transform"] is not None
+    assert memory["scaler"] is memory["transform"].scaler
+
+
+def test_single_day_macro_history_contract_collapse_is_detected():
+    spec = ResearchExperimentSpec(feature_window_bars=5, horizon_days=2, target_return_pct=0.02, stop_return_pct=0.02)
+    bars = [HistoricalBar(symbol="AAA", timestamp=f"2025-11-{i:02d}", open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1_000_000 + i * 1000) for i in range(1, 15)]
+    bars_by_symbol = {"AAA": bars}
+    macro_history = _macro_history_sample()
+    memory = build_event_memory_asof(decision_date="2025-11-12", spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history, sector_map={}, market="US")
+    target = next(r for r in memory["event_records"] if r.event_date == "2025-11-09")
+    query_idx = next(i for i, bar in enumerate(bars) if str(bar.timestamp)[:10] == "2025-11-09")
+    assert target.diagnostics["raw_features"]["vix_change_5"] != 0.0
+    assert target.diagnostics["raw_features"]["vix_zscore_20"] != 0.0
+    with pytest.raises(AssertionError, match="single-day macro history collapses context semantics"):
+        build_query_embedding(symbol="AAA", bars=bars[query_idx - spec.feature_window_bars + 1: query_idx + 1], bars_by_symbol=bars_by_symbol, macro_history={"2025-11-09": macro_history["2025-11-09"]}, sector_map={}, cutoff_date="2025-11-09", spec=spec, transform=memory["transform"])
+
+
+def test_generate_similarity_candidates_rolling_records_runtime_support_metadata():
+    bars = [HistoricalBar(symbol="AAA", timestamp=f"2025-11-{((i - 1) % 28) + 1:02d}" if i <= 28 else (f"2025-12-{((i - 29) % 28) + 1:02d}" if i <= 56 else f"2026-01-{((i - 57) % 28) + 1:02d}"), open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1_000_000 + i * 1000) for i in range(1, 85)]
+    bars_by_symbol = {"AAA": bars}
+    macro_history = _macro_history_for_bars(bars)
+    spec = ResearchExperimentSpec(feature_window_bars=20, horizon_days=3, target_return_pct=0.02, stop_return_pct=0.02)
+    _candidates, diagnostics = generate_similarity_candidates_rolling(
+        bars_by_symbol=bars_by_symbol,
+        market="US",
+        macro_history_by_date=macro_history,
+        sector_map={},
+        top_k=3,
+        abstain_margin=0.01,
+        spec=spec,
+        metadata={
+            "top_k": "5",
+            "kernel_temperature": "8.0",
+            "use_kernel_weighting": "false",
+            "min_effective_sample_size": "2.5",
+            "diagnostic_disable_ess_gate": "true",
+        },
+    )
+    pipeline = diagnostics["pipeline"]
+    assert pipeline["top_k"] == 5
+    assert pipeline["top_k_requested"] == 3
+    assert pipeline["ev_config"]["kernel_temperature"] == 8.0
+    assert pipeline["ev_config"]["use_kernel_weighting"] is False
+    assert pipeline["ev_config"]["min_effective_sample_size"] == 2.5
+    assert pipeline["ev_config"]["diagnostic_disable_ess_gate"] is True
+    panel = diagnostics["signal_panel"]
+    assert panel
+    assert all((((row.get("decision_surface") or {}).get("gate_ablation") or {}).get("diagnostic_disable_ess_gate")) is True for row in panel)

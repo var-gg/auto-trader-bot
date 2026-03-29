@@ -8,7 +8,13 @@ from time import perf_counter
 from typing import Dict, List, Tuple
 
 from backtest_app.configs.models import ResearchExperimentSpec
-from backtest_app.historical_data.features import build_multiscale_feature_vector, compute_bar_features, fit_feature_scaler
+from backtest_app.historical_data.features import (
+    build_multiscale_feature_vector,
+    build_raw_multiscale_feature_payload,
+    compute_bar_features,
+    fit_feature_scaler,
+    fit_feature_transform,
+)
 from backtest_app.historical_data.models import HistoricalBar
 from backtest_app.portfolio import PortfolioConfig, PortfolioState, build_portfolio_decisions
 from backtest_app.quote_policy import QuotePolicyConfig, compare_policy_ab
@@ -25,6 +31,12 @@ from .repository import ExactCosineCandidateIndex, load_prototypes_asof
 from .scoring import CalibrationModel, CandidateScore, EVConfig, ScoringConfig, build_decision_surface, estimate_expected_value, score_candidates_exact
 
 DECISION_CONVENTION = "EOD_T_SIGNAL__T1_OPEN_EXECUTION"
+
+
+def _feature_flag(name: str, metadata: dict | None, default: bool = False) -> bool:
+    meta = metadata or {}
+    value = meta.get(name, default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"} if isinstance(value, str) else bool(value)
 
 
 def _ev_config_from_metadata(metadata: dict | None = None, *, top_k: int = 3, abstain_margin: float | None = None) -> EVConfig:
@@ -88,11 +100,36 @@ def _sector_proxy_bars(symbol: str, bars_by_symbol: Dict[str, List[HistoricalBar
     return _market_proxy_bars(peers or {symbol: bars_by_symbol.get(symbol, [])}, cutoff_date=cutoff_date)
 
 
-def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history: Dict[str, Dict[str, float]], sector_map: Dict[str, str], cutoff_date: str | None, spec: ResearchExperimentSpec | None = None, scaler=None) -> tuple[list[float], dict]:
+def _assert_similarity_macro_history_contract(macro_history: Dict[str, Dict[str, float]] | None) -> None:
+    if not macro_history:
+        return
+    populated_dates = [payload for payload in macro_history.values() if payload]
+    if len(populated_dates) <= 1:
+        raise AssertionError("single-day macro history collapses context semantics")
+
+
+def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history: Dict[str, Dict[str, float]], sector_map: Dict[str, str], cutoff_date: str | None, spec: ResearchExperimentSpec | None = None, scaler=None, transform=None, use_macro_level_in_similarity: bool = False, use_dollar_volume_absolute: bool = False) -> tuple[list[float], dict]:
+    _assert_similarity_macro_history_contract(macro_history)
     sector_code = sector_map.get(symbol)
     shape_horizons = list((spec.lookback_horizons if spec and spec.lookback_horizons else [spec.horizon_days] if spec else []) or [])
-    fv = build_multiscale_feature_vector(symbol=symbol, bars=bars, market_bars=_market_proxy_bars(bars_by_symbol, cutoff_date=cutoff_date), sector_bars=_sector_proxy_bars(symbol, bars_by_symbol, sector_map, cutoff_date=cutoff_date), macro_history=macro_history, sector_code=sector_code, scaler=scaler, shape_horizons=shape_horizons)
-    return fv.embedding, {"shape_features": fv.shape_features, "residual_features": fv.residual_features, "context_features": fv.context_features, "shape_vector": fv.shape_vector, "ctx_vector": fv.ctx_vector, **fv.metadata}
+    resolved_scaler = scaler or (transform.scaler if transform is not None else None)
+    fv = build_multiscale_feature_vector(symbol=symbol, bars=bars, market_bars=_market_proxy_bars(bars_by_symbol, cutoff_date=cutoff_date), sector_bars=_sector_proxy_bars(symbol, bars_by_symbol, sector_map, cutoff_date=cutoff_date), macro_history=macro_history, sector_code=sector_code, scaler=resolved_scaler, transform=transform, shape_horizons=shape_horizons, use_macro_level_in_similarity=use_macro_level_in_similarity, use_dollar_volume_absolute=use_dollar_volume_absolute)
+    return fv.embedding, {
+        "raw_shape_features": fv.raw_shape_features,
+        "raw_residual_features": fv.raw_residual_features,
+        "raw_context_features": fv.raw_context_features,
+        "raw_regime_context_features": fv.raw_regime_context_features,
+        "shape_features": fv.shape_features,
+        "residual_features": fv.residual_features,
+        "context_features": fv.context_features,
+        "regime_context_features": fv.regime_context_features,
+        "raw_features": fv.raw_features,
+        "transformed_features": fv.transformed_features,
+        "shape_vector": fv.shape_vector,
+        "ctx_vector": fv.ctx_vector,
+        "transform_version": fv.metadata.get("transform_version"),
+        **fv.metadata,
+    }
 
 
 def _topk(scores: List[CandidateScore], k: int) -> List[dict]:
@@ -149,13 +186,20 @@ def _label_cfg(spec: ResearchExperimentSpec) -> EventLabelingConfig:
     return EventLabelingConfig(target_return_pct=spec.target_return_pct, stop_return_pct=spec.stop_return_pct, horizon_days=spec.horizon_days, fee_bps=spec.fee_bps, slippage_bps=spec.slippage_bps, flat_return_band_pct=spec.flat_return_band_pct)
 
 
-def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, lookback_bars: int = 5) -> dict:
+def _macro_history_until(macro_history_by_date: Dict[str, Dict[str, float]], feature_end_date: str) -> Dict[str, Dict[str, float]]:
+    return {k: dict(v) for k, v in sorted(macro_history_by_date.items()) if k <= feature_end_date}
+
+
+def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, lookback_bars: int = 5, metadata: dict | None = None) -> dict:
     min_required_bars = max(lookback_bars, spec.feature_window_bars)
     label_cfg = _label_cfg(spec)
+    use_macro_level_in_similarity = _feature_flag("use_macro_level_in_similarity", metadata, default=False)
+    use_dollar_volume_absolute = _feature_flag("use_dollar_volume_absolute", metadata, default=False)
     event_records: List[EventOutcomeRecord] = []
     anchor_library: List[ResearchAnchor] = []
-    anchor_feature_rows: List[dict] = []
+    raw_event_rows: List[dict] = []
     excluded_reasons: list[dict] = []
+    pending_records: list[dict] = []
     for lib_symbol, lib_bars in bars_by_symbol.items():
         if len(lib_bars) < min_required_bars + spec.horizon_days + 2:
             excluded_reasons.append({"symbol": lib_symbol, "reason": "insufficient_bars"})
@@ -170,22 +214,86 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 break
             history_window = lib_bars[j - spec.feature_window_bars + 1 : j + 1]
             future_window = lib_bars[j + 1 : j + 1 + spec.horizon_days]
+            macro_window = _macro_history_until(macro_history_by_date, feature_end_date)
             macro_payload = dict(macro_history_by_date.get(feature_end_date, {}))
             regime_code = _regime_from_macro(macro_payload)
             event = build_event_outcome_record(future_window, label_cfg)
-            raw_embedding, feature_meta = build_query_embedding(symbol=lib_symbol, bars=history_window, bars_by_symbol=bars_by_symbol, macro_history={feature_end_date: macro_payload}, sector_map=sector_map, cutoff_date=feature_end_date, spec=spec)
-            anchor_feature_rows.append({**feature_meta.get("shape_features", {}), **feature_meta.get("context_features", {})})
-            event_records.append(EventOutcomeRecord(symbol=lib_symbol, event_date=feature_end_date, outcome_end_date=outcome_end_date, schema_version=spec.label_version, path_summary={**event.path_summary, "path_label": event.path_label, "feature_end_date": feature_end_date, "embedding": raw_embedding}, side_outcomes=event.side_payload, diagnostics={**event.diagnostics, "decision_cutoff": decision_date, "feature_end_date": feature_end_date, "embedding": raw_embedding, "shape_vector": raw_embedding[:3], "ctx_vector": raw_embedding[3:], "regime_code": regime_code, "sector_code": lib_sector, "liquidity_score": max(0.0, min(1.0, compute_bar_features(history_window).get("volume_mean", 0.0) / 1_000_000.0)), "quality_score": float(event.quality_score)}))
-    scaler = fit_feature_scaler(anchor_feature_rows)
+            raw_payload = build_raw_multiscale_feature_payload(
+                symbol=lib_symbol,
+                bars=history_window,
+                market_bars=_market_proxy_bars(bars_by_symbol, cutoff_date=feature_end_date),
+                sector_bars=_sector_proxy_bars(lib_symbol, bars_by_symbol, sector_map, cutoff_date=feature_end_date),
+                macro_history=macro_window,
+                sector_code=lib_sector,
+                shape_horizons=list((spec.lookback_horizons if spec.lookback_horizons else [spec.horizon_days]) or []),
+                use_macro_level_in_similarity=use_macro_level_in_similarity,
+                use_dollar_volume_absolute=use_dollar_volume_absolute,
+            )
+            raw_event_rows.append(dict(raw_payload.raw_features))
+            pending_records.append({
+                "event": event,
+                "symbol": lib_symbol,
+                "feature_end_date": feature_end_date,
+                "outcome_end_date": outcome_end_date,
+                "lib_sector": lib_sector,
+                "regime_code": regime_code,
+                "history_window": history_window,
+                "raw_payload": raw_payload,
+            })
+    transform = fit_feature_transform(raw_event_rows)
+    scaler = transform.scaler
+    for pending in pending_records:
+        raw_payload = pending["raw_payload"]
+        transformed_features, embedding = transform.apply(raw_payload.raw_features)
+        shape_keys = sorted(list(raw_payload.shape_features.keys()) + list(raw_payload.residual_features.keys()))
+        ctx_keys = sorted(raw_payload.context_features.keys())
+        shape_vector = [float(transformed_features.get(k, 0.0)) for k in shape_keys]
+        ctx_vector = [float(transformed_features.get(k, 0.0)) for k in ctx_keys]
+        event_records.append(EventOutcomeRecord(
+            symbol=pending["symbol"],
+            event_date=pending["feature_end_date"],
+            outcome_end_date=pending["outcome_end_date"],
+            schema_version=spec.label_version,
+            path_summary={
+                **pending["event"].path_summary,
+                "path_label": pending["event"].path_label,
+                "feature_end_date": pending["feature_end_date"],
+                "embedding": embedding,
+                "raw_features": dict(raw_payload.raw_features),
+                "transformed_features": dict(transformed_features),
+                "raw_regime_context_features": dict(raw_payload.regime_context_features),
+                "transform_version": transform.version,
+            },
+            side_outcomes=pending["event"].side_payload,
+            diagnostics={
+                **pending["event"].diagnostics,
+                "decision_cutoff": decision_date,
+                "feature_end_date": pending["feature_end_date"],
+                "embedding": embedding,
+                "raw_features": dict(raw_payload.raw_features),
+                "transformed_features": dict(transformed_features),
+                "shape_vector": shape_vector,
+                "ctx_vector": ctx_vector,
+                "raw_regime_context_features": dict(raw_payload.regime_context_features),
+                "regime_context_features": dict(raw_payload.regime_context_features),
+                "transform_version": transform.version,
+                "regime_code": pending["regime_code"],
+                "sector_code": pending["lib_sector"],
+                "liquidity_score": max(0.0, min(1.0, compute_bar_features(pending["history_window"]).get("volume_mean", 0.0) / 1_000_000.0)),
+                "quality_score": float(pending["event"].quality_score),
+            },
+        ))
     prototypes = build_state_prototypes_from_event_memory(event_records=event_records, as_of_date=decision_date, memory_version=spec.memory_version, spec_hash=spec.spec_hash(), config=PrototypeConfig(dedup_similarity_threshold=0.985, memory_version=spec.memory_version)) if event_records else []
     coverage = {"event_record_count": len(event_records), "anchor_count": len(anchor_library), "prototype_count": len(prototypes)}
-    return {"spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "as_of_date": decision_date, "coverage": coverage, "excluded_reasons": excluded_reasons, "event_records": event_records, "anchor_library": anchor_library, "prototypes": prototypes, "scaler": scaler}
+    return {"spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "as_of_date": decision_date, "coverage": coverage, "excluded_reasons": excluded_reasons, "event_records": event_records, "anchor_library": anchor_library, "prototypes": prototypes, "scaler": scaler, "transform": transform}
 
 
-def _build_query_panel(*, decision_dates: list[str], spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], scaler=None):
+def _build_query_panel(*, decision_dates: list[str], spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], scaler=None, transform=None, metadata: dict | None = None):
     out = {}
     excluded_reasons = []
     allowed = set(decision_dates)
+    use_macro_level_in_similarity = _feature_flag("use_macro_level_in_similarity", metadata, default=False)
+    use_dollar_volume_absolute = _feature_flag("use_dollar_volume_absolute", metadata, default=False)
     for decision_date in decision_dates:
         per_date = {}
         for symbol, bars in bars_by_symbol.items():
@@ -197,7 +305,7 @@ def _build_query_panel(*, decision_dates: list[str], spec: ResearchExperimentSpe
                 excluded_reasons.append({"symbol": symbol, "reason": "insufficient_query_history", "decision_date": decision_date})
                 continue
             query_window = bars[idx - spec.feature_window_bars + 1 : idx + 1]
-            embedding, meta = build_query_embedding(symbol=symbol, bars=query_window, bars_by_symbol=bars_by_symbol, macro_history={k: v for k, v in macro_history_by_date.items() if k <= decision_date}, sector_map=sector_map, cutoff_date=decision_date, spec=spec, scaler=scaler)
+            embedding, meta = build_query_embedding(symbol=symbol, bars=query_window, bars_by_symbol=bars_by_symbol, macro_history=_macro_history_until(macro_history_by_date, decision_date), sector_map=sector_map, cutoff_date=decision_date, spec=spec, scaler=scaler, transform=transform, use_macro_level_in_similarity=use_macro_level_in_similarity, use_dollar_volume_absolute=use_dollar_volume_absolute)
             per_date[symbol] = {"idx": idx, "query_window": query_window, "embedding": embedding, "meta": meta, "execution_bar": bars[idx + 1]}
         if decision_date in allowed:
             out[decision_date] = per_date
@@ -205,14 +313,14 @@ def _build_query_panel(*, decision_dates: list[str], spec: ResearchExperimentSpe
 
 
 def fit_train_artifacts(*, run_id: str, artifact_store: JsonResearchArtifactStore, train_end: str, test_start: str, purge: int, embargo: int, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, calibration_artifact: dict | None = None, quote_policy_calibration: dict | None = None, metadata: dict | None = None) -> dict:
-    memory = build_event_memory_asof(decision_date=train_end, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market)
+    memory = build_event_memory_asof(decision_date=train_end, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market, metadata=metadata)
     max_train_date = max((r.event_date for r in memory["event_records"]), default=None)
     max_outcome_end = max((r.outcome_end_date for r in memory["event_records"] if r.outcome_end_date), default=None)
     if max_outcome_end and max_outcome_end >= test_start:
         raise AssertionError("future event/outcome mixed into train artifact")
     snapshot_id = f"{run_id}:{train_end}:{spec.spec_hash()}"
     artifact_store.save_prototype_snapshot(run_id=run_id, as_of_date=train_end, memory_version=spec.memory_version, payload={"spec_hash": spec.spec_hash(), "snapshot_id": snapshot_id, "prototype_count": len(memory["prototypes"]), "prototypes": [p.__dict__ for p in memory["prototypes"]]})
-    return {"run_id": run_id, "snapshot_id": snapshot_id, "spec_hash": spec.spec_hash(), "as_of_date": train_end, "train_end": train_end, "test_start": test_start, "purge": purge, "embargo": embargo, "memory_version": spec.memory_version, "prototype_snapshot_name": "prototype_snapshot", "max_train_date": max_train_date, "max_outcome_end_date": max_outcome_end, "prototypes": [p.__dict__ for p in memory["prototypes"]], "scaler": memory["scaler"], "calibration": dict(calibration_artifact or {"method": "logistic", "slope": 1.0, "intercept": 0.0, "ev_slope": 1.0, "ev_intercept": 0.0}), "quote_policy_calibration": dict(quote_policy_calibration or {"ev_threshold": 0.005, "uncertainty_cap": 0.12, "min_effective_sample_size": 1.5, "min_fill_probability": 0.1, "abstain_margin": 0.05}), "metadata": dict(metadata or {}), "snapshot_ids": {"prototype_snapshot_id": snapshot_id}}
+    return {"run_id": run_id, "snapshot_id": snapshot_id, "spec_hash": spec.spec_hash(), "as_of_date": train_end, "train_end": train_end, "test_start": test_start, "purge": purge, "embargo": embargo, "memory_version": spec.memory_version, "prototype_snapshot_name": "prototype_snapshot", "max_train_date": max_train_date, "max_outcome_end_date": max_outcome_end, "prototypes": [p.__dict__ for p in memory["prototypes"]], "scaler": memory["transform"].scaler, "transform": memory["transform"], "calibration": dict(calibration_artifact or {"method": "logistic", "slope": 1.0, "intercept": 0.0, "ev_slope": 1.0, "ev_intercept": 0.0}), "quote_policy_calibration": dict(quote_policy_calibration or {"ev_threshold": 0.005, "uncertainty_cap": 0.12, "min_effective_sample_size": 1.5, "min_fill_probability": 0.1, "abstain_margin": 0.05}), "metadata": dict(metadata or {}), "snapshot_ids": {"prototype_snapshot_id": snapshot_id}}
 
 
 def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: JsonResearchArtifactStore, decision_dates: list[str], spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, top_k: int | None = None) -> dict:
@@ -227,7 +335,7 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
     if not prototype_pool and train_artifact.get("prototypes"):
         from .models import StatePrototype
         prototype_pool = [StatePrototype(**p) for p in train_artifact.get("prototypes") or []]
-    query_panel, excluded = _build_query_panel(decision_dates=decision_dates, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=train_artifact.get("scaler"))
+    query_panel, excluded = _build_query_panel(decision_dates=decision_dates, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=train_artifact.get("scaler"), transform=train_artifact.get("transform"), metadata=train_artifact.get("metadata"))
     scoring_cfg = ScoringConfig(min_liquidity_score=0.0)
     qp = train_artifact.get("quote_policy_calibration") or {}
     metadata = train_artifact.get("metadata") or {}
@@ -283,7 +391,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
     spec = spec or _default_spec(feature_window_bars=feature_window_bars, horizon_days=horizon_days)
     sector_map = sector_map or {}
     ev_cfg = _ev_config_from_metadata(metadata, top_k=top_k, abstain_margin=abstain_margin)
-    diagnostics: Dict[str, dict] = {"pipeline": {"strategy_mode": "research_similarity_v2", "spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "lookback_bars": lookback_bars, "top_k": top_k, "abstain_margin": abstain_margin, "ev_config": {"min_effective_sample_size": ev_cfg.min_effective_sample_size, "max_uncertainty": ev_cfg.max_uncertainty, "max_return_interval_width": ev_cfg.max_return_interval_width, "min_regime_alignment": ev_cfg.min_regime_alignment, "min_expected_utility": ev_cfg.min_expected_utility, "diagnostic_disable_lower_bound_gate": ev_cfg.diagnostic_disable_lower_bound_gate}}}
+    diagnostics: Dict[str, dict] = {"pipeline": {"strategy_mode": "research_similarity_v2", "spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "lookback_bars": lookback_bars, "top_k": ev_cfg.top_k, "top_k_requested": top_k, "abstain_margin": abstain_margin, "feature_flags": {"use_macro_level_in_similarity": _feature_flag("use_macro_level_in_similarity", metadata, default=False), "use_dollar_volume_absolute": _feature_flag("use_dollar_volume_absolute", metadata, default=False)}, "ev_config": {"kernel_temperature": ev_cfg.kernel_temperature, "use_kernel_weighting": ev_cfg.use_kernel_weighting, "min_effective_sample_size": ev_cfg.min_effective_sample_size, "max_uncertainty": ev_cfg.max_uncertainty, "max_return_interval_width": ev_cfg.max_return_interval_width, "min_regime_alignment": ev_cfg.min_regime_alignment, "min_expected_utility": ev_cfg.min_expected_utility, "diagnostic_disable_lower_bound_gate": ev_cfg.diagnostic_disable_lower_bound_gate, "diagnostic_disable_ess_gate": ev_cfg.diagnostic_disable_ess_gate}}}
     panel_rows: List[dict] = []
     out: List[SignalCandidate] = []
     scoring_cfg = ScoringConfig(min_liquidity_score=0.0)
@@ -314,8 +422,8 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
 
     _emit_progress(0, force=True)
     for idx, decision_date in enumerate(decision_dates, start=1):
-        memory = build_event_memory_asof(decision_date=decision_date, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market, lookback_bars=lookback_bars)
-        query_panel, query_excluded = _build_query_panel(decision_dates=[decision_date], spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=memory["scaler"])
+        memory = build_event_memory_asof(decision_date=decision_date, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market, lookback_bars=lookback_bars, metadata=metadata)
+        query_panel, query_excluded = _build_query_panel(decision_dates=[decision_date], spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=memory["scaler"], transform=memory["transform"], metadata=metadata)
         event_record_batches.append({"decision_date": decision_date, "records": [{"symbol": r.symbol, "event_date": r.event_date, "outcome_end_date": r.outcome_end_date, "side_outcomes": r.side_outcomes} for r in memory["event_records"]]})
         all_excluded_reasons.extend([{**r, "decision_date": decision_date} for r in memory["excluded_reasons"] + query_excluded])
         total_prototype_count += len(memory["prototypes"])
@@ -331,7 +439,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
             long_ev = estimate_expected_value(side=Side.BUY.value, query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
             short_ev = estimate_expected_value(side=Side.SELL.value, query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
             surface = build_decision_surface(query_embedding=q["embedding"], prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
-            row_diag = {"decision_date": decision_date, "symbol": symbol, "query": {"regime_code": regime_code, "sector_code": sector_code, "decision_date": decision_date, "execution_date": execution_date, "decision_convention": DECISION_CONVENTION, "price_reference_source": "next_open", "feature_window_bars": spec.feature_window_bars, "feature_coverage_bars": len(q["query_window"]), "query_panel_count": len(query_panel.get(decision_date, {})), "insufficient_history": False, "shape_horizons": q["meta"].get("shape_horizons", [])}, "library": {"event_record_count": len(memory["event_records"]), "max_outcome_end_before_decision": max((r.outcome_end_date for r in memory["event_records"] if r.outcome_end_date), default=None)}, "decision_surface": {"chosen_side": surface.chosen_side, "abstain": surface.abstain, "abstain_reasons": list(surface.abstain_reasons), "prototype_pool_size": surface.diagnostics.get("prototype_pool_size"), "chosen_lower_bound": (surface.diagnostics.get("decision_rule") or {}).get("chosen_lower_bound"), "chosen_interval_width": (surface.diagnostics.get("decision_rule") or {}).get("chosen_interval_width"), "chosen_effective_sample_size": (surface.diagnostics.get("decision_rule") or {}).get("chosen_effective_sample_size"), "chosen_uncertainty": (surface.diagnostics.get("decision_rule") or {}).get("chosen_uncertainty"), "gate_ablation": surface.diagnostics.get("gate_ablation"), "decision_rule": surface.diagnostics.get("decision_rule")}, "ev": {"buy": {"expected_utility": long_ev.expected_utility, "expected_net_return": long_ev.expected_net_return, "effective_sample_size": long_ev.effective_sample_size, "uncertainty": long_ev.uncertainty, "abstain_reasons": long_ev.abstain_reasons}, "sell": {"expected_utility": short_ev.expected_utility, "expected_net_return": short_ev.expected_net_return, "effective_sample_size": short_ev.effective_sample_size, "uncertainty": short_ev.uncertainty, "abstain_reasons": short_ev.abstain_reasons}}, "scorer_diagnostics": {"buy": _side_diag(long_ev, surface, "BUY"), "sell": _side_diag(short_ev, surface, "SELL")}, "top_matches": {"long": surface.buy.top_matches, "short": surface.sell.top_matches}}
+            row_diag = {"decision_date": decision_date, "symbol": symbol, "query": {"regime_code": regime_code, "sector_code": sector_code, "decision_date": decision_date, "execution_date": execution_date, "decision_convention": DECISION_CONVENTION, "price_reference_source": "next_open", "feature_window_bars": spec.feature_window_bars, "feature_coverage_bars": len(q["query_window"]), "query_panel_count": len(query_panel.get(decision_date, {})), "insufficient_history": False, "shape_horizons": q["meta"].get("shape_horizons", []), "transform_version": q["meta"].get("transform_version"), "feature_flags": {"use_macro_level_in_similarity": q["meta"].get("use_macro_level_in_similarity", False), "use_dollar_volume_absolute": q["meta"].get("use_dollar_volume_absolute", False)}, "regime_context_features": q["meta"].get("regime_context_features", {})}, "library": {"event_record_count": len(memory["event_records"]), "max_outcome_end_before_decision": max((r.outcome_end_date for r in memory["event_records"] if r.outcome_end_date), default=None)}, "decision_surface": {"chosen_side": surface.chosen_side, "abstain": surface.abstain, "abstain_reasons": list(surface.abstain_reasons), "prototype_pool_size": surface.diagnostics.get("prototype_pool_size"), "chosen_lower_bound": (surface.diagnostics.get("decision_rule") or {}).get("chosen_lower_bound"), "chosen_interval_width": (surface.diagnostics.get("decision_rule") or {}).get("chosen_interval_width"), "chosen_effective_sample_size": (surface.diagnostics.get("decision_rule") or {}).get("chosen_effective_sample_size"), "chosen_uncertainty": (surface.diagnostics.get("decision_rule") or {}).get("chosen_uncertainty"), "gate_ablation": surface.diagnostics.get("gate_ablation"), "decision_rule": surface.diagnostics.get("decision_rule")}, "ev": {"buy": {"expected_utility": long_ev.expected_utility, "expected_net_return": long_ev.expected_net_return, "effective_sample_size": long_ev.effective_sample_size, "uncertainty": long_ev.uncertainty, "abstain_reasons": long_ev.abstain_reasons}, "sell": {"expected_utility": short_ev.expected_utility, "expected_net_return": short_ev.expected_net_return, "effective_sample_size": short_ev.effective_sample_size, "uncertainty": short_ev.uncertainty, "abstain_reasons": short_ev.abstain_reasons}}, "scorer_diagnostics": {"buy": _side_diag(long_ev, surface, "BUY"), "sell": _side_diag(short_ev, surface, "SELL")}, "top_matches": {"long": surface.buy.top_matches, "short": surface.sell.top_matches}}
             panel_rows.append(row_diag)
             diagnostics[f"{decision_date}:{symbol}"] = row_diag
             if surface.abstain:

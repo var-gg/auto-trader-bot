@@ -29,6 +29,7 @@ except Exception:  # pragma: no cover
 
 from backtest_app.configs.models import BacktestConfig, BacktestScenario, ResearchExperimentSpec, RunnerRequest
 from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory, guard_backtest_local_only
+from backtest_app.observability.git_provenance import collect_git_provenance
 from backtest_app.research_runtime.engine import run_backtest
 from scripts.research_first_batch import (
     UNIVERSE,
@@ -105,6 +106,12 @@ COUNTER_KEYS = [
 ]
 SUMMARY_COLS = [
     "run_label",
+    "authoritative",
+    "verdict_eligible",
+    "branch",
+    "head_commit",
+    "dirty_worktree",
+    "diff_fingerprint",
     "candidate_count",
     "candidate_dates",
     "buy_pass_count",
@@ -114,6 +121,9 @@ SUMMARY_COLS = [
     "n_eff_histogram",
     "top1_weight_histogram",
     "abstain_reason_histogram",
+    "metadata_application",
+    "changed_tracked_files",
+    "exclusion_reasons",
     "result_path",
     "metadata",
 ]
@@ -175,6 +185,106 @@ def _resolve_script_commit() -> str:
     return proc.stdout.strip()
 
 
+def _metadata_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _saved_signal_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = dict(result.get("diagnostics") or {})
+    signal_diagnostics = diagnostics.get("signal_diagnostics")
+    return dict(signal_diagnostics if isinstance(signal_diagnostics, dict) else diagnostics)
+
+
+def _saved_portfolio_payload(result: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = dict(result.get("diagnostics") or {})
+    portfolio = diagnostics.get("portfolio")
+    if isinstance(portfolio, dict):
+        return dict(portfolio)
+    return dict(result.get("portfolio") or {})
+
+
+def _saved_reproducibility(result: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = dict(result.get("diagnostics") or {})
+    signal_diagnostics = diagnostics.get("signal_diagnostics")
+    return dict(
+        result.get("reproducibility")
+        or diagnostics.get("reproducibility")
+        or (signal_diagnostics.get("reproducibility") if isinstance(signal_diagnostics, dict) else {})
+        or {}
+    )
+
+
+def _verify_metadata_applied(saved_run: dict[str, Any], metadata: dict[str, str]) -> dict[str, Any]:
+    support_metadata = {k: v for k, v in (metadata or {}).items() if k in ALLOWED_SUPPORT_KEYS}
+    if not support_metadata:
+        return {"checked": False, "applied": True, "expected": {}, "observed": {}, "checks": {}}
+    signal_diagnostics = _saved_signal_diagnostics(saved_run)
+    pipeline = dict(signal_diagnostics.get("pipeline") or {})
+    ev_config = dict(pipeline.get("ev_config") or {})
+    panel_rows = list(signal_diagnostics.get("signal_panel") or [])
+    observed = {
+        "top_k": pipeline.get("top_k"),
+        "kernel_temperature": ev_config.get("kernel_temperature"),
+        "use_kernel_weighting": ev_config.get("use_kernel_weighting"),
+        "min_effective_sample_size": ev_config.get("min_effective_sample_size"),
+        "diagnostic_disable_ess_gate": ev_config.get("diagnostic_disable_ess_gate"),
+    }
+    checks: dict[str, bool] = {}
+    for key, raw_value in support_metadata.items():
+        if key == "top_k":
+            checks[key] = int(observed.get(key) or 0) == int(raw_value)
+        elif key == "kernel_temperature":
+            checks[key] = float(observed.get(key) or 0.0) == float(raw_value)
+        elif key == "use_kernel_weighting":
+            checks[key] = bool(observed.get(key)) == _metadata_bool(raw_value)
+        elif key == "min_effective_sample_size":
+            checks[key] = float(observed.get(key) or 0.0) == float(raw_value)
+        elif key == "diagnostic_disable_ess_gate":
+            expected_bool = _metadata_bool(raw_value)
+            checks[key] = bool(observed.get(key)) == expected_bool
+            gate_values = {
+                bool(((row.get("decision_surface") or {}).get("gate_ablation") or {}).get("diagnostic_disable_ess_gate"))
+                for row in panel_rows
+                if isinstance(row, dict)
+            }
+            if gate_values:
+                observed["diagnostic_disable_ess_gate_rows"] = sorted(gate_values)
+                checks[f"{key}_rows"] = gate_values == {expected_bool}
+    return {
+        "checked": True,
+        "applied": all(checks.values()),
+        "expected": support_metadata,
+        "observed": observed,
+        "checks": checks,
+    }
+
+
+def _summary_exclusion_reasons(summary: dict[str, Any] | None) -> list[str]:
+    row = dict(summary or {})
+    reasons: list[str] = []
+    child_summary = dict(row.get("child_summary") or {})
+    if child_summary and not bool(child_summary.get("ok")):
+        reasons.append("child_failed")
+    if not bool(row.get("authoritative")):
+        reasons.append("non_authoritative")
+    metadata_application = dict(row.get("metadata_application") or {})
+    if metadata_application.get("checked") and not metadata_application.get("applied", False):
+        reasons.append("metadata_not_applied")
+    return reasons
+
+
+def _verdict_eligible(summary: dict[str, Any] | None) -> bool:
+    return not _summary_exclusion_reasons(summary)
+
+
+def _live_result_reproducibility(result: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = dict(result.get("diagnostics") or {})
+    artifacts = dict(result.get("artifacts") or {})
+    return dict(diagnostics.get("reproducibility") or artifacts.get("reproducibility") or {})
+
+
 def _execution_start_record(output_root: Path) -> dict[str, Any]:
     return {
         "__file__": str(Path(__file__).resolve()),
@@ -204,11 +314,16 @@ def _ensure_public_committed_driver() -> dict[str, Any]:
     tracked = subprocess.run(["git", "ls-files", "--error-unmatch", "scripts/medium_viability_check.py"], cwd=ROOT, capture_output=True, text=True)
     if tracked.returncode != 0:
         raise RuntimeError("Refusing run: scripts/medium_viability_check.py is not tracked in git")
+    provenance = collect_git_provenance(ROOT)
     return {
         "branch": branch,
         "head_commit": resolve_git_commit(),
         "driver_script": "scripts/medium_viability_check.py",
         "driver_script_last_commit": _resolve_script_commit(),
+        "dirty_worktree": provenance.get("dirty_worktree", False),
+        "changed_tracked_files": provenance.get("changed_tracked_files", []),
+        "diff_fingerprint": provenance.get("diff_fingerprint"),
+        "authoritative": provenance.get("authoritative", False),
     }
 
 
@@ -333,13 +448,16 @@ def _load_tiny_rows(tiny_root: Path) -> list[dict[str, Any]]:
 
 def _pick_best_two_allowed(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     filtered = [r for r in rows if _is_allowed_tiny_candidate(r)]
-    filtered.sort(key=_rank_key, reverse=True)
+    filtered.sort(key=lambda row: (-int(row.get("candidate_count", 0)), -int(row.get("fills_count", 0)), -int(row.get("trades_count", 0)), -(int(row.get("buy_pass_count", 0)) + int(row.get("sell_pass_count", 0))), str(row.get("run_label", ""))))
     return filtered[:2]
 
 
-def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, Any], scenario: BacktestScenario) -> dict[str, Any]:
-    panel = list((result.get("artifacts") or {}).get("signal_panel") or [])
-    selected = list(((result.get("portfolio") or {}).get("selected_symbols")) or [])
+def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, Any], scenario: BacktestScenario, *, result_path: str | None = None) -> dict[str, Any]:
+    signal_diagnostics = _saved_signal_diagnostics(result)
+    portfolio = _saved_portfolio_payload(result)
+    reproducibility = _saved_reproducibility(result)
+    panel = list(signal_diagnostics.get("signal_panel") or [])
+    selected = list((portfolio.get("selected_symbols")) or [])
     fills = list(result.get("fills") or [])
     plans = list(result.get("plans") or [])
     abstain: dict[str, int] = {}
@@ -370,11 +488,18 @@ def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, A
                 bucket = f"{w:.1f}"
                 top1_weight_histogram[bucket] = top1_weight_histogram.get(bucket, 0) + 1
     filled = [f for f in fills if str((f.get("fill_status") or "")).upper() in {"FULL", "PARTIAL"}]
-    return {
+    metadata_application = _verify_metadata_applied(result, metadata)
+    summary = {
         "run_label": run_label,
         "scenario_id": scenario.scenario_id,
         "window": {"start_date": scenario.start_date, "end_date": scenario.end_date},
         "symbols": list(scenario.symbols),
+        "authoritative": bool(reproducibility.get("authoritative", False)),
+        "branch": reproducibility.get("branch"),
+        "head_commit": reproducibility.get("head_commit"),
+        "dirty_worktree": reproducibility.get("dirty_worktree"),
+        "changed_tracked_files": reproducibility.get("changed_tracked_files", []),
+        "diff_fingerprint": reproducibility.get("diff_fingerprint"),
         "candidate_count": len(selected),
         "candidate_dates": candidate_dates,
         "buy_pass_count": buy_pass_count,
@@ -384,12 +509,17 @@ def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, A
         "abstain_reason_histogram": dict(sorted(abstain.items())),
         "fills_count": len(filled),
         "trades_count": len(plans),
-        "result_path": result.get("result_path"),
+        "result_path": result_path or result.get("result_path"),
         "metadata": metadata,
+        "metadata_application": metadata_application,
     }
+    summary["exclusion_reasons"] = _summary_exclusion_reasons(summary)
+    summary["verdict_eligible"] = not summary["exclusion_reasons"]
+    return summary
 
 
 def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, preflight: dict[str, Any], scenario: BacktestScenario, metadata: dict[str, str], result: dict[str, Any], git_commit: str) -> None:
+    reproducibility = _live_result_reproducibility(result)
     manifest = _read_json(run_dir / "manifest.json")
     manifest.update({
         "experiment_group": "medium_viability_check",
@@ -412,8 +542,16 @@ def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, pr
         "metadata_overrides": metadata,
         "metadata_json": json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         "diagnostic_flags": {k: v for k, v in metadata.items() if k.startswith("diagnostic_")},
+        "run_reproducibility": reproducibility,
+        "authoritative": bool(reproducibility.get("authoritative", False)),
+        "branch": reproducibility.get("branch"),
+        "head_commit": reproducibility.get("head_commit"),
+        "dirty_worktree": reproducibility.get("dirty_worktree"),
+        "changed_tracked_files": reproducibility.get("changed_tracked_files", []),
+        "diff_fingerprint": reproducibility.get("diff_fingerprint"),
     })
     _write_json(run_dir / "manifest.json", manifest)
+    _write_json(run_dir / "reproducibility.json", reproducibility)
     fold_report = {
         "run_id": run_id,
         "strategy_mode": strategy_mode,
@@ -431,6 +569,7 @@ def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, pr
         "validation": fold_report["discovery"],
         "holdout_validation": {},
         "diagnostics_lite": False,
+        "reproducibility": reproducibility,
     }
     _write_json(run_dir / "diagnostics.json", diagnostics)
     aggregate = ((result.get("validation") or {}).get("fold_engine") or {}).get("aggregate") or {}
@@ -478,6 +617,11 @@ def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, pr
         "macro_coverage": preflight.get("macro_coverage"),
         "sector_coverage": preflight.get("sector_coverage"),
         "legacy_snapshot_ready": preflight.get("legacy_snapshot_ready"),
+        "authoritative": bool(reproducibility.get("authoritative", False)),
+        "branch": reproducibility.get("branch"),
+        "head_commit": reproducibility.get("head_commit"),
+        "dirty_worktree": reproducibility.get("dirty_worktree"),
+        "diff_fingerprint": reproducibility.get("diff_fingerprint"),
     }
     _write_json(run_dir / "run_card.json", run_card)
     report_md = build_report_md(run_card=run_card, discovery=result, holdout={}, previous_rows=load_leaderboard_rows(run_dir.parent / "leaderboard.csv"))
@@ -654,6 +798,7 @@ def _prepare_child_run(*, output_root: Path, run_label: str, scenario: BacktestS
     if run_dir.exists():
         shutil.rmtree(run_dir)
     expected_path = _result_path_for_run(run_dir, scenario.scenario_id)
+    launch_provenance = collect_git_provenance(ROOT)
     manifest = {
         "run_label": run_label,
         "child_run_label": run_label,
@@ -667,6 +812,7 @@ def _prepare_child_run(*, output_root: Path, run_label: str, scenario: BacktestS
         "result_path_expected": str(expected_path.resolve()),
         "result_path_expected_file": str((run_dir / "result_path_expected").resolve()),
         "driver": driver,
+        "launch_provenance": launch_provenance,
         "created_at": datetime.now().isoformat(),
     }
     _write_json(run_dir / "manifest.json", manifest)
@@ -685,6 +831,8 @@ def _run_prepared_child(run_dir: Path) -> dict[str, Any]:
     final_status = _read_json(run_dir / "status.json")
     actual_result_path = Path(str(final_status.get("result_path") or "")) if final_status.get("result_path") else None
     success = exit_code == 0 and final_status.get("status") == "ok" and actual_result_path is not None and actual_result_path.exists()
+    saved_run = _read_json(actual_result_path) if actual_result_path is not None and actual_result_path.exists() else {}
+    reproducibility = _saved_reproducibility(saved_run)
     return {
         "exit_code": exit_code,
         "run_dir": str(run_dir.resolve()),
@@ -701,6 +849,12 @@ def _run_prepared_child(run_dir: Path) -> dict[str, Any]:
         "status": final_status,
         "monitor": monitor,
         "ok": success,
+        "authoritative": bool(reproducibility.get("authoritative", False)),
+        "branch": reproducibility.get("branch"),
+        "head_commit": reproducibility.get("head_commit"),
+        "dirty_worktree": reproducibility.get("dirty_worktree"),
+        "changed_tracked_files": reproducibility.get("changed_tracked_files", []),
+        "diff_fingerprint": reproducibility.get("diff_fingerprint"),
     }
 
 
@@ -722,7 +876,12 @@ def _run_baseline_parent(output_root: Path) -> dict[str, Any]:
         extra_window={"trading_dates": window.trading_dates, "trading_date_count": len(window.trading_dates)},
     )
     child_summary = _run_prepared_child(run_dir)
-    summary = {"baseline_contract_passed": child_summary["ok"], **child_summary}
+    summary = {
+        "baseline_run_completed": child_summary["ok"],
+        "baseline_contract_gate_passed": child_summary["ok"] and bool(child_summary.get("authoritative", False)),
+        "baseline_gate_fail_reasons": ([] if child_summary["ok"] and bool(child_summary.get("authoritative", False)) else ["child_failed"] if not child_summary["ok"] else ["non_authoritative"]),
+        **child_summary,
+    }
     _write_json(output_root / "baseline_summary.json", summary)
     return summary
 
@@ -742,13 +901,40 @@ def _run_medium_case(output_root: Path, run_label: str, scenario: BacktestScenar
     )
     child_summary = _run_prepared_child(run_dir)
     if not child_summary["ok"]:
-        summary = {"run_label": run_label, "scenario_id": scenario.scenario_id, "result_path": child_summary["status"].get("result_path"), "metadata": metadata, "candidate_count": 0, "fills_count": 0, "trades_count": 0, "child_summary": child_summary}
+        metadata_application = {
+            "checked": bool({k: v for k, v in metadata.items() if k in ALLOWED_SUPPORT_KEYS}),
+            "applied": False,
+            "expected": {k: v for k, v in metadata.items() if k in ALLOWED_SUPPORT_KEYS},
+            "observed": {},
+            "checks": {},
+        }
+        summary = {
+            "run_label": run_label,
+            "scenario_id": scenario.scenario_id,
+            "result_path": child_summary["status"].get("result_path"),
+            "metadata": metadata,
+            "candidate_count": 0,
+            "fills_count": 0,
+            "trades_count": 0,
+            "authoritative": bool(child_summary.get("authoritative", False)),
+            "branch": child_summary.get("branch"),
+            "head_commit": child_summary.get("head_commit"),
+            "dirty_worktree": child_summary.get("dirty_worktree"),
+            "changed_tracked_files": child_summary.get("changed_tracked_files", []),
+            "diff_fingerprint": child_summary.get("diff_fingerprint"),
+            "metadata_application": metadata_application,
+            "child_summary": child_summary,
+        }
+        summary["exclusion_reasons"] = _summary_exclusion_reasons(summary)
+        summary["verdict_eligible"] = not summary["exclusion_reasons"]
         _write_json(run_dir / "summary.json", summary)
         return summary
     result_path = Path(str(child_summary["status"].get("result_path")))
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    summary = _summarize_run(run_label, metadata, result, scenario)
+    summary = _summarize_run(run_label, metadata, result, scenario, result_path=str(result_path.resolve()))
     summary["child_summary"] = child_summary
+    summary["exclusion_reasons"] = _summary_exclusion_reasons(summary)
+    summary["verdict_eligible"] = not summary["exclusion_reasons"]
     _write_json(run_dir / "summary.json", summary)
     return summary
 
@@ -770,7 +956,7 @@ def _main_parent(args: argparse.Namespace) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
     _emit_execution_start(output_root)
     baseline_summary = _run_baseline_parent(output_root)
-    if not baseline_summary.get("baseline_contract_passed"):
+    if not baseline_summary.get("baseline_run_completed"):
         print(json.dumps({"baseline": baseline_summary, "aborted_after_baseline": True}, ensure_ascii=False, indent=2, default=_json_default))
         return 1
 
@@ -799,16 +985,28 @@ def _main_parent(args: argparse.Namespace) -> int:
         best2_summary = _run_medium_case(output_root, "best2", discovery, best2_meta, preflight, driver)
         medium_rows.append(best2_summary)
     best_runs = [r for r in [best1_summary, best2_summary] if r is not None]
-    viable = any(int(r.get("candidate_count", 0)) > 0 and int(r.get("fills_count", 0)) > 0 and int(r.get("trades_count", 0)) > 0 for r in best_runs)
-    verdict = "TOBE v1 viable" if viable else "current TOBE v1 fails"
+    eligible_best_runs = [r for r in best_runs if r.get("verdict_eligible")]
+    if not best_runs:
+        viable = None
+        verdict = "best runs not requested"
+        verdict_basis = "best1/best2 were not requested, so medium verdict was not evaluated."
+    elif not eligible_best_runs:
+        viable = None
+        verdict = "authoritative rerun required"
+        verdict_basis = "best1/best2 completed without any verdict-eligible authoritative runs."
+    else:
+        viable = any(int(r.get("candidate_count", 0)) > 0 and int(r.get("fills_count", 0)) > 0 and int(r.get("trades_count", 0)) > 0 for r in eligible_best_runs)
+        verdict = "TOBE v1 viable" if viable else "current TOBE v1 fails"
+        verdict_basis = f"evaluated {len(eligible_best_runs)} authoritative run(s) after excluding non-authoritative or metadata-misaligned runs."
     holdout_summary = None
-    if viable and "holdout" in requested:
-        winner = sorted(best_runs, key=_rank_key, reverse=True)[0]
+    if viable is True and "holdout" in requested:
+        winner = sorted(eligible_best_runs, key=_rank_key, reverse=True)[0]
         winner_meta = {k: v for k, v in (winner.get("metadata") or {}).items() if k in ALLOWED_SUPPORT_KEYS}
         holdout_summary = _run_medium_case(output_root, "holdout", holdout, winner_meta, preflight, driver)
     summary_payload = {
         "output_root": str(output_root),
         "tiny_root": str(Path(args.tiny_root).resolve()),
+        "driver": driver,
         "preflight": preflight,
         "baseline_contract": baseline_summary,
         "selected_best1_source_run_label": best_two[0]["run_label"],
@@ -816,7 +1014,9 @@ def _main_parent(args: argparse.Namespace) -> int:
         "best1_support_metadata": best1_meta,
         "best2_support_metadata": best2_meta,
         "medium_runs": medium_rows,
+        "eligible_medium_run_labels": [r.get("run_label") for r in eligible_best_runs],
         "verdict": verdict,
+        "verdict_basis": verdict_basis,
         "viable": viable,
         "holdout_executed": bool(holdout_summary),
         "holdout_summary": holdout_summary,
@@ -830,15 +1030,20 @@ def _main_parent(args: argparse.Namespace) -> int:
         f"- Tiny root: `{Path(args.tiny_root).resolve()}`",
         f"- scripts/medium_viability_check.py tracked on public branch: yes",
         f"- CLI selective support: `--run-labels` and `--only`",
+        f"- Baseline run completed: `{baseline_summary.get('baseline_run_completed')}`",
+        f"- Baseline contract gate passed: `{baseline_summary.get('baseline_contract_gate_passed')}`",
         f"- best1 source: `{best_two[0]['run_label']}` -> {json.dumps(best1_meta, ensure_ascii=False)}",
         f"- best2 source: `{best_two[1]['run_label']}` -> {json.dumps(best2_meta, ensure_ascii=False)}",
         "",
         "## Runs",
     ]
     for row in medium_rows:
-        diagnosis_lines.append(f"- {row['run_label']}: candidates={row['candidate_count']}, fills={row['fills_count']}, trades={row['trades_count']}, result=`{row['result_path']}`")
+        diagnosis_lines.append(
+            f"- {row['run_label']}: candidates={row['candidate_count']}, fills={row['fills_count']}, trades={row['trades_count']}, authoritative={row.get('authoritative')}, verdict_eligible={row.get('verdict_eligible')}, exclusion_reasons={json.dumps(row.get('exclusion_reasons') or [], ensure_ascii=False)}, result=`{row['result_path']}`"
+        )
     diagnosis_lines.append("")
     diagnosis_lines.append(f"## Verdict\n- **{verdict}**")
+    diagnosis_lines.append(f"- basis: {verdict_basis}")
     if holdout_summary:
         diagnosis_lines.extend(["", "## Holdout", "- executed: yes", f"- holdout: candidates={holdout_summary['candidate_count']}, fills={holdout_summary['fills_count']}, trades={holdout_summary['trades_count']}, result=`{holdout_summary['result_path']}`"])
     else:

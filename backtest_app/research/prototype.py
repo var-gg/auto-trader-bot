@@ -122,7 +122,11 @@ def build_state_prototypes_from_event_memory(*, event_records: Iterable[EventOut
     eligible = [e for e in event_records if not e.outcome_end_date or e.outcome_end_date < as_of_date]
     clusters: list[list[dict]] = []
     for event in eligible:
+        transformed_features = dict(((event.diagnostics or {}).get("transformed_features") or (event.path_summary or {}).get("transformed_features") or {}))
         emb = list(((event.diagnostics or {}).get("embedding") or (event.path_summary or {}).get("embedding") or []))
+        if transformed_features and not emb:
+            feature_keys = sorted(transformed_features.keys())
+            emb = [float(transformed_features[k]) for k in feature_keys]
         if not emb:
             emb = [0.0, 0.0]
         row = {
@@ -130,6 +134,9 @@ def build_state_prototypes_from_event_memory(*, event_records: Iterable[EventOut
             "embedding": emb,
             "shape_vector": list(((event.diagnostics or {}).get("shape_vector") or [])),
             "ctx_vector": list(((event.diagnostics or {}).get("ctx_vector") or [])),
+            "raw_features": dict(((event.diagnostics or {}).get("raw_features") or (event.path_summary or {}).get("raw_features") or {})),
+            "transformed_features": transformed_features,
+            "transform_version": str((event.diagnostics or {}).get("transform_version") or (event.path_summary or {}).get("transform_version") or "unknown"),
             "regime_code": str(event.diagnostics.get("regime_code") or event.path_summary.get("regime_code") or "UNKNOWN"),
             "sector_code": str(event.diagnostics.get("sector_code") or event.path_summary.get("sector_code") or "UNKNOWN"),
             "liquidity_bucket": str(event.path_summary.get("liquidity_bucket") or "UNKNOWN"),
@@ -158,10 +165,16 @@ def build_state_prototypes_from_event_memory(*, event_records: Iterable[EventOut
         representative_hash = _representative_hash(rep_payload)
         prior_buckets = {"regime": sorted({r["regime_code"] for r in cluster}), "sector": sorted({r["sector_code"] for r in cluster}), "liquidity": sorted({r["liquidity_bucket"] for r in cluster})}
         member_refs = [{"symbol": e.symbol, "event_date": e.event_date, "outcome_end_date": e.outcome_end_date} for e in events]
-        lineage = [{"ref": f"{e.symbol}:{e.event_date}", "side_outcomes": dict(e.side_outcomes or {})} for e in events]
+        lineage = [{
+            "ref": f"{e.symbol}:{e.event_date}",
+            "side_outcomes": dict(e.side_outcomes or {}),
+            "raw_features": dict((e.diagnostics or {}).get("raw_features") or (e.path_summary or {}).get("raw_features") or {}),
+            "transformed_features": dict((e.diagnostics or {}).get("transformed_features") or (e.path_summary or {}).get("transformed_features") or {}),
+            "transform_version": (e.diagnostics or {}).get("transform_version") or (e.path_summary or {}).get("transform_version"),
+        } for e in events]
         side_stats = {side: _state_side_stats([{**dict((e.side_outcomes or {}).get(side) or {}), "event_date": e.event_date} for e in events], cfg, as_of_date=as_of_date) for side in ("BUY", "SELL")}
         prototype_id = f"{as_of_date}:{memory_version}:{representative_hash}"
-        prototypes.append(StatePrototype(prototype_id=prototype_id, anchor_code="STATE_MEMORY_V1", embedding=list(rep["embedding"]), member_count=len(cluster), representative_symbol=rep["event"].symbol, representative_date=rep["event"].event_date, representative_hash=representative_hash, shape_vector=list(rep["shape_vector"]), ctx_vector=list(rep["ctx_vector"]), vector_version=memory_version, feature_version=spec_hash, embedding_model="event-memory-state", vector_dim=len(rep["embedding"]), anchor_quality=float(mean([r["anchor_quality"] for r in cluster])), regime_code=rep["regime_code"], sector_code=rep["sector_code"], liquidity_score=float(mean([r["liquidity_score"] for r in cluster])), support_count=len(cluster), decayed_support=decayed_support, freshness_days=float(((_parse_date(as_of_date) or date.today()) - max(member_dates)).days) if member_dates else 9999.0, prototype_membership={"member_refs": member_refs, "lineage": lineage}, side_stats=side_stats, metadata={"as_of_date": as_of_date, "memory_version": memory_version, "spec_hash": spec_hash, "representative_hash": representative_hash, "prior_buckets": prior_buckets}))
+        prototypes.append(StatePrototype(prototype_id=prototype_id, anchor_code="STATE_MEMORY_V1", embedding=list(rep["embedding"]), member_count=len(cluster), representative_symbol=rep["event"].symbol, representative_date=rep["event"].event_date, representative_hash=representative_hash, shape_vector=list(rep["shape_vector"]), ctx_vector=list(rep["ctx_vector"]), vector_version=memory_version, feature_version=spec_hash, embedding_model="event-memory-state", vector_dim=len(rep["embedding"]), anchor_quality=float(mean([r["anchor_quality"] for r in cluster])), regime_code=rep["regime_code"], sector_code=rep["sector_code"], liquidity_score=float(mean([r["liquidity_score"] for r in cluster])), support_count=len(cluster), decayed_support=decayed_support, freshness_days=float(((_parse_date(as_of_date) or date.today()) - max(member_dates)).days) if member_dates else 9999.0, prototype_membership={"member_refs": member_refs, "lineage": lineage}, side_stats=side_stats, metadata={"as_of_date": as_of_date, "memory_version": memory_version, "spec_hash": spec_hash, "representative_hash": representative_hash, "prior_buckets": prior_buckets, "raw_features": rep["raw_features"], "transformed_features": rep["transformed_features"], "transform_version": rep["transform_version"]}))
     prototypes.sort(key=lambda p: p.prototype_id)
     return prototypes
 

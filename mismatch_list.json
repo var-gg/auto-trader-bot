@@ -1,0 +1,81 @@
+{
+  "branch": "public-release-20260323",
+  "head_commit": "cc47f4d84caf2a7d4341374eca7faef508c8f04b",
+  "do_not_run_medium": true,
+  "branch_vs_claim": [
+    {
+      "id": "B1",
+      "severity": "high",
+      "file": "backtest_app/historical_data/features.py",
+      "title": "Committed HEAD still lacks FeatureTransform",
+      "detail": "git show HEAD:backtest_app/historical_data/features.py still exposes FeatureScaler-only semantics. The claimed explicit transform contract is not present in committed HEAD."
+    },
+    {
+      "id": "B2",
+      "severity": "high",
+      "file": "backtest_app/historical_data/features.py",
+      "title": "Committed HEAD still includes absolute macro level and raw dollar_volume in default similarity",
+      "detail": "HEAD context features still emit *_level values and liquidity still emits raw dollar_volume by default, so the committed branch is still on the old similarity contract."
+    },
+    {
+      "id": "B3",
+      "severity": "high",
+      "file": "backtest_app/research/pipeline.py",
+      "title": "Committed HEAD still uses single-day macro payload for event similarity semantics",
+      "detail": "HEAD build_event_memory_asof calls build_query_embedding with macro_history={feature_end_date: macro_payload}, while query embeddings use trailing macro history up to decision date."
+    },
+    {
+      "id": "B4",
+      "severity": "high",
+      "file": "backtest_app/research/pipeline.py",
+      "title": "Committed HEAD still has query/event transform semantic mismatch",
+      "detail": "HEAD has no authoritative transformed-feature contract shared by event, query, and prototype paths, and event/query macro windows are different."
+    }
+  ],
+  "working_tree_vs_head": [
+    {
+      "id": "W1",
+      "severity": "high",
+      "file": "backtest_app/historical_data/features.py",
+      "title": "Working tree introduces FeatureTransform and separates regime-only context",
+      "detail": "Current working tree adds FeatureTransform, transformed feature storage, regime_context_features, and default similarity exclusions that do not exist in committed HEAD."
+    },
+    {
+      "id": "W2",
+      "severity": "high",
+      "file": "backtest_app/research/pipeline.py",
+      "title": "Working tree changes event/query/prototype to a shared transform contract",
+      "detail": "Current working tree fits FeatureTransform on raw event rows, aliases scaler to transform.scaler, applies the same transform to queries, and persists transformed embeddings into prototype lineage."
+    },
+    {
+      "id": "W3",
+      "severity": "medium",
+      "file": "scripts/medium_viability_check.py",
+      "title": "Working tree medium driver has provenance and verdict gating not present in prior artifacts",
+      "detail": "Current working tree records authoritative provenance, metadata-application checks, and excludes dirty or misapplied runs from verdicts; older outputs were produced without that contract."
+    }
+  ],
+  "run_provenance_gap": [
+    {
+      "id": "P1",
+      "severity": "high",
+      "scope": "medium_viability_check artifacts",
+      "title": "Prior medium outputs are not authoritative",
+      "detail": "Existing medium artifacts were produced while committed HEAD truth and dirty working-tree truth were mixed, so they cannot be used for TOBE viability verdicts."
+    },
+    {
+      "id": "P2",
+      "severity": "high",
+      "scope": "feature_contract_diagnosis artifacts",
+      "title": "Prior diagnosis compared synthetic variants inside one code state",
+      "detail": "The previous diagnosis flow did not run clean baseline ref versus clean fixed state, so it did not establish a trustworthy baseline-vs-fixed comparison."
+    },
+    {
+      "id": "P3",
+      "severity": "high",
+      "scope": "all preexisting runs",
+      "title": "Run artifacts did not consistently pin git provenance",
+      "detail": "Branch, head_commit, dirty_worktree, changed_tracked_files, diff_fingerprint, and authoritative status were not consistently persisted, leaving run provenance ambiguous."
+    }
+  ]
+}

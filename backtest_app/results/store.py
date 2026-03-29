@@ -27,7 +27,8 @@ class JsonResultStore:
         return str(path)
 
     def save_run(self, *, run_id: str, plans: Iterable[OrderPlan], fills: Iterable[FillOutcome], summary: Mapping[str, object], diagnostics: Mapping[str, object] | None = None, manifest: Mapping[str, object] | None = None) -> str:
-        return self.save_blob(name=run_id, payload={"run_id": run_id, "namespace": self.namespace, "manifest": dict(manifest or {}), "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "summary": dict(summary), "diagnostics": dict(diagnostics or {})})
+        resolved_diagnostics = dict(diagnostics or {})
+        return self.save_blob(name=run_id, payload={"run_id": run_id, "namespace": self.namespace, "manifest": dict(manifest or {}), "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "summary": dict(summary), "diagnostics": resolved_diagnostics, "reproducibility": resolved_diagnostics.get("reproducibility")})
 
 
 @dataclass
