@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from backtest_app.configs.models import ResearchExperimentSpec
 from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory, guard_backtest_local_only
-from backtest_app.historical_data.features import SIMILARITY_CTX_SERIES
+from backtest_app.historical_data.features import SIMILARITY_CTX_SERIES, fit_feature_transform
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
 from backtest_app.historical_data.models import HistoricalBar
 from backtest_app.research.pipeline import BREADTH_POLICY_DIAGNOSTICS_ONLY_V1, _build_query_panel, build_event_memory_asof
@@ -113,6 +113,14 @@ def _timestamp_order_violation(source_ts_utc: str | None, anchor_ts_utc: str | N
     if not source_ts_utc or not anchor_ts_utc:
         return False
     return datetime.fromisoformat(str(source_ts_utc)) > datetime.fromisoformat(str(anchor_ts_utc))
+
+
+def _raw_event_rows_before_decision(event_records: list[Any], decision_date: str) -> list[dict[str, Any]]:
+    return [
+        dict(((getattr(record, "path_summary", {}) or {}).get("raw_features") or {}))
+        for record in event_records
+        if getattr(record, "outcome_end_date", None) and str(getattr(record, "outcome_end_date")) < decision_date
+    ]
 
 
 def build_row_record(
@@ -487,6 +495,8 @@ def diagnose_missingness(
     decision_dates = _trade_dates_in_window(bars_by_symbol, start_date=start_date, end_date=end_date)
     if max_dates > 0:
         decision_dates = decision_dates[-max_dates:]
+    if not decision_dates:
+        raise RuntimeError("No trade dates found in requested diagnosis window")
     rows: list[dict[str, Any]] = []
     contract = {
         "query_rows_total": 0,
@@ -502,38 +512,43 @@ def diagnose_missingness(
         "prototypes_with_anchor": 0,
         "rows_with_derived_macro_publish_time": 0,
     }
+    full_memory = build_event_memory_asof(
+        decision_date=decision_dates[-1],
+        spec=spec,
+        bars_by_symbol=bars_by_symbol,
+        macro_history_by_date=macro_history_by_date,
+        sector_map=sector_map,
+        market="US",
+        metadata=None,
+        session_metadata_by_symbol=session_metadata_by_symbol,
+        macro_series_history=macro_series_history,
+    )
+    event_records = list(full_memory["event_records"] or [])
+    prototype_pool = list(full_memory["prototypes"] or [])
+    shared_library_reasons = list(full_memory["excluded_reasons"] or [])
+    for record in event_records:
+        contract["event_records_total"] += 1
+        if getattr(record, "feature_anchor_ts_utc", None):
+            contract["event_records_with_anchor"] += 1
+        if ((getattr(record, "diagnostics", {}) or {}).get("breadth_policy")) == BREADTH_POLICY_DIAGNOSTICS_ONLY_V1:
+            contract["event_records_with_expected_breadth_policy"] += 1
+        if _timestamp_order_violation(getattr(record, "macro_asof_ts_utc", None), getattr(record, "feature_anchor_ts_utc", None)):
+            contract["event_macro_asof_violations"] += 1
+    for prototype in prototype_pool:
+        contract["prototypes_total"] += 1
+        if getattr(prototype, "feature_anchor_ts_utc", None):
+            contract["prototypes_with_anchor"] += 1
     for decision_date in decision_dates:
-        memory = build_event_memory_asof(
-            decision_date=decision_date,
-            spec=spec,
-            bars_by_symbol=bars_by_symbol,
-            macro_history_by_date=macro_history_by_date,
-            sector_map=sector_map,
-            market="US",
-            metadata=None,
-            session_metadata_by_symbol=session_metadata_by_symbol,
-            macro_series_history=macro_series_history,
-        )
-        for record in memory["event_records"]:
-            contract["event_records_total"] += 1
-            if getattr(record, "feature_anchor_ts_utc", None):
-                contract["event_records_with_anchor"] += 1
-            if ((getattr(record, "diagnostics", {}) or {}).get("breadth_policy")) == BREADTH_POLICY_DIAGNOSTICS_ONLY_V1:
-                contract["event_records_with_expected_breadth_policy"] += 1
-            if _timestamp_order_violation(getattr(record, "macro_asof_ts_utc", None), getattr(record, "feature_anchor_ts_utc", None)):
-                contract["event_macro_asof_violations"] += 1
-        for prototype in memory["prototypes"]:
-            contract["prototypes_total"] += 1
-            if getattr(prototype, "feature_anchor_ts_utc", None):
-                contract["prototypes_with_anchor"] += 1
+        raw_event_rows = _raw_event_rows_before_decision(event_records, decision_date)
+        transform = fit_feature_transform(raw_event_rows)
         query_panel, query_excluded = _build_query_panel(
             decision_dates=[decision_date],
             spec=spec,
             bars_by_symbol=bars_by_symbol,
             macro_history_by_date=macro_history_by_date,
             sector_map=sector_map,
-            scaler=memory["scaler"],
-            transform=memory["transform"],
+            scaler=transform.scaler,
+            transform=transform,
             metadata=None,
             session_metadata_by_symbol=session_metadata_by_symbol,
             macro_series_history=macro_series_history,
@@ -557,7 +572,7 @@ def diagnose_missingness(
         library_reasons_by_symbol: dict[str, list[str]] = {symbol: [] for symbol in symbols}
         for item in query_excluded:
             query_reasons_by_symbol.setdefault(str(item.get("symbol")), []).append(str(item.get("reason") or "unknown"))
-        for item in memory["excluded_reasons"]:
+        for item in shared_library_reasons:
             library_reasons_by_symbol.setdefault(str(item.get("symbol")), []).append(str(item.get("reason") or "unknown"))
         for symbol in symbols:
             symbol_dates = {str(bar.timestamp)[:10] for bar in bars_by_symbol.get(symbol, [])}
