@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from scripts.medium_viability_check import _pick_best_two_allowed, _rebuild_medium_root_outputs, _resolve_or_lock_support_pair, _support_pair_payload
+from backtest_app.configs.models import BacktestScenario
+from scripts.medium_viability_check import ProgressRecorder, _pick_best_two_allowed, _rebuild_medium_root_outputs, _resolve_or_lock_support_pair, _summarize_authoritative_artifact, _support_pair_payload, _verify_metadata_applied
 from scripts.support_config_audit import build_audit
 
 
@@ -204,3 +205,94 @@ def test_support_config_audit_uses_selected_support_pair_fallback_when_medium_su
     assert audit["selected_best1_source_run_label"] == "tiny_best1"
     assert audit["selected_best2_source_run_label"] == "tiny_best2"
     assert audit["medium_pair_matches_tiny_sources"] is True
+
+
+def test_progress_recorder_refreshes_last_progress_on_phase_change_without_counter_delta(tmp_path: Path):
+    recorder = ProgressRecorder(tmp_path, {"run_label": "best1", "child_run_label": "best1"})
+
+    recorder.emit(phase="candidate_generation", status="running", extra={"completed_trading_dates": 5})
+    first = _read_json(tmp_path / "status.json")["last_progress_at"]
+
+    recorder.emit(
+        phase="write_artifacts",
+        status="running",
+        extra={
+            "completed_trading_dates": 5,
+            "artifact_name": "authoritative_summary_prewrite",
+            "artifact_index": 1,
+            "artifact_total": 5,
+        },
+    )
+    second = _read_json(tmp_path / "status.json")["last_progress_at"]
+
+    assert second is not None
+    assert second != first
+
+
+def test_verify_metadata_applied_uses_authoritative_artifact_observed_fields():
+    saved_run = {
+        "support_metadata_observed": {
+            "top_k": 5,
+            "kernel_temperature": 6.0,
+            "use_kernel_weighting": True,
+            "min_effective_sample_size": 1.5,
+            "diagnostic_disable_ess_gate": True,
+            "diagnostic_disable_ess_gate_rows": [True],
+        },
+        "signal_panel_rows": [
+            {"decision_surface": {"gate_ablation": {"diagnostic_disable_ess_gate": True}}},
+        ],
+    }
+
+    applied = _verify_metadata_applied(
+        saved_run,
+        {
+            "top_k": "5",
+            "kernel_temperature": "6",
+            "use_kernel_weighting": "true",
+            "min_effective_sample_size": "1.5",
+            "diagnostic_disable_ess_gate": "true",
+        },
+    )
+
+    assert applied["applied"] is True
+    assert applied["checks"]["diagnostic_disable_ess_gate_rows"] is True
+
+
+def test_summarize_authoritative_artifact_rescues_child_failure(tmp_path: Path):
+    csv_path = tmp_path / "forecast_panel.csv"
+    parquet_path = tmp_path / "forecast_panel.parquet"
+    artifact_path = tmp_path / "authoritative_summary.json"
+    csv_path.write_text("decision_date,symbol\n2025-03-28,AAPL\n", encoding="utf-8")
+    parquet_path.write_text("placeholder", encoding="utf-8")
+    artifact_path.write_text("{}", encoding="utf-8")
+
+    summary = _summarize_authoritative_artifact(
+        "best1",
+        {"diagnostic_disable_ess_gate": "true"},
+        {
+            "scenario_id": "medium_smoke",
+            "window": {"start_date": "2025-03-28", "end_date": "2025-04-10"},
+            "symbols": ["AAPL"],
+            "authoritative": True,
+            "forecast_selected_count": 1,
+            "forecast_selected_dates": ["2025-03-28"],
+            "forecast_viable": True,
+            "candidate_count": 1,
+            "candidate_dates": ["2025-03-28"],
+            "fills_count": 0,
+            "trades_count": 0,
+            "deploy_viable": False,
+            "forecast_panel": {"csv_path": str(csv_path), "parquet_path": str(parquet_path)},
+            "support_metadata_observed": {"diagnostic_disable_ess_gate": True, "diagnostic_disable_ess_gate_rows": [True]},
+            "signal_panel_rows": [{"decision_surface": {"gate_ablation": {"diagnostic_disable_ess_gate": True}}}],
+        },
+        BacktestScenario(scenario_id="medium_smoke", market="US", start_date="2025-03-28", end_date="2025-04-10", symbols=["AAPL"]),
+        artifact_path=artifact_path,
+        child_summary={"ok": False},
+    )
+
+    assert summary is not None
+    assert summary["artifact_rescued"] is True
+    assert summary["verdict_eligible"] is True
+    assert "child_failed" not in summary["exclusion_reasons"]

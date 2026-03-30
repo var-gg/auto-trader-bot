@@ -61,7 +61,9 @@ PHASE_TIMEOUT_SECONDS = {
     "load_historical": 45 * 60,
     "candidate_generation": 4 * 60 * 60,
     "daily_execution": 5 * 60,
-    "write_artifacts": 2 * 60,
+    "summary_and_validation": 60 * 60,
+    "write_artifacts": 20 * 60,
+    "child_finalize": 20 * 60,
 }
 BASE_SPEC = ResearchExperimentSpec(
     feature_window_bars=60,
@@ -107,6 +109,16 @@ COUNTER_KEYS = [
     "plans_count",
     "fills_count",
     "bytes_written",
+]
+ARTIFACT_PROGRESS_KEYS = [
+    "artifact_name",
+    "artifact_index",
+    "artifact_total",
+    "artifact_rows",
+    "artifact_bytes",
+    "result_path",
+    "result_path_expected",
+    "authoritative_summary_path",
 ]
 SUMMARY_COLS = [
     "run_label",
@@ -225,10 +237,11 @@ def _saved_reproducibility(result: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _verify_metadata_applied(saved_run: dict[str, Any], metadata: dict[str, str]) -> dict[str, Any]:
-    support_metadata = {k: v for k, v in (metadata or {}).items() if k in ALLOWED_SUPPORT_KEYS}
-    if not support_metadata:
-        return {"checked": False, "applied": True, "expected": {}, "observed": {}, "checks": {}}
+def _observed_support_metadata(saved_run: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    artifact_observed = dict(saved_run.get("support_metadata_observed") or {})
+    artifact_panel_rows = list(saved_run.get("signal_panel_rows") or [])
+    if artifact_observed:
+        return artifact_observed, artifact_panel_rows
     signal_diagnostics = _saved_signal_diagnostics(saved_run)
     pipeline = dict(signal_diagnostics.get("pipeline") or {})
     ev_config = dict(pipeline.get("ev_config") or {})
@@ -240,6 +253,14 @@ def _verify_metadata_applied(saved_run: dict[str, Any], metadata: dict[str, str]
         "min_effective_sample_size": ev_config.get("min_effective_sample_size"),
         "diagnostic_disable_ess_gate": ev_config.get("diagnostic_disable_ess_gate"),
     }
+    return observed, panel_rows
+
+
+def _verify_metadata_applied(saved_run: dict[str, Any], metadata: dict[str, str]) -> dict[str, Any]:
+    support_metadata = {k: v for k, v in (metadata or {}).items() if k in ALLOWED_SUPPORT_KEYS}
+    if not support_metadata:
+        return {"checked": False, "applied": True, "expected": {}, "observed": {}, "checks": {}}
+    observed, panel_rows = _observed_support_metadata(saved_run)
     checks: dict[str, bool] = {}
     for key, raw_value in support_metadata.items():
         if key == "top_k":
@@ -253,7 +274,8 @@ def _verify_metadata_applied(saved_run: dict[str, Any], metadata: dict[str, str]
         elif key == "diagnostic_disable_ess_gate":
             expected_bool = _metadata_bool(raw_value)
             checks[key] = bool(observed.get(key)) == expected_bool
-            gate_values = {
+            gate_row_values = observed.get("diagnostic_disable_ess_gate_rows")
+            gate_values = {bool(value) for value in gate_row_values} if isinstance(gate_row_values, list) else {
                 bool(((row.get("decision_surface") or {}).get("gate_ablation") or {}).get("diagnostic_disable_ess_gate"))
                 for row in panel_rows
                 if isinstance(row, dict)
@@ -270,11 +292,56 @@ def _verify_metadata_applied(saved_run: dict[str, Any], metadata: dict[str, str]
     }
 
 
+def _summarize_authoritative_artifact(run_label: str, metadata: dict[str, str], artifact: dict[str, Any], scenario: BacktestScenario, *, artifact_path: Path, child_summary: dict[str, Any]) -> dict[str, Any] | None:
+    forecast_panel = dict(artifact.get("forecast_panel") or {})
+    csv_path = Path(str(forecast_panel.get("csv_path") or "")) if forecast_panel.get("csv_path") else None
+    parquet_path = Path(str(forecast_panel.get("parquet_path") or "")) if forecast_panel.get("parquet_path") else None
+    if not bool(artifact.get("authoritative")) or csv_path is None or parquet_path is None or not csv_path.exists() or not parquet_path.exists():
+        return None
+    summary = {
+        "run_label": run_label,
+        "support_fingerprint": _support_fingerprint(metadata),
+        "scenario_id": artifact.get("scenario_id") or scenario.scenario_id,
+        "window": dict(artifact.get("window") or {"start_date": scenario.start_date, "end_date": scenario.end_date}),
+        "symbols": list(artifact.get("symbols") or scenario.symbols),
+        "authoritative": bool(artifact.get("authoritative")),
+        "branch": artifact.get("branch"),
+        "head_commit": artifact.get("head_commit"),
+        "dirty_worktree": artifact.get("dirty_worktree"),
+        "changed_tracked_files": list(artifact.get("changed_tracked_files") or []),
+        "diff_fingerprint": artifact.get("diff_fingerprint"),
+        "forecast_selected_count": int(artifact.get("forecast_selected_count") or 0),
+        "forecast_selected_dates": list(artifact.get("forecast_selected_dates") or []),
+        "forecast_viable": bool(artifact.get("forecast_viable", False)),
+        "deploy_viable": bool(artifact.get("deploy_viable", False)),
+        "candidate_count": int(artifact.get("candidate_count") or 0),
+        "candidate_dates": list(artifact.get("candidate_dates") or []),
+        "buy_pass_count": int(artifact.get("buy_pass_count") or 0),
+        "sell_pass_count": int(artifact.get("sell_pass_count") or 0),
+        "n_eff_histogram": dict(artifact.get("n_eff_histogram") or {}),
+        "top1_weight_histogram": dict(artifact.get("top1_weight_histogram") or {}),
+        "abstain_reason_histogram": dict(artifact.get("abstain_reason_histogram") or {}),
+        "fills_count": int(artifact.get("fills_count") or 0),
+        "trades_count": int(artifact.get("trades_count") or 0),
+        "result_path": artifact.get("result_path") or str(artifact_path.resolve()),
+        "metadata": metadata,
+        "child_summary": child_summary,
+        "artifact_rescued": True,
+        "forecast_panel": forecast_panel,
+        "support_metadata_observed": dict(artifact.get("support_metadata_observed") or {}),
+        "signal_panel_rows": list(artifact.get("signal_panel_rows") or []),
+    }
+    summary["metadata_application"] = _verify_metadata_applied(summary, metadata)
+    summary["exclusion_reasons"] = _summary_exclusion_reasons(summary)
+    summary["verdict_eligible"] = not summary["exclusion_reasons"]
+    return summary
+
+
 def _summary_exclusion_reasons(summary: dict[str, Any] | None) -> list[str]:
     row = dict(summary or {})
     reasons: list[str] = []
     child_summary = dict(row.get("child_summary") or {})
-    if child_summary and not bool(child_summary.get("ok")):
+    if child_summary and not bool(child_summary.get("ok")) and not bool(row.get("artifact_rescued", False)):
         reasons.append("child_failed")
     if not bool(row.get("authoritative")):
         reasons.append("non_authoritative")
@@ -382,8 +449,12 @@ class ProgressRecorder:
         self.static_payload = dict(static_payload)
         self.counters = _initial_counters()
         self.last_progress_at: str | None = None
+        self.last_phase: str | None = None
+        self.last_status: str | None = None
+        self.last_artifact_progress: dict[str, Any] = {}
 
     def emit(self, *, phase: str, status: str, extra: dict[str, Any] | None = None) -> None:
+        now = datetime.now().isoformat()
         raw_extra = dict(extra or {})
         extra = {k: v for k, v in raw_extra.items() if v is not None}
         changed = False
@@ -397,14 +468,17 @@ class ProgressRecorder:
                 changed = True
             else:
                 extra[key] = int(self.counters.get(key, 0))
-        should_write = phase in {"child_start", "child_finalize", "complete", "failed_no_artifact", "exception", "stall_detected"} or changed
-        if changed:
-            self.last_progress_at = datetime.now().isoformat()
+        artifact_progress = {key: extra.get(key) for key in ARTIFACT_PROGRESS_KEYS if extra.get(key) is not None}
+        phase_changed = phase != self.last_phase or status != self.last_status
+        artifact_changed = artifact_progress != self.last_artifact_progress
+        should_write = phase in {"child_start", "child_finalize", "complete", "failed_no_artifact", "exception", "stall_detected"} or changed or phase_changed or artifact_changed
+        if changed or phase_changed or artifact_changed:
+            self.last_progress_at = now
         payload = {
             **self.static_payload,
             "status": status,
             "phase": phase,
-            "event_at": datetime.now().isoformat(),
+            "event_at": now,
             "last_progress_at": self.last_progress_at,
             **self.counters,
             **extra,
@@ -412,6 +486,9 @@ class ProgressRecorder:
         if should_write:
             _append_jsonl(self.progress_path, payload)
         _write_json(self.status_path, payload)
+        self.last_phase = phase
+        self.last_status = status
+        self.last_artifact_progress = artifact_progress
 
 
 def _sum_dir_bytes(path: Path) -> int:
@@ -775,7 +852,23 @@ def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, A
     return summary
 
 
-def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, preflight: dict[str, Any], scenario: BacktestScenario, metadata: dict[str, str], result: dict[str, Any], git_commit: str) -> None:
+def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, preflight: dict[str, Any], scenario: BacktestScenario, metadata: dict[str, str], result: dict[str, Any], git_commit: str, progress_callback=None) -> None:
+    artifact_total = 8
+
+    def _emit_bundle_progress(artifact_name: str, artifact_index: int, extra: dict[str, Any] | None = None) -> None:
+        if not progress_callback:
+            return
+        progress_callback({
+            "phase": "child_finalize",
+            "status": "running",
+            "artifact_name": artifact_name,
+            "artifact_index": artifact_index,
+            "artifact_total": artifact_total,
+            "artifact_bytes": _sum_dir_bytes(run_dir),
+            "bytes_written": _sum_dir_bytes(run_dir),
+            **dict(extra or {}),
+        })
+
     reproducibility = _live_result_reproducibility(result)
     manifest = _read_json(run_dir / "manifest.json")
     manifest.update({
@@ -808,7 +901,9 @@ def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, pr
         "diff_fingerprint": reproducibility.get("diff_fingerprint"),
     })
     _write_json(run_dir / "manifest.json", manifest)
+    _emit_bundle_progress("manifest", 1)
     _write_json(run_dir / "reproducibility.json", reproducibility)
+    _emit_bundle_progress("reproducibility", 2)
     fold_report = {
         "run_id": run_id,
         "strategy_mode": strategy_mode,
@@ -816,10 +911,13 @@ def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, pr
         "holdout": fold_report_summary({}),
     }
     _write_json(run_dir / "fold_report.json", fold_report)
+    _emit_bundle_progress("fold_report", 3)
     decisions_rows = [{"phase": "discovery", **row} for row in ((result.get("portfolio") or {}).get("decisions") or [])]
     trades_rows = [{"phase": "discovery", **row} for row in (result.get("fills") or [])]
     write_csv(run_dir / "decisions.csv", decisions_rows)
+    _emit_bundle_progress("decisions_csv", 4)
     write_csv(run_dir / "trades.csv", trades_rows)
+    _emit_bundle_progress("trades_csv", 5)
     diagnostics = {
         "discovery": result.get("diagnostics"),
         "holdout": {},
@@ -829,6 +927,7 @@ def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, pr
         "reproducibility": reproducibility,
     }
     _write_json(run_dir / "diagnostics.json", diagnostics)
+    _emit_bundle_progress("diagnostics_json", 6)
     aggregate = ((result.get("validation") or {}).get("fold_engine") or {}).get("aggregate") or {}
     discovery_direct = direct_metrics(result, len(scenario.symbols))
     side_split = summarize_side_split(result.get("plans") or [])
@@ -881,9 +980,11 @@ def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, pr
         "diff_fingerprint": reproducibility.get("diff_fingerprint"),
     }
     _write_json(run_dir / "run_card.json", run_card)
+    _emit_bundle_progress("run_card", 7)
     report_md = build_report_md(run_card=run_card, discovery=result, holdout={}, previous_rows=load_leaderboard_rows(run_dir.parent / "leaderboard.csv"))
     (run_dir / "report.md").write_text(report_md, encoding="utf-8")
     append_leaderboard(run_dir.parent / "leaderboard.csv", run_card)
+    _emit_bundle_progress("report_and_leaderboard", 8)
 
 
 def _mark_stall_error(run_dir: Path, stall_reason: str) -> None:
@@ -1020,6 +1121,13 @@ def _child_run(run_dir: Path) -> int:
             "bytes_written": update.get("bytes_written"),
             "current_decision_date": update.get("current_decision_date"),
             "result_path": update.get("result_path"),
+            "result_path_expected": update.get("result_path_expected"),
+            "artifact_name": update.get("artifact_name"),
+            "artifact_index": update.get("artifact_index"),
+            "artifact_total": update.get("artifact_total"),
+            "artifact_rows": update.get("artifact_rows"),
+            "artifact_bytes": update.get("artifact_bytes"),
+            "authoritative_summary_path": update.get("authoritative_summary_path"),
         }
         recorder.emit(phase=mapped.pop("phase"), status=mapped.pop("status"), extra=mapped)
 
@@ -1039,7 +1147,7 @@ def _child_run(run_dir: Path) -> int:
         result_path = Path(str(result.get("result_path") or expected_path))
         bytes_written = _sum_dir_bytes(run_dir)
         recorder.emit(phase="child_finalize", status="running", extra={"result_path": str(result_path), "result_path_expected": str(expected_path), "bytes_written": bytes_written})
-        _write_contract_bundle(run_dir=run_dir, run_id=manifest["run_label"], strategy_mode="research_similarity_v2", preflight=manifest["preflight"], scenario=scenario, metadata=metadata, result=result, git_commit=manifest["driver"]["head_commit"])
+        _write_contract_bundle(run_dir=run_dir, run_id=manifest["run_label"], strategy_mode="research_similarity_v2", preflight=manifest["preflight"], scenario=scenario, metadata=metadata, result=result, git_commit=manifest["driver"]["head_commit"], progress_callback=_progress)
         if not result_path.exists():
             recorder.emit(phase="failed_no_artifact", status="error", extra={"result_path": str(result_path), "result_path_expected": str(expected_path), "bytes_written": bytes_written, "stall_reason": "FAILED_NO_ARTIFACT"})
             return 1
@@ -1158,6 +1266,19 @@ def _run_medium_case(output_root: Path, run_label: str, scenario: BacktestScenar
     )
     child_summary = _run_prepared_child(run_dir)
     if not child_summary["ok"]:
+        artifact_path = run_dir / "authoritative_summary.json"
+        artifact_payload = _read_json(artifact_path)
+        rescued_summary = _summarize_authoritative_artifact(
+            run_label,
+            metadata,
+            artifact_payload,
+            scenario,
+            artifact_path=artifact_path,
+            child_summary=child_summary,
+        ) if artifact_payload else None
+        if rescued_summary is not None:
+            _write_json(run_dir / "summary.json", rescued_summary)
+            return rescued_summary
         metadata_application = {
             "checked": bool({k: v for k, v in metadata.items() if k in ALLOWED_SUPPORT_KEYS}),
             "applied": False,

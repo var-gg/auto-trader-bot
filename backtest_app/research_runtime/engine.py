@@ -203,7 +203,7 @@ def _forecast_rows(signal_panel_payload: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, signal_panel_payload: Any) -> dict[str, Any]:
+def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, signal_panel_payload: Any, progress_callback=None, total_trading_dates: int = 0, completed_trading_dates: int = 0, candidate_rows: int = 0, plans_count: int = 0, fills_count: int = 0) -> dict[str, Any]:
     rows = _forecast_rows(signal_panel_payload)
     if not rows:
         return {"row_count": 0, "csv_path": None, "parquet_path": None}
@@ -215,14 +215,58 @@ def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, signal_pane
     run_dir.mkdir(parents=True, exist_ok=True)
     csv_path = run_dir / "forecast_panel.csv"
     parquet_path = run_dir / "forecast_panel.parquet"
+    _emit_progress(progress_callback, {
+        "phase": "write_artifacts",
+        "status": "running",
+        "artifact_name": "forecast_panel_prepare",
+        "artifact_index": 2,
+        "artifact_total": 5,
+        "artifact_rows": len(rows),
+        "bytes_written": 0,
+        "candidate_rows": candidate_rows,
+        "plans_count": plans_count,
+        "fills_count": fills_count,
+        "total_trading_dates": total_trading_dates,
+        "completed_trading_dates": completed_trading_dates,
+    })
     frame = pd.DataFrame(rows)
     frame.to_csv(csv_path, index=False)
+    _emit_progress(progress_callback, {
+        "phase": "write_artifacts",
+        "status": "running",
+        "artifact_name": "forecast_panel_csv",
+        "artifact_index": 3,
+        "artifact_total": 5,
+        "artifact_rows": len(rows),
+        "artifact_bytes": csv_path.stat().st_size if csv_path.exists() else 0,
+        "bytes_written": csv_path.stat().st_size if csv_path.exists() else 0,
+        "candidate_rows": candidate_rows,
+        "plans_count": plans_count,
+        "fills_count": fills_count,
+        "total_trading_dates": total_trading_dates,
+        "completed_trading_dates": completed_trading_dates,
+    })
     parquet_format = "parquet"
     try:
         frame.to_parquet(parquet_path, index=False)
     except Exception:
         parquet_path.write_text(json.dumps({"format": "json_fallback", "rows": rows}, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         parquet_format = "json_fallback"
+    _emit_progress(progress_callback, {
+        "phase": "write_artifacts",
+        "status": "running",
+        "artifact_name": "forecast_panel_parquet",
+        "artifact_index": 4,
+        "artifact_total": 5,
+        "artifact_rows": len(rows),
+        "artifact_bytes": parquet_path.stat().st_size if parquet_path.exists() else 0,
+        "bytes_written": sum(path.stat().st_size for path in [csv_path, parquet_path] if path.exists()),
+        "candidate_rows": candidate_rows,
+        "plans_count": plans_count,
+        "fills_count": fills_count,
+        "total_trading_dates": total_trading_dates,
+        "completed_trading_dates": completed_trading_dates,
+    })
     return {
         "row_count": len(rows),
         "csv_path": str(csv_path),
@@ -290,6 +334,115 @@ def _date_str(value) -> str | None:
 
 def _candidate_decision_date(candidate) -> str | None:
     return _date_str(candidate.reference_date) or _date_str(candidate.anchor_date)
+
+
+def _emit_progress(progress_callback, payload: dict[str, Any]) -> None:
+    if progress_callback:
+        progress_callback(payload)
+
+
+def _support_metadata_observed(raw_diagnostics: dict[str, Any] | None, signal_panel_payload: Any) -> dict[str, Any]:
+    pipeline = dict(((raw_diagnostics or {}).get("pipeline") or {}))
+    ev_config = dict(pipeline.get("ev_config") or {})
+    observed = {
+        "top_k": pipeline.get("top_k"),
+        "kernel_temperature": ev_config.get("kernel_temperature"),
+        "use_kernel_weighting": ev_config.get("use_kernel_weighting"),
+        "min_effective_sample_size": ev_config.get("min_effective_sample_size"),
+        "diagnostic_disable_ess_gate": ev_config.get("diagnostic_disable_ess_gate"),
+    }
+    gate_values = {
+        bool(((row.get("decision_surface") or {}).get("gate_ablation") or {}).get("diagnostic_disable_ess_gate"))
+        for row in list(signal_panel_payload or [])
+        if isinstance(row, dict)
+    }
+    if gate_values:
+        observed["diagnostic_disable_ess_gate_rows"] = sorted(gate_values)
+    return observed
+
+
+def _authoritative_summary_payload(
+    *,
+    request: RunnerRequest,
+    raw_diagnostics: dict[str, Any] | None,
+    signal_panel_payload: Any,
+    selected_symbols: list[dict[str, Any]],
+    plans: list[Any],
+    fills: list[Any],
+    reproducibility: dict[str, Any],
+    forecast_panel_artifact: dict[str, Any],
+    result_path: str | None,
+) -> dict[str, Any]:
+    panel = list(signal_panel_payload or [])
+    abstain: dict[str, int] = {}
+    buy_pass_count = 0
+    sell_pass_count = 0
+    n_eff_histogram: dict[str, int] = {}
+    top1_weight_histogram: dict[str, int] = {}
+    forecast_selected_count = 0
+    forecast_selected_dates: set[str] = set()
+    for row in panel:
+        ds = row.get("decision_surface") or {}
+        chosen_side = str(ds.get("chosen_side") or "ABSTAIN")
+        if not bool(ds.get("abstain", False)) and chosen_side != "ABSTAIN":
+            forecast_selected_count += 1
+            if row.get("decision_date"):
+                forecast_selected_dates.add(str(row.get("decision_date")))
+        for reason in ds.get("abstain_reasons") or []:
+            abstain[str(reason)] = abstain.get(str(reason), 0) + 1
+        buy_reasons = (((row.get("ev") or {}).get("buy") or {}).get("abstain_reasons") or [])
+        sell_reasons = (((row.get("ev") or {}).get("sell") or {}).get("abstain_reasons") or [])
+        if not buy_reasons:
+            buy_pass_count += 1
+        if not sell_reasons:
+            sell_pass_count += 1
+        for side_key in ("buy", "sell"):
+            n_eff = (((row.get("scorer_diagnostics") or {}).get(side_key) or {}).get("n_eff"))
+            if n_eff is not None:
+                bucket = f"{float(n_eff):.1f}"
+                n_eff_histogram[bucket] = n_eff_histogram.get(bucket, 0) + 1
+        for side_key in ("long", "short"):
+            matches = (((row.get("top_matches") or {}).get(side_key)) or [])
+            if matches:
+                weight = float((matches[0] or {}).get("weight", 0.0) or 0.0)
+                bucket = f"{weight:.1f}"
+                top1_weight_histogram[bucket] = top1_weight_histogram.get(bucket, 0) + 1
+    filled = [f for f in fills if str((f.get("fill_status") or "")).upper() in {"FULL", "PARTIAL"}]
+    candidate_dates = sorted({str(item.get("decision_date")) for item in selected_symbols if item.get("decision_date")})
+    return {
+        "scenario_id": request.scenario.scenario_id,
+        "window": {"start_date": request.scenario.start_date, "end_date": request.scenario.end_date},
+        "symbols": list(request.scenario.symbols),
+        "metadata": dict(request.config.metadata or {}),
+        "authoritative": bool(reproducibility.get("authoritative", False)),
+        "branch": reproducibility.get("branch"),
+        "head_commit": reproducibility.get("head_commit"),
+        "dirty_worktree": reproducibility.get("dirty_worktree"),
+        "changed_tracked_files": reproducibility.get("changed_tracked_files", []),
+        "diff_fingerprint": reproducibility.get("diff_fingerprint"),
+        "forecast_selected_count": forecast_selected_count,
+        "forecast_selected_dates": sorted(forecast_selected_dates),
+        "forecast_viable": forecast_selected_count > 0,
+        "candidate_count": len(selected_symbols),
+        "candidate_dates": candidate_dates,
+        "buy_pass_count": buy_pass_count,
+        "sell_pass_count": sell_pass_count,
+        "n_eff_histogram": dict(sorted(n_eff_histogram.items())),
+        "top1_weight_histogram": dict(sorted(top1_weight_histogram.items())),
+        "abstain_reason_histogram": dict(sorted(abstain.items())),
+        "fills_count": len(filled),
+        "trades_count": len(plans),
+        "deploy_viable": len(filled) > 0 and len(plans) > 0,
+        "forecast_panel": dict(forecast_panel_artifact or {}),
+        "result_path": result_path,
+        "support_metadata_observed": _support_metadata_observed(raw_diagnostics, signal_panel_payload),
+    }
+
+
+def _write_authoritative_summary_artifact(*, output_dir: str, payload: dict[str, Any]) -> str:
+    path = Path(output_dir) / "authoritative_summary.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    return str(path)
 
 
 def _candidate_groups(candidates, *, start_date: str, end_date: str):
@@ -534,19 +687,72 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
         snapshot_info = {"data_source": data_source, "strategy_mode": strategy_mode, "historical_metadata": historical_metadata, "date_artifacts": date_artifacts, "reproducibility": reproducibility}
         result["sql_run_id"] = SqlResultStore(sql_db_url, namespace="research").save_run(run_key=manifest.manifest_id(), scenario_id=request.scenario.scenario_id, strategy_id=request.scenario.strategy_id, strategy_mode=strategy_mode, market=request.scenario.market, data_source=data_source, config_version=request.scenario.strategy_version, label_version=str(request.config.metadata.get("label_version", "v1")), vector_version=str(request.config.metadata.get("vector_version", strategy_mode)), initial_capital=request.config.initial_capital, params={"scenario_params": request.scenario.params, "scenario_notes": request.scenario.notes, "config_metadata": request.config.metadata}, summary=summary.__dict__, diagnostics={**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, plans=plans, fills=fills, snapshot_info=snapshot_info, manifest=manifest.to_dict())
     if output_dir and save_json:
-        if progress_callback:
-            progress_callback({"phase": "write_artifacts", "status": "running", "total_trading_dates": len(trading_dates), "completed_trading_dates": len(trading_dates)})
+        authoritative_summary = _authoritative_summary_payload(
+            request=request,
+            raw_diagnostics=raw_diagnostics,
+            signal_panel_payload=signal_panel_payload,
+            selected_symbols=selected_symbols,
+            plans=result["plans"],
+            fills=result["fills"],
+            reproducibility=reproducibility,
+            forecast_panel_artifact=forecast_panel_artifact,
+            result_path=None,
+        )
+        authoritative_summary_path = _write_authoritative_summary_artifact(output_dir=output_dir, payload=authoritative_summary)
+        _emit_progress(progress_callback, {
+            "phase": "write_artifacts",
+            "status": "running",
+            "artifact_name": "authoritative_summary_prewrite",
+            "artifact_index": 1,
+            "artifact_total": 5,
+            "artifact_bytes": Path(authoritative_summary_path).stat().st_size if Path(authoritative_summary_path).exists() else 0,
+            "bytes_written": Path(authoritative_summary_path).stat().st_size if Path(authoritative_summary_path).exists() else 0,
+            "authoritative_summary_path": authoritative_summary_path,
+            "candidate_rows": len(historical.candidates or []),
+            "plans_count": len(plans),
+            "fills_count": len(fills),
+            "total_trading_dates": len(trading_dates),
+            "completed_trading_dates": len(trading_dates),
+        })
         write_timer = _stage_timer(emit_timing_logs, "write_artifacts")
-        forecast_panel_artifact = _write_forecast_panel_artifacts(output_dir=output_dir, run_id=manifest.manifest_id(), signal_panel_payload=signal_panel_payload)
+        forecast_panel_artifact = _write_forecast_panel_artifacts(
+            output_dir=output_dir,
+            run_id=manifest.manifest_id(),
+            signal_panel_payload=signal_panel_payload,
+            progress_callback=progress_callback,
+            total_trading_dates=len(trading_dates),
+            completed_trading_dates=len(trading_dates),
+            candidate_rows=len(historical.candidates or []),
+            plans_count=len(plans),
+            fills_count=len(fills),
+        )
         result["artifacts"]["forecast_panel"] = forecast_panel_artifact
+        authoritative_summary["forecast_panel"] = forecast_panel_artifact
+        authoritative_summary_path = _write_authoritative_summary_artifact(output_dir=output_dir, payload=authoritative_summary)
         result["result_path"] = JsonResultStore(output_dir, namespace="research").save_run(run_id=manifest.manifest_id(), plans=plans, fills=fills, summary={**summary.__dict__, "diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "strategy_mode": strategy_mode}, diagnostics={"quote_policy_sweep": quote_policy_sweep, "portfolio": result["portfolio"], "signal_diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "reproducibility": reproducibility}, manifest=manifest.to_dict())
+        authoritative_summary["result_path"] = result.get("result_path")
+        authoritative_summary_path = _write_authoritative_summary_artifact(output_dir=output_dir, payload=authoritative_summary)
         write_timer(result.get("result_path") or "")
-        if progress_callback:
-            try:
-                bytes_written = Path(str(result.get("result_path"))).stat().st_size if result.get("result_path") else 0
-            except Exception:
-                bytes_written = 0
-            progress_callback({"phase": "write_artifacts", "status": "running", "total_trading_dates": len(trading_dates), "completed_trading_dates": len(trading_dates), "plans_count": len(plans), "fills_count": len(fills), "candidate_rows": len(historical.candidates or []), "bytes_written": bytes_written, "result_path": result.get("result_path")})
+        try:
+            result_bytes = Path(str(result.get("result_path"))).stat().st_size if result.get("result_path") else 0
+        except Exception:
+            result_bytes = 0
+        _emit_progress(progress_callback, {
+            "phase": "write_artifacts",
+            "status": "running",
+            "artifact_name": "result_json",
+            "artifact_index": 5,
+            "artifact_total": 5,
+            "artifact_bytes": result_bytes,
+            "bytes_written": result_bytes + (Path(authoritative_summary_path).stat().st_size if Path(authoritative_summary_path).exists() else 0),
+            "candidate_rows": len(historical.candidates or []),
+            "plans_count": len(plans),
+            "fills_count": len(fills),
+            "total_trading_dates": len(trading_dates),
+            "completed_trading_dates": len(trading_dates),
+            "result_path": result.get("result_path"),
+            "authoritative_summary_path": authoritative_summary_path,
+        })
     if progress_callback:
         progress_callback({"phase": "complete", "status": "ok", "total_trading_dates": len(trading_dates), "completed_trading_dates": len(trading_dates), "plans_count": len(plans), "fills_count": len(fills), "candidate_rows": len(historical.candidates or []), "result_path": result.get("result_path")})
     total_timer(f"plans={len(plans)} fills={len(fills)}")
