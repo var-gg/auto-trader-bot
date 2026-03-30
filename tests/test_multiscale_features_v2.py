@@ -1,5 +1,6 @@
 from backtest_app.historical_data.features import build_multiscale_feature_vector, fit_feature_scaler, fit_feature_transform
 from backtest_app.historical_data.models import HistoricalBar
+from backtest_app.research.pipeline import _regime_from_context_features, _regime_from_macro_raw
 
 
 def _bars(symbol: str, start: int = 1):
@@ -112,3 +113,44 @@ def test_ablation_shape_plus_liquidity_uses_non_absolute_dollar_volume_by_defaul
     fv_with_abs = build_multiscale_feature_vector(symbol="AAPL", bars=_bars("AAPL"), market_bars=_bars("MKT"), sector_bars=_bars("TECH"), macro_history={}, sector_code="TECH", use_dollar_volume_absolute=True)
     assert "dollar_volume" in fv_with_abs.raw_shape_features
     assert fv_with_abs.metadata["use_dollar_volume_absolute"] is True
+
+
+def test_normalized_regime_context_features_are_exposed_without_raw_levels():
+    fv = build_multiscale_feature_vector(symbol="AAPL", bars=_bars("AAPL"), market_bars=_bars("MKT"), sector_bars=_bars("TECH"), macro_history=_macro_history(), sector_code="TECH")
+    assert fv.normalized_regime_context_features
+    assert all(not key.endswith("_level") for key in fv.normalized_regime_context_features)
+    assert set(fv.normalized_regime_context_features).issubset(set(fv.raw_context_features))
+    assert fv.metadata["normalized_regime_ctx_keys"] == sorted(fv.normalized_regime_context_features.keys())
+
+
+def test_transform_zero_fill_bookkeeping_is_recorded():
+    fv_train = build_multiscale_feature_vector(symbol="AAPL", bars=_bars("AAPL"), market_bars=_bars("MKT"), sector_bars=_bars("TECH"), macro_history=_macro_history(), sector_code="TECH")
+    transform = fit_feature_transform([fv_train.raw_features])
+    fv_query = build_multiscale_feature_vector(
+        symbol="AAPL",
+        bars=_bars("AAPL"),
+        market_bars=_bars("MKT"),
+        sector_bars=_bars("TECH"),
+        macro_history={},
+        sector_code="TECH",
+        transform=transform,
+    )
+    missing_keys = set(fv_query.metadata["transform_missing_keys_filled_zero"])
+    assert "vix_zscore_20" in missing_keys
+    assert "rate_pct_change_20" in missing_keys
+    assert fv_query.metadata["transformed_zero_feature_keys"]
+
+
+def test_normalized_regime_path_is_more_scale_stable_than_raw_macro_average():
+    normalized = {
+        "vix_zscore_20": -1.0,
+        "rate_zscore_20": -0.5,
+        "dollar_zscore_20": -0.2,
+        "oil_zscore_20": 0.4,
+        "breadth_zscore_20": 1.2,
+    }
+    raw_macro_a = {"vix": 25.0, "rate": 3.5, "dollar": 101.0, "oil": 75.0, "breadth": 0.3}
+    raw_macro_b = {"vix": -90.0, "rate": -8.0, "dollar": -110.0, "oil": -70.0, "breadth": -0.3}
+    assert _regime_from_context_features(normalized) == "RISK_OFF"
+    assert _regime_from_context_features(normalized) == _regime_from_context_features(dict(normalized))
+    assert _regime_from_macro_raw(raw_macro_a) != _regime_from_macro_raw(raw_macro_b)

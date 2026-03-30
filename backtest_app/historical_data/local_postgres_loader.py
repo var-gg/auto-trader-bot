@@ -10,10 +10,45 @@ from backtest_app.configs.models import ResearchExperimentSpec
 from backtest_app.research.pipeline import generate_similarity_candidates, generate_similarity_candidates_rolling
 from shared.domain.models import MarketCode, MarketSnapshot, OutcomeLabel, Side, SignalCandidate
 
-from .features import compute_bar_features
+from .features import CTX_SERIES, compute_bar_features
 from .models import HistoricalBar, HistoricalSlice
 
 WARMUP_DAYS = 120
+MACRO_SERIES_NAME_TO_CANONICAL = {
+    "vix": "vix",
+    "rate": "rate",
+    "dollar": "dollar",
+    "oil": "oil",
+    "breadth": "breadth",
+    "CBOE Volatility Index: VIX": "vix",
+    "Federal Funds Effective Rate": "rate",
+    "Nominal Broad U.S. Dollar Index": "dollar",
+    "Crude Oil Prices: West Texas Intermediate (WTI) - Cushing, Oklahoma": "oil",
+}
+CANONICAL_MACRO_SOURCE_NAMES = sorted(MACRO_SERIES_NAME_TO_CANONICAL.keys())
+
+
+def _canonical_macro_series_name(raw_name: str | None) -> str | None:
+    if raw_name is None:
+        return None
+    return MACRO_SERIES_NAME_TO_CANONICAL.get(str(raw_name).strip())
+
+
+def _canonicalize_macro_rows(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    out: List[Dict[str, object]] = []
+    for row in rows:
+        canonical_name = _canonical_macro_series_name(str(row.get("name") or ""))
+        if not canonical_name or row.get("value") is None:
+            continue
+        out.append(
+            {
+                **row,
+                "name": canonical_name,
+                "raw_name": str(row.get("name") or ""),
+                "value": float(row["value"]),
+            }
+        )
+    return out
 
 
 class LocalPostgresLoader:
@@ -80,13 +115,15 @@ class LocalPostgresLoader:
                   FROM {self.schema}.macro_data_series_value v
                   JOIN {self.schema}.macro_data_series s ON s.id = v.series_id
                  WHERE v.obs_date <= CAST(:as_of AS date)
+                   AND s.name = ANY(:series_names)
             ) latest
             WHERE latest.rn = 1
             """)
         try:
             with self.session_factory() as session:
-                rows = [dict(r._mapping) for r in session.execute(sql, {"as_of": as_of})]
-            return {str(r["name"]): float(r["value"]) for r in rows if r.get("value") is not None}
+                rows = [dict(r._mapping) for r in session.execute(sql, {"as_of": as_of, "series_names": CANONICAL_MACRO_SOURCE_NAMES})]
+            canonical_rows = _canonicalize_macro_rows(rows)
+            return {str(r["name"]): float(r["value"]) for r in canonical_rows if str(r["name"]) in CTX_SERIES}
         except Exception:
             return {}
 
@@ -96,6 +133,7 @@ class LocalPostgresLoader:
               FROM {self.schema}.macro_data_series_value v
               JOIN {self.schema}.macro_data_series s ON s.id = v.series_id
              WHERE v.obs_date BETWEEN CAST(:prewarm_start AS date) AND CAST(:end_date AS date)
+               AND s.name = ANY(:series_names)
              ORDER BY v.obs_date, s.name
             """)
         by_date: Dict[str, Dict[str, float]] = {}
@@ -103,13 +141,12 @@ class LocalPostgresLoader:
         try:
             prewarm_start = (datetime.fromisoformat(start_date) - timedelta(days=prewarm_days)).date().isoformat()
             with self.session_factory() as session:
-                rows = [dict(r._mapping) for r in session.execute(sql, {"prewarm_start": prewarm_start, "end_date": end_date})]
-            for row in rows:
+                rows = [dict(r._mapping) for r in session.execute(sql, {"prewarm_start": prewarm_start, "end_date": end_date, "series_names": CANONICAL_MACRO_SOURCE_NAMES})]
+            for row in _canonicalize_macro_rows(rows):
                 d = str(row["obs_date"])
                 by_date.setdefault(d, dict(last_seen))
-                if row.get("value") is not None:
-                    last_seen[str(row["name"])] = float(row["value"])
-                    by_date[d][str(row["name"])] = float(row["value"])
+                last_seen[str(row["name"])] = float(row["value"])
+                by_date[d][str(row["name"])] = float(row["value"])
             cursor = datetime.fromisoformat(start_date)
             end = datetime.fromisoformat(end_date)
             while cursor <= end:

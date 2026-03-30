@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 from statistics import mean
 from time import perf_counter
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from backtest_app.configs.models import ResearchExperimentSpec
 from backtest_app.historical_data.features import (
+    CTX_SERIES,
     build_multiscale_feature_vector,
     build_raw_multiscale_feature_payload,
     compute_bar_features,
@@ -31,6 +32,17 @@ from .repository import ExactCosineCandidateIndex, load_prototypes_asof
 from .scoring import CalibrationModel, CandidateScore, EVConfig, ScoringConfig, build_decision_surface, estimate_expected_value, score_candidates_exact
 
 DECISION_CONVENTION = "EOD_T_SIGNAL__T1_OPEN_EXECUTION"
+REGIME_THRESHOLD = 0.2
+REGIME_SOURCE_NORMALIZED = "normalized_regime_context"
+REGIME_SOURCE_RAW = "raw_macro"
+
+
+@dataclass(frozen=True)
+class ProxySeriesResult:
+    bars: List[HistoricalBar]
+    peer_count_by_date: Dict[str, int]
+    contributing_symbols_by_date: Dict[str, List[str]]
+    fallback_to_self: bool = False
 
 
 def _feature_flag(name: str, metadata: dict | None, default: bool = False) -> bool:
@@ -65,7 +77,7 @@ def _default_spec(feature_window_bars: int = 60, horizon_days: int = 5) -> Resea
     return ResearchExperimentSpec(feature_window_bars=feature_window_bars, horizon_days=horizon_days, lookback_horizons=[horizon_days])
 
 
-def _regime_from_macro(macro_payload: Dict[str, float]) -> str:
+def _regime_from_macro_raw(macro_payload: Dict[str, float]) -> str:
     if not macro_payload:
         return "NEUTRAL"
     avg = mean(float(v) for v in macro_payload.values())
@@ -76,28 +88,161 @@ def _regime_from_macro(macro_payload: Dict[str, float]) -> str:
     return "NEUTRAL"
 
 
+def _regime_from_macro(macro_payload: Dict[str, float]) -> str:
+    # Deprecated compatibility wrapper. New runtime paths should prefer
+    # _regime_from_context_features(normalized_regime_context_features).
+    return _regime_from_macro_raw(macro_payload)
+
+
 def _bars_until_date(bars: List[HistoricalBar], cutoff_date: str | None) -> List[HistoricalBar]:
     return [bar for bar in bars if not cutoff_date or str(bar.timestamp)[:10] <= cutoff_date]
 
 
-def _market_proxy_bars(bars_by_symbol: Dict[str, List[HistoricalBar]], cutoff_date: str | None = None) -> List[HistoricalBar]:
+def _trade_date(bar: HistoricalBar) -> str:
+    return str(bar.timestamp)[:10]
+
+
+def _latest_macro_payload(macro_history: Dict[str, Dict[str, float]] | None) -> Dict[str, float]:
+    if not macro_history:
+        return {}
+    latest_date = max(macro_history.keys())
+    return dict(macro_history.get(latest_date, {}) or {})
+
+
+def _sign(value: float) -> int:
+    if value > 1e-12:
+        return 1
+    if value < -1e-12:
+        return -1
+    return 0
+
+
+def _regime_inputs_summary(normalized_regime_context_features: Dict[str, float]) -> Dict[str, Any]:
+    if not normalized_regime_context_features:
+        return {"aggregate_score": 0.0, "series_inputs": {}, "series_count": 0}
+    series_inputs: Dict[str, Dict[str, float | int | str]] = {}
+    signals: List[int] = []
+    for key, value in sorted(normalized_regime_context_features.items()):
+        if "_" not in key:
+            continue
+        series_name = key.split("_", 1)[0]
+        signal_input = float(value)
+        if key.endswith("percentile_20"):
+            signal_input = float(value) - 0.5
+        signal = _sign(signal_input)
+        signals.append(signal)
+        series_inputs[series_name] = {
+            "key": key,
+            "value": float(value),
+            "signal_input": float(signal_input),
+            "signal": signal,
+        }
+    aggregate_score = mean(signals) if signals else 0.0
+    return {
+        "aggregate_score": float(aggregate_score),
+        "series_inputs": series_inputs,
+        "series_count": len(series_inputs),
+    }
+
+
+def _regime_from_context_features(normalized_regime_context_features: Dict[str, float]) -> str:
+    summary = _regime_inputs_summary(normalized_regime_context_features)
+    score = float(summary.get("aggregate_score", 0.0) or 0.0)
+    if score >= REGIME_THRESHOLD:
+        return "RISK_ON"
+    if score <= -REGIME_THRESHOLD:
+        return "RISK_OFF"
+    return "NEUTRAL"
+
+
+def _market_proxy_series(
+    bars_by_symbol: Dict[str, List[HistoricalBar]],
+    cutoff_date: str | None = None,
+    *,
+    proxy_symbol: str = "MKT",
+) -> ProxySeriesResult:
+    symbol_date_bars: Dict[str, Dict[str, HistoricalBar]] = {}
+    for symbol, bars in bars_by_symbol.items():
+        clipped = _bars_until_date(bars, cutoff_date)
+        if not clipped:
+            continue
+        symbol_date_bars[symbol] = {_trade_date(bar): bar for bar in clipped}
+    if not symbol_date_bars:
+        return ProxySeriesResult(bars=[], peer_count_by_date={}, contributing_symbols_by_date={}, fallback_to_self=False)
+    all_dates = sorted({trade_date for date_map in symbol_date_bars.values() for trade_date in date_map.keys()})
     rows: List[HistoricalBar] = []
-    series = [_bars_until_date(bars, cutoff_date) for bars in bars_by_symbol.values() if bars]
-    series = [bars for bars in series if bars]
-    if not series:
-        return rows
-    for idx in range(max(len(b) for b in series)):
-        bucket = [bars[idx] for bars in series if idx < len(bars)]
+    peer_count_by_date: Dict[str, int] = {}
+    contributing_symbols_by_date: Dict[str, List[str]] = {}
+    for trade_date in all_dates:
+        bucket = [(symbol, date_map[trade_date]) for symbol, date_map in symbol_date_bars.items() if trade_date in date_map]
         if not bucket:
             continue
-        rows.append(HistoricalBar(symbol="MKT", timestamp=bucket[-1].timestamp, open=mean([b.open for b in bucket]), high=mean([b.high for b in bucket]), low=mean([b.low for b in bucket]), close=mean([b.close for b in bucket]), volume=mean([b.volume for b in bucket])))
-    return rows
+        symbols = sorted(symbol for symbol, _bar in bucket)
+        peer_count_by_date[trade_date] = len(symbols)
+        contributing_symbols_by_date[trade_date] = symbols
+        bars = [bar for _symbol, bar in bucket]
+        rows.append(
+            HistoricalBar(
+                symbol=proxy_symbol,
+                timestamp=trade_date,
+                open=mean([float(bar.open) for bar in bars]),
+                high=mean([float(bar.high) for bar in bars]),
+                low=mean([float(bar.low) for bar in bars]),
+                close=mean([float(bar.close) for bar in bars]),
+                volume=mean([float(bar.volume) for bar in bars]),
+            )
+        )
+    return ProxySeriesResult(
+        bars=rows,
+        peer_count_by_date=peer_count_by_date,
+        contributing_symbols_by_date=contributing_symbols_by_date,
+        fallback_to_self=False,
+    )
+
+
+def _market_proxy_bars(bars_by_symbol: Dict[str, List[HistoricalBar]], cutoff_date: str | None = None) -> List[HistoricalBar]:
+    return _market_proxy_series(bars_by_symbol, cutoff_date=cutoff_date).bars
+
+
+def _sector_proxy_series(symbol: str, bars_by_symbol: Dict[str, List[HistoricalBar]], sector_map: Dict[str, str], cutoff_date: str | None = None) -> ProxySeriesResult:
+    sector = sector_map.get(symbol)
+    peers = {s: bars for s, bars in bars_by_symbol.items() if s != symbol and sector and sector_map.get(s) == sector}
+    fallback_to_self = not bool(peers)
+    proxy_source = peers or {symbol: bars_by_symbol.get(symbol, [])}
+    result = _market_proxy_series(proxy_source, cutoff_date=cutoff_date, proxy_symbol=f"SECTOR:{sector or symbol}")
+    return ProxySeriesResult(
+        bars=result.bars,
+        peer_count_by_date=result.peer_count_by_date,
+        contributing_symbols_by_date=result.contributing_symbols_by_date,
+        fallback_to_self=fallback_to_self,
+    )
 
 
 def _sector_proxy_bars(symbol: str, bars_by_symbol: Dict[str, List[HistoricalBar]], sector_map: Dict[str, str], cutoff_date: str | None = None) -> List[HistoricalBar]:
-    sector = sector_map.get(symbol)
-    peers = {s: bars for s, bars in bars_by_symbol.items() if s != symbol and sector and sector_map.get(s) == sector}
-    return _market_proxy_bars(peers or {symbol: bars_by_symbol.get(symbol, [])}, cutoff_date=cutoff_date)
+    return _sector_proxy_series(symbol, bars_by_symbol, sector_map, cutoff_date=cutoff_date).bars
+
+
+def _proxy_diagnostics_payload(market_proxy: ProxySeriesResult, sector_proxy: ProxySeriesResult) -> Dict[str, Any]:
+    return {
+        "market": {
+            "peer_count_by_date": dict(market_proxy.peer_count_by_date),
+            "contributing_symbols_by_date": dict(market_proxy.contributing_symbols_by_date),
+            "fallback_to_self": False,
+        },
+        "sector": {
+            "peer_count_by_date": dict(sector_proxy.peer_count_by_date),
+            "contributing_symbols_by_date": dict(sector_proxy.contributing_symbols_by_date),
+            "fallback_to_self": bool(sector_proxy.fallback_to_self),
+        },
+    }
+
+
+def _query_regime_code(query_meta: Dict[str, Any]) -> str:
+    normalized = dict(query_meta.get("normalized_regime_context_features") or {})
+    if normalized:
+        return _regime_from_context_features(normalized)
+    raw_regime = str(query_meta.get("regime_code_raw_macro") or "").strip()
+    return raw_regime or "NEUTRAL"
 
 
 def _assert_similarity_macro_history_contract(macro_history: Dict[str, Dict[str, float]] | None) -> None:
@@ -113,12 +258,32 @@ def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_sym
     sector_code = sector_map.get(symbol)
     shape_horizons = list((spec.lookback_horizons if spec and spec.lookback_horizons else [spec.horizon_days] if spec else []) or [])
     resolved_scaler = scaler or (transform.scaler if transform is not None else None)
-    fv = build_multiscale_feature_vector(symbol=symbol, bars=bars, market_bars=_market_proxy_bars(bars_by_symbol, cutoff_date=cutoff_date), sector_bars=_sector_proxy_bars(symbol, bars_by_symbol, sector_map, cutoff_date=cutoff_date), macro_history=macro_history, sector_code=sector_code, scaler=resolved_scaler, transform=transform, shape_horizons=shape_horizons, use_macro_level_in_similarity=use_macro_level_in_similarity, use_dollar_volume_absolute=use_dollar_volume_absolute)
+    market_proxy = _market_proxy_series(bars_by_symbol, cutoff_date=cutoff_date)
+    sector_proxy = _sector_proxy_series(symbol, bars_by_symbol, sector_map, cutoff_date=cutoff_date)
+    fv = build_multiscale_feature_vector(
+        symbol=symbol,
+        bars=bars,
+        market_bars=market_proxy.bars,
+        sector_bars=sector_proxy.bars,
+        macro_history=macro_history,
+        sector_code=sector_code,
+        scaler=resolved_scaler,
+        transform=transform,
+        shape_horizons=shape_horizons,
+        use_macro_level_in_similarity=use_macro_level_in_similarity,
+        use_dollar_volume_absolute=use_dollar_volume_absolute,
+        proxy_diagnostics=_proxy_diagnostics_payload(market_proxy, sector_proxy),
+    )
+    latest_macro_payload = _latest_macro_payload(macro_history)
+    regime_inputs_summary = _regime_inputs_summary(fv.normalized_regime_context_features)
+    regime_code = _regime_from_context_features(fv.normalized_regime_context_features)
+    regime_code_raw_macro = _regime_from_macro_raw(latest_macro_payload)
     return fv.embedding, {
         "raw_shape_features": fv.raw_shape_features,
         "raw_residual_features": fv.raw_residual_features,
         "raw_context_features": fv.raw_context_features,
         "raw_regime_context_features": fv.raw_regime_context_features,
+        "normalized_regime_context_features": fv.normalized_regime_context_features,
         "shape_features": fv.shape_features,
         "residual_features": fv.residual_features,
         "context_features": fv.context_features,
@@ -128,6 +293,12 @@ def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_sym
         "shape_vector": fv.shape_vector,
         "ctx_vector": fv.ctx_vector,
         "transform_version": fv.metadata.get("transform_version"),
+        "regime_source": REGIME_SOURCE_NORMALIZED,
+        "regime_inputs_summary": regime_inputs_summary,
+        "regime_code": regime_code,
+        "regime_code_raw_macro": regime_code_raw_macro,
+        "macro_history_length": len(macro_history),
+        "macro_series_present_count": sum(1 for key in CTX_SERIES if latest_macro_payload.get(key) is not None),
         **fv.metadata,
     }
 
@@ -216,19 +387,24 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
             future_window = lib_bars[j + 1 : j + 1 + spec.horizon_days]
             macro_window = _macro_history_until(macro_history_by_date, feature_end_date)
             macro_payload = dict(macro_history_by_date.get(feature_end_date, {}))
-            regime_code = _regime_from_macro(macro_payload)
             event = build_event_outcome_record(future_window, label_cfg)
+            market_proxy = _market_proxy_series(bars_by_symbol, cutoff_date=feature_end_date)
+            sector_proxy = _sector_proxy_series(lib_symbol, bars_by_symbol, sector_map, cutoff_date=feature_end_date)
             raw_payload = build_raw_multiscale_feature_payload(
                 symbol=lib_symbol,
                 bars=history_window,
-                market_bars=_market_proxy_bars(bars_by_symbol, cutoff_date=feature_end_date),
-                sector_bars=_sector_proxy_bars(lib_symbol, bars_by_symbol, sector_map, cutoff_date=feature_end_date),
+                market_bars=market_proxy.bars,
+                sector_bars=sector_proxy.bars,
                 macro_history=macro_window,
                 sector_code=lib_sector,
                 shape_horizons=list((spec.lookback_horizons if spec.lookback_horizons else [spec.horizon_days]) or []),
                 use_macro_level_in_similarity=use_macro_level_in_similarity,
                 use_dollar_volume_absolute=use_dollar_volume_absolute,
+                proxy_diagnostics=_proxy_diagnostics_payload(market_proxy, sector_proxy),
             )
+            regime_inputs_summary = _regime_inputs_summary(raw_payload.normalized_regime_context_features)
+            regime_code = _regime_from_context_features(raw_payload.normalized_regime_context_features)
+            regime_code_raw_macro = _regime_from_macro_raw(macro_payload)
             raw_event_rows.append(dict(raw_payload.raw_features))
             pending_records.append({
                 "event": event,
@@ -237,7 +413,11 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 "outcome_end_date": outcome_end_date,
                 "lib_sector": lib_sector,
                 "regime_code": regime_code,
+                "regime_code_raw_macro": regime_code_raw_macro,
+                "regime_inputs_summary": regime_inputs_summary,
                 "history_window": history_window,
+                "macro_history_length": len(macro_window),
+                "macro_series_present_count": sum(1 for key in CTX_SERIES if macro_payload.get(key) is not None),
                 "raw_payload": raw_payload,
             })
     transform = fit_feature_transform(raw_event_rows)
@@ -245,6 +425,8 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
     for pending in pending_records:
         raw_payload = pending["raw_payload"]
         transformed_features, embedding = transform.apply(raw_payload.raw_features)
+        transform_missing_keys_filled_zero = sorted(key for key in transform.feature_keys if key not in raw_payload.raw_features)
+        transformed_zero_feature_keys = sorted(key for key, value in transformed_features.items() if abs(float(value)) <= 1e-12)
         shape_keys = sorted(list(raw_payload.shape_features.keys()) + list(raw_payload.residual_features.keys()))
         ctx_keys = sorted(raw_payload.context_features.keys())
         shape_vector = [float(transformed_features.get(k, 0.0)) for k in shape_keys]
@@ -262,7 +444,13 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 "raw_features": dict(raw_payload.raw_features),
                 "transformed_features": dict(transformed_features),
                 "raw_regime_context_features": dict(raw_payload.regime_context_features),
+                "normalized_regime_context_features": dict(raw_payload.normalized_regime_context_features),
                 "transform_version": transform.version,
+                "proxy_diagnostics": dict(raw_payload.metadata.get("proxy_diagnostics", {})),
+                "raw_zero_default_keys": list(raw_payload.metadata.get("raw_zero_default_keys", [])),
+                "transform_missing_keys_filled_zero": transform_missing_keys_filled_zero,
+                "regime_source": REGIME_SOURCE_NORMALIZED,
+                "regime_inputs_summary": dict(pending["regime_inputs_summary"]),
             },
             side_outcomes=pending["event"].side_payload,
             diagnostics={
@@ -276,9 +464,20 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 "ctx_vector": ctx_vector,
                 "raw_regime_context_features": dict(raw_payload.regime_context_features),
                 "regime_context_features": dict(raw_payload.regime_context_features),
+                "normalized_regime_context_features": dict(raw_payload.normalized_regime_context_features),
                 "transform_version": transform.version,
                 "regime_code": pending["regime_code"],
+                "regime_code_raw_macro": pending["regime_code_raw_macro"],
+                "regime_source": REGIME_SOURCE_NORMALIZED,
+                "regime_inputs_summary": dict(pending["regime_inputs_summary"]),
                 "sector_code": pending["lib_sector"],
+                "proxy_diagnostics": dict(raw_payload.metadata.get("proxy_diagnostics", {})),
+                "sector_proxy_fallback_to_self": bool((((raw_payload.metadata.get("proxy_diagnostics", {}) or {}).get("sector") or {}).get("fallback_to_self", False))),
+                "raw_zero_default_keys": list(raw_payload.metadata.get("raw_zero_default_keys", [])),
+                "transform_missing_keys_filled_zero": transform_missing_keys_filled_zero,
+                "transformed_zero_feature_keys": transformed_zero_feature_keys,
+                "macro_history_length": pending["macro_history_length"],
+                "macro_series_present_count": pending["macro_series_present_count"],
                 "liquidity_score": max(0.0, min(1.0, compute_bar_features(pending["history_window"]).get("volume_mean", 0.0) / 1_000_000.0)),
                 "quality_score": float(pending["event"].quality_score),
             },
@@ -354,7 +553,7 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
     for decision_date, items in query_panel.items():
         batch = []
         for symbol, q in items.items():
-            regime_code = _regime_from_macro(dict(macro_history_by_date.get(decision_date, {})))
+            regime_code = _query_regime_code(q["meta"])
             sector_code = sector_map.get(symbol)
             surface = build_decision_surface(query_embedding=q["embedding"], prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
             long_scores = score_candidates_exact(query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex(), side=Side.BUY.value)
@@ -429,8 +628,8 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
         total_prototype_count += len(memory["prototypes"])
         prototype_pool = list(memory["prototypes"])
         for symbol, q in query_panel.get(decision_date, {}).items():
-            query_macro = dict(macro_history_by_date.get(decision_date, {}))
-            regime_code = _regime_from_macro(query_macro)
+            query_meta = dict(q["meta"] or {})
+            regime_code = _query_regime_code(query_meta)
             sector_code = sector_map.get(symbol)
             execution_bar = q["execution_bar"]
             execution_date = str(execution_bar.timestamp)[:10]
@@ -439,7 +638,74 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
             long_ev = estimate_expected_value(side=Side.BUY.value, query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
             short_ev = estimate_expected_value(side=Side.SELL.value, query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
             surface = build_decision_surface(query_embedding=q["embedding"], prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
-            row_diag = {"decision_date": decision_date, "symbol": symbol, "query": {"regime_code": regime_code, "sector_code": sector_code, "decision_date": decision_date, "execution_date": execution_date, "decision_convention": DECISION_CONVENTION, "price_reference_source": "next_open", "feature_window_bars": spec.feature_window_bars, "feature_coverage_bars": len(q["query_window"]), "query_panel_count": len(query_panel.get(decision_date, {})), "insufficient_history": False, "shape_horizons": q["meta"].get("shape_horizons", []), "transform_version": q["meta"].get("transform_version"), "feature_flags": {"use_macro_level_in_similarity": q["meta"].get("use_macro_level_in_similarity", False), "use_dollar_volume_absolute": q["meta"].get("use_dollar_volume_absolute", False)}, "regime_context_features": q["meta"].get("regime_context_features", {})}, "library": {"event_record_count": len(memory["event_records"]), "max_outcome_end_before_decision": max((r.outcome_end_date for r in memory["event_records"] if r.outcome_end_date), default=None)}, "decision_surface": {"chosen_side": surface.chosen_side, "abstain": surface.abstain, "abstain_reasons": list(surface.abstain_reasons), "prototype_pool_size": surface.diagnostics.get("prototype_pool_size"), "chosen_lower_bound": (surface.diagnostics.get("decision_rule") or {}).get("chosen_lower_bound"), "chosen_interval_width": (surface.diagnostics.get("decision_rule") or {}).get("chosen_interval_width"), "chosen_effective_sample_size": (surface.diagnostics.get("decision_rule") or {}).get("chosen_effective_sample_size"), "chosen_uncertainty": (surface.diagnostics.get("decision_rule") or {}).get("chosen_uncertainty"), "gate_ablation": surface.diagnostics.get("gate_ablation"), "decision_rule": surface.diagnostics.get("decision_rule")}, "ev": {"buy": {"expected_utility": long_ev.expected_utility, "expected_net_return": long_ev.expected_net_return, "effective_sample_size": long_ev.effective_sample_size, "uncertainty": long_ev.uncertainty, "abstain_reasons": long_ev.abstain_reasons}, "sell": {"expected_utility": short_ev.expected_utility, "expected_net_return": short_ev.expected_net_return, "effective_sample_size": short_ev.effective_sample_size, "uncertainty": short_ev.uncertainty, "abstain_reasons": short_ev.abstain_reasons}}, "scorer_diagnostics": {"buy": _side_diag(long_ev, surface, "BUY"), "sell": _side_diag(short_ev, surface, "SELL")}, "top_matches": {"long": surface.buy.top_matches, "short": surface.sell.top_matches}}
+            row_diag = {
+                "decision_date": decision_date,
+                "symbol": symbol,
+                "query": {
+                    "regime_code": regime_code,
+                    "regime_code_raw_macro": query_meta.get("regime_code_raw_macro"),
+                    "regime_source": query_meta.get("regime_source", REGIME_SOURCE_NORMALIZED),
+                    "regime_inputs_summary": query_meta.get("regime_inputs_summary", {}),
+                    "sector_code": sector_code,
+                    "decision_date": decision_date,
+                    "execution_date": execution_date,
+                    "decision_convention": DECISION_CONVENTION,
+                    "price_reference_source": "next_open",
+                    "feature_window_bars": spec.feature_window_bars,
+                    "feature_coverage_bars": len(q["query_window"]),
+                    "query_panel_count": len(query_panel.get(decision_date, {})),
+                    "insufficient_history": False,
+                    "shape_horizons": query_meta.get("shape_horizons", []),
+                    "transform_version": query_meta.get("transform_version"),
+                    "feature_flags": {
+                        "use_macro_level_in_similarity": query_meta.get("use_macro_level_in_similarity", False),
+                        "use_dollar_volume_absolute": query_meta.get("use_dollar_volume_absolute", False),
+                    },
+                    "regime_context_features": query_meta.get("regime_context_features", {}),
+                    "normalized_regime_context_features": query_meta.get("normalized_regime_context_features", {}),
+                    "proxy_diagnostics": query_meta.get("proxy_diagnostics", {}),
+                    "sector_proxy_fallback_to_self": bool((((query_meta.get("proxy_diagnostics", {}) or {}).get("sector") or {}).get("fallback_to_self", False))),
+                    "raw_zero_default_keys": query_meta.get("raw_zero_default_keys", []),
+                    "transform_missing_keys_filled_zero": query_meta.get("transform_missing_keys_filled_zero", []),
+                    "transformed_zero_feature_keys": query_meta.get("transformed_zero_feature_keys", []),
+                    "macro_history_length": query_meta.get("macro_history_length", 0),
+                    "macro_series_present_count": query_meta.get("macro_series_present_count", 0),
+                },
+                "library": {
+                    "event_record_count": len(memory["event_records"]),
+                    "max_outcome_end_before_decision": max((r.outcome_end_date for r in memory["event_records"] if r.outcome_end_date), default=None),
+                },
+                "decision_surface": {
+                    "chosen_side": surface.chosen_side,
+                    "abstain": surface.abstain,
+                    "abstain_reasons": list(surface.abstain_reasons),
+                    "prototype_pool_size": surface.diagnostics.get("prototype_pool_size"),
+                    "chosen_lower_bound": (surface.diagnostics.get("decision_rule") or {}).get("chosen_lower_bound"),
+                    "chosen_interval_width": (surface.diagnostics.get("decision_rule") or {}).get("chosen_interval_width"),
+                    "chosen_effective_sample_size": (surface.diagnostics.get("decision_rule") or {}).get("chosen_effective_sample_size"),
+                    "chosen_uncertainty": (surface.diagnostics.get("decision_rule") or {}).get("chosen_uncertainty"),
+                    "gate_ablation": surface.diagnostics.get("gate_ablation"),
+                    "decision_rule": surface.diagnostics.get("decision_rule"),
+                },
+                "ev": {
+                    "buy": {
+                        "expected_utility": long_ev.expected_utility,
+                        "expected_net_return": long_ev.expected_net_return,
+                        "effective_sample_size": long_ev.effective_sample_size,
+                        "uncertainty": long_ev.uncertainty,
+                        "abstain_reasons": long_ev.abstain_reasons,
+                    },
+                    "sell": {
+                        "expected_utility": short_ev.expected_utility,
+                        "expected_net_return": short_ev.expected_net_return,
+                        "effective_sample_size": short_ev.effective_sample_size,
+                        "uncertainty": short_ev.uncertainty,
+                        "abstain_reasons": short_ev.abstain_reasons,
+                    },
+                },
+                "scorer_diagnostics": {"buy": _side_diag(long_ev, surface, "BUY"), "sell": _side_diag(short_ev, surface, "SELL")},
+                "top_matches": {"long": surface.buy.top_matches, "short": surface.sell.top_matches},
+            }
             panel_rows.append(row_diag)
             diagnostics[f"{decision_date}:{symbol}"] = row_diag
             if surface.abstain:

@@ -12,6 +12,7 @@ FEATURE_TRANSFORM_VERSION = "feature_contract_v1"
 DEFAULT_SHAPE_HORIZONS = (1, 3, 5, 10, 20, 60)
 CTX_SERIES = ("vix", "rate", "dollar", "oil", "breadth")
 DEFAULT_CONTEXT_LOOKBACKS = (5, 20)
+REGIME_CONTEXT_PRIORITY_SUFFIXES = ("zscore_20", "pct_change_20", "pct_change_5", "slope_5", "percentile_20")
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class FeatureVector:
     raw_residual_features: Dict[str, float]
     raw_context_features: Dict[str, float]
     raw_regime_context_features: Dict[str, float]
+    normalized_regime_context_features: Dict[str, float]
     shape_features: Dict[str, float]
     residual_features: Dict[str, float]
     context_features: Dict[str, float]
@@ -71,6 +73,7 @@ class RawFeaturePayload:
     residual_features: Dict[str, float]
     context_features: Dict[str, float]
     regime_context_features: Dict[str, float]
+    normalized_regime_context_features: Dict[str, float]
     raw_features: Dict[str, float]
     metadata: Dict[str, object]
 
@@ -311,6 +314,45 @@ def _build_context_features(macro_history: Mapping[str, Mapping[str, float]], *,
     return similarity_out, regime_out
 
 
+def _normalized_regime_context_features(context_features: Mapping[str, float]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for series_name in CTX_SERIES:
+        for suffix in REGIME_CONTEXT_PRIORITY_SUFFIXES:
+            key = f"{series_name}_{suffix}"
+            if key in context_features:
+                out[key] = float(context_features[key])
+                break
+    return out
+
+
+def _trim_proxy_diagnostics(
+    proxy_diagnostics: Mapping[str, Mapping[str, object]] | None,
+    bars: Sequence[HistoricalBar],
+) -> Dict[str, object]:
+    if not proxy_diagnostics:
+        return {}
+    valid_dates = {str(bar.timestamp)[:10] for bar in bars}
+    out: Dict[str, object] = {}
+    for scope, payload in dict(proxy_diagnostics).items():
+        payload_dict = dict(payload or {})
+        peer_count_by_date = {
+            str(date_key): int(count)
+            for date_key, count in dict(payload_dict.get("peer_count_by_date") or {}).items()
+            if str(date_key) in valid_dates
+        }
+        contributing_symbols_by_date = {
+            str(date_key): [str(symbol) for symbol in list(symbols or [])]
+            for date_key, symbols in dict(payload_dict.get("contributing_symbols_by_date") or {}).items()
+            if str(date_key) in valid_dates
+        }
+        out[str(scope)] = {
+            "peer_count_by_date": peer_count_by_date,
+            "contributing_symbols_by_date": contributing_symbols_by_date,
+            "fallback_to_self": bool(payload_dict.get("fallback_to_self", False)),
+        }
+    return out
+
+
 def compute_external_vector(payload: Dict[str, float]) -> List[float]:
     ordered_keys = sorted(payload.keys())
     return [float(payload[k]) for k in ordered_keys]
@@ -327,6 +369,7 @@ def build_raw_multiscale_feature_payload(
     shape_horizons: Sequence[int] | None = None,
     use_macro_level_in_similarity: bool = False,
     use_dollar_volume_absolute: bool = False,
+    proxy_diagnostics: Mapping[str, Mapping[str, object]] | None = None,
 ) -> RawFeaturePayload:
     bars = list(bars)
     market_bars = list(market_bars or [])
@@ -360,12 +403,15 @@ def build_raw_multiscale_feature_payload(
     residual["vol_normalized_residual_20"] = _safe_div(residual["beta_residual_20"], shape["realized_vol_20"])
 
     context, regime_context = _build_context_features(macro_history, use_macro_level_in_similarity=use_macro_level_in_similarity)
+    normalized_regime_context = _normalized_regime_context_features(context)
     raw_features = {**shape, **residual, **context}
+    raw_zero_default_keys = sorted(key for key, value in raw_features.items() if abs(float(value)) <= 1e-12)
     return RawFeaturePayload(
         shape_features=shape,
         residual_features=residual,
         context_features=context,
         regime_context_features=regime_context,
+        normalized_regime_context_features=normalized_regime_context,
         raw_features=raw_features,
         metadata={
             "symbol": symbol,
@@ -375,6 +421,8 @@ def build_raw_multiscale_feature_payload(
             "shape_horizons": list(resolved_shape_horizons),
             "use_macro_level_in_similarity": use_macro_level_in_similarity,
             "use_dollar_volume_absolute": use_dollar_volume_absolute,
+            "proxy_diagnostics": _trim_proxy_diagnostics(proxy_diagnostics, bars),
+            "raw_zero_default_keys": raw_zero_default_keys,
         },
     )
 
@@ -392,6 +440,7 @@ def build_multiscale_feature_vector(
     shape_horizons: Sequence[int] | None = None,
     use_macro_level_in_similarity: bool = False,
     use_dollar_volume_absolute: bool = False,
+    proxy_diagnostics: Mapping[str, Mapping[str, object]] | None = None,
 ) -> FeatureVector:
     raw_payload = build_raw_multiscale_feature_payload(
         symbol=symbol,
@@ -403,6 +452,7 @@ def build_multiscale_feature_vector(
         shape_horizons=shape_horizons,
         use_macro_level_in_similarity=use_macro_level_in_similarity,
         use_dollar_volume_absolute=use_dollar_volume_absolute,
+        proxy_diagnostics=proxy_diagnostics,
     )
     resolved_transform = transform
     if resolved_transform is None and scaler is not None:
@@ -411,6 +461,8 @@ def build_multiscale_feature_vector(
         resolved_transform = identity_feature_transform(raw_payload.raw_features)
 
     transformed_features, embedding = resolved_transform.apply(raw_payload.raw_features)
+    transform_missing_keys_filled_zero = sorted(key for key in resolved_transform.feature_keys if key not in raw_payload.raw_features)
+    transformed_zero_feature_keys = sorted(key for key, value in transformed_features.items() if abs(float(value)) <= 1e-12)
     shape_keys = sorted([k for k in raw_payload.shape_features.keys() if k in transformed_features])
     residual_keys = sorted([k for k in raw_payload.residual_features.keys() if k in transformed_features])
     ctx_keys = sorted([k for k in raw_payload.context_features.keys() if k in transformed_features])
@@ -421,6 +473,7 @@ def build_multiscale_feature_vector(
         raw_residual_features={k: float(raw_payload.residual_features[k]) for k in sorted(raw_payload.residual_features.keys())},
         raw_context_features={k: float(raw_payload.context_features[k]) for k in sorted(raw_payload.context_features.keys())},
         raw_regime_context_features={k: float(raw_payload.regime_context_features[k]) for k in sorted(raw_payload.regime_context_features.keys())},
+        normalized_regime_context_features={k: float(raw_payload.normalized_regime_context_features[k]) for k in sorted(raw_payload.normalized_regime_context_features.keys())},
         shape_features={k: float(transformed_features[k]) for k in shape_keys},
         residual_features={k: float(transformed_features[k]) for k in residual_keys},
         context_features={k: float(transformed_features[k]) for k in ctx_keys},
@@ -440,6 +493,11 @@ def build_multiscale_feature_vector(
             "shape_keys": shape_keys + residual_keys,
             "ctx_keys": ctx_keys,
             "regime_ctx_keys": sorted(raw_payload.regime_context_features.keys()),
+            "normalized_regime_ctx_keys": sorted(raw_payload.normalized_regime_context_features.keys()),
             "feature_keys": list(resolved_transform.feature_keys),
+            "proxy_diagnostics": raw_payload.metadata.get("proxy_diagnostics", {}),
+            "raw_zero_default_keys": list(raw_payload.metadata.get("raw_zero_default_keys", [])),
+            "transform_missing_keys_filled_zero": transform_missing_keys_filled_zero,
+            "transformed_zero_feature_keys": transformed_zero_feature_keys,
         },
     )
