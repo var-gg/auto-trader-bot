@@ -22,10 +22,11 @@ def test_feature_coverage_score_formula_matches_contract():
         raw_feature_count=20,
         transform_missing_keys_filled_zero_count=2,
         transform_feature_count=10,
-        macro_series_present_count=4,
+        macro_series_present_count=3,
+        macro_series_scope_count=4,
         sector_proxy_fallback_to_self=True,
     )
-    expected = max(0.0, 1 - (0.35 * (4 / 20) + 0.35 * (2 / 10) + 0.20 * (1 - 4 / 5) + 0.25))
+    expected = max(0.0, 1 - (0.35 * (4 / 20) + 0.35 * (2 / 10) + 0.20 * (1 - 3 / 4) + 0.25))
     assert score == expected
 
 
@@ -84,14 +85,21 @@ def test_summary_and_output_files_are_generated(tmp_path):
     rows_path = Path(outputs["rows_path"])
     summary_path = Path(outputs["summary_path"])
     report_path = Path(outputs["report_path"])
+    landing_review_path = Path(outputs["landing_review_path"])
     assert rows_path.exists()
     assert summary_path.exists()
     assert report_path.exists()
+    assert landing_review_path.exists()
     summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary_payload["row_count"] == 2
     assert "insufficient_query_history" in summary_payload["exclude_reason_histogram"]
+    assert summary_payload["macro_coverage_scope"] == "similarity_enabled_ctx_series"
+    assert summary_payload["breadth_blocking"] is False
     report_text = report_path.read_text(encoding="utf-8")
     assert "medium_verdict_hold_recommended" in report_text
+    assert "breadth_policy" in report_text
+    landing_review_text = landing_review_path.read_text(encoding="utf-8")
+    assert "representation_landed" in landing_review_text
 
 
 def test_build_row_record_preserves_excluded_rows_and_fallback_flags():
@@ -111,6 +119,7 @@ def test_build_row_record_preserves_excluded_rows_and_fallback_flags():
                 "raw_features": {"beta_20": 0.0, "ret_1": 0.01},
                 "feature_keys": ["beta_20", "ret_1", "vix_zscore_20"],
                 "macro_series_present_count": 4,
+                "breadth_policy": "diagnostics_only_v1",
             }
         },
         query_reasons=["missing_decision_bar"],
@@ -122,3 +131,42 @@ def test_build_row_record_preserves_excluded_rows_and_fallback_flags():
     assert row["sector_proxy_fallback_to_self"] is True
     assert row["market_proxy_peer_count_max"] == 4
     assert row["transform_missing_keys_filled_zero_count"] == 1
+    assert row["breadth_policy"] == "diagnostics_only_v1"
+
+
+def test_breadth_missingness_does_not_trigger_stale_or_hold():
+    module = _load_module()
+    row = module.build_row_record(
+        symbol="AAPL",
+        decision_date="2026-01-04",
+        query_item={
+            "meta": {
+                "macro_freshness_summary": {
+                    "vix": {"is_stale_flag": False, "source_ts_is_derived": True},
+                    "rate": {"is_stale_flag": False, "source_ts_is_derived": True},
+                    "dollar": {"is_stale_flag": False, "source_ts_is_derived": True},
+                    "oil": {"is_stale_flag": False, "source_ts_is_derived": True},
+                    "breadth": {"is_stale_flag": True, "missing_reason": "canonical_source_missing"},
+                },
+                "macro_series_present_count": 4,
+                "raw_features": {"ret_1": 0.01},
+                "feature_keys": ["ret_1"],
+                "raw_zero_default_keys": [],
+                "transform_missing_keys_filled_zero": [],
+                "transformed_zero_feature_keys": [],
+                "breadth_policy": "diagnostics_only_v1",
+                "breadth_present": False,
+                "breadth_missing_reason": "canonical_source_missing",
+                "feature_anchor_ts_utc": "2026-01-04T21:00:00+00:00",
+                "macro_asof_ts_utc": "2026-01-04T20:00:00+00:00",
+            }
+        },
+        query_reasons=[],
+        library_reasons=[],
+        macro_window={"2026-01-04": {"vix": 20.0, "rate": 3.0, "dollar": 100.0, "oil": 70.0, "breadth": 0.2}},
+    )
+    assert row["stale_macro"] is False
+    summary = module.summarize_rows([row])
+    assert summary["breadth_canonical_missing_ratio"] == 1.0
+    assert summary["breadth_blocking"] is False
+    assert summary["medium_verdict_hold_recommended"] is False

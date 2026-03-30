@@ -183,6 +183,9 @@ def test_event_and_query_use_identical_feature_contract_for_same_date():
     assert target.diagnostics["embedding"] == query_embedding
     assert target.feature_anchor_ts_utc == meta["feature_anchor_ts_utc"]
     assert target.exchange_code == meta["exchange_code"] == "NMS"
+    assert meta["breadth_policy"] == "diagnostics_only_v1"
+    assert target.diagnostics["breadth_policy"] == "diagnostics_only_v1"
+    assert meta["macro_series_present_count"] == 4
     matching_prototype = next(p for p in memory["prototypes"] if p.representative_date == target.event_date)
     assert matching_prototype.embedding == target.diagnostics["embedding"]
     assert matching_prototype.metadata["transformed_features"] == target.diagnostics["transformed_features"]
@@ -241,10 +244,12 @@ def test_generate_similarity_candidates_rolling_records_runtime_support_metadata
     assert pipeline["ev_config"]["use_kernel_weighting"] is False
     assert pipeline["ev_config"]["min_effective_sample_size"] == 2.5
     assert pipeline["ev_config"]["diagnostic_disable_ess_gate"] is True
+    assert pipeline["macro_join"]["breadth_policy"] == "diagnostics_only_v1"
     panel = diagnostics["signal_panel"]
     assert panel
     assert all((((row.get("decision_surface") or {}).get("gate_ablation") or {}).get("diagnostic_disable_ess_gate")) is True for row in panel)
     assert all(((row.get("query") or {}).get("exchange_code")) == "NMS" for row in panel)
+    assert all(((row.get("query") or {}).get("breadth_policy")) == "diagnostics_only_v1" for row in panel)
 
 
 def test_generate_similarity_candidates_rolling_emits_candidate_generation_progress_phase():

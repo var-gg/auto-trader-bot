@@ -16,14 +16,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from backtest_app.configs.models import ResearchExperimentSpec
 from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory, guard_backtest_local_only
-from backtest_app.historical_data.features import CTX_SERIES
+from backtest_app.historical_data.features import SIMILARITY_CTX_SERIES
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
 from backtest_app.historical_data.models import HistoricalBar
-from backtest_app.research.pipeline import _build_query_panel, build_event_memory_asof
+from backtest_app.research.pipeline import BREADTH_POLICY_DIAGNOSTICS_ONLY_V1, _build_query_panel, build_event_memory_asof
 
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL"]
 DEFAULT_OUTPUT_ROOT = Path("runs") / "representation_missingness_diagnosis"
 TOP_N = 5
+MACRO_COVERAGE_SCOPE = "similarity_enabled_ctx_series"
+VALID_MISSINGNESS_FAMILIES = {"none", "structural_missing", "stale_but_usable", "data_quality_missing"}
 
 
 def _parse_symbols(raw: str | None) -> list[str]:
@@ -85,11 +87,12 @@ def compute_feature_coverage_score(
     transform_missing_keys_filled_zero_count: int,
     transform_feature_count: int,
     macro_series_present_count: int,
+    macro_series_scope_count: int = len(SIMILARITY_CTX_SERIES),
     sector_proxy_fallback_to_self: bool,
 ) -> float:
     raw_zero_default_ratio = raw_zero_default_keys_count / max(1, raw_feature_count)
     transform_zero_fill_ratio = transform_missing_keys_filled_zero_count / max(1, transform_feature_count)
-    macro_missing_ratio = 1 - (macro_series_present_count / 5.0)
+    macro_missing_ratio = 1 - (macro_series_present_count / max(1, macro_series_scope_count))
     proxy_fallback_penalty = 0.25 if sector_proxy_fallback_to_self else 0.0
     score = max(0.0, 1 - (0.35 * raw_zero_default_ratio + 0.35 * transform_zero_fill_ratio + 0.20 * macro_missing_ratio + proxy_fallback_penalty))
     return float(score)
@@ -104,6 +107,12 @@ def _latest_macro_payload(macro_window: dict[str, dict[str, float]]) -> dict[str
         return {}
     latest_date = max(macro_window.keys())
     return dict(macro_window.get(latest_date, {}) or {})
+
+
+def _timestamp_order_violation(source_ts_utc: str | None, anchor_ts_utc: str | None) -> bool:
+    if not source_ts_utc or not anchor_ts_utc:
+        return False
+    return datetime.fromisoformat(str(source_ts_utc)) > datetime.fromisoformat(str(anchor_ts_utc))
 
 
 def build_row_record(
@@ -128,16 +137,27 @@ def build_row_record(
     transform_feature_count = len(list(query_meta.get("feature_keys") or []))
     sector_proxy_fallback_to_self = bool(sector_proxy.get("fallback_to_self", False))
     macro_freshness_summary = dict(query_meta.get("macro_freshness_summary") or {})
-    stale_macro = any(bool((item or {}).get("is_stale_flag", False)) for item in macro_freshness_summary.values())
+    relevant_macro_freshness_summary = {
+        series_name: dict(macro_freshness_summary.get(series_name) or {})
+        for series_name in SIMILARITY_CTX_SERIES
+    }
+    stale_macro = any(bool((item or {}).get("is_stale_flag", False)) for item in relevant_macro_freshness_summary.values())
+    breadth_policy = str(query_meta.get("breadth_policy") or BREADTH_POLICY_DIAGNOSTICS_ONLY_V1)
     breadth_present = bool(query_meta.get("breadth_present", False))
     breadth_missing_reason = query_meta.get("breadth_missing_reason")
-    macro_series_present_count = int(query_meta.get("macro_series_present_count") or sum(1 for key in CTX_SERIES if latest_macro.get(key) is not None))
+    macro_series_scope_count = len(SIMILARITY_CTX_SERIES)
+    macro_series_present_count = int(query_meta.get("macro_series_present_count") or sum(1 for key in SIMILARITY_CTX_SERIES if latest_macro.get(key) is not None))
+    macro_asof_ts_utc = query_meta.get("macro_asof_ts_utc")
+    feature_anchor_ts_utc = query_meta.get("feature_anchor_ts_utc")
+    macro_asof_ordering_violation = _timestamp_order_violation(macro_asof_ts_utc, feature_anchor_ts_utc)
+    derived_macro_publish_time_present = any(bool((item or {}).get("source_ts_is_derived", False)) for item in relevant_macro_freshness_summary.values())
     feature_coverage_score = compute_feature_coverage_score(
         raw_zero_default_keys_count=len(raw_zero_default_keys),
         raw_feature_count=raw_feature_count,
         transform_missing_keys_filled_zero_count=len(transform_missing_keys),
         transform_feature_count=transform_feature_count,
         macro_series_present_count=macro_series_present_count,
+        macro_series_scope_count=macro_series_scope_count,
         sector_proxy_fallback_to_self=sector_proxy_fallback_to_self,
     )
     exclude_reasons = sorted(set(query_reasons + library_reasons))
@@ -157,6 +177,8 @@ def build_row_record(
         "market_proxy_peer_count_max": max(market_peer_counts) if market_peer_counts else 0,
         "macro_history_length": len(macro_window),
         "macro_series_present_count": macro_series_present_count,
+        "macro_series_scope_count": macro_series_scope_count,
+        "macro_coverage_scope": MACRO_COVERAGE_SCOPE,
         "raw_feature_count": raw_feature_count,
         "transform_feature_count": transform_feature_count,
         "raw_zero_default_keys_count": len(raw_zero_default_keys),
@@ -170,14 +192,17 @@ def build_row_record(
         "exchange_code": query_meta.get("exchange_code"),
         "exchange_tz": query_meta.get("exchange_tz"),
         "session_date_local": query_meta.get("session_date_local"),
-        "feature_anchor_ts_utc": query_meta.get("feature_anchor_ts_utc"),
-        "macro_asof_ts_utc": query_meta.get("macro_asof_ts_utc"),
+        "feature_anchor_ts_utc": feature_anchor_ts_utc,
+        "macro_asof_ts_utc": macro_asof_ts_utc,
+        "macro_asof_ordering_violation": macro_asof_ordering_violation,
         "proxy_mode": market_proxy.get("proxy_mode"),
         "same_exchange_peer_count": int(market_proxy.get("same_exchange_peer_count") or 0),
         "cross_exchange_proxy_used": bool(market_proxy.get("cross_exchange_proxy_used", False)),
         "stale_macro": stale_macro,
+        "breadth_policy": breadth_policy,
         "breadth_present": breadth_present,
         "breadth_missing_reason": breadth_missing_reason,
+        "derived_macro_publish_time_present": derived_macro_publish_time_present,
         "structural_missing": structural_missing,
         "data_quality_missing": data_quality_missing,
         "missingness_family": "data_quality_missing" if data_quality_missing else "structural_missing" if structural_missing else "stale_but_usable" if stale_macro else "none",
@@ -200,7 +225,10 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     stale_macro_rows = 0
     data_quality_missing_rows = 0
     breadth_missing_rows = 0
+    missingness_family_hist = Counter()
     zero_imputation_sum = 0.0
+    macro_asof_ordering_violation_rows = 0
+    derived_macro_publish_time_rows = 0
     for row in rows:
         if row.get("query_available"):
             query_available_rows += 1
@@ -214,7 +242,12 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             data_quality_missing_rows += 1
         if row.get("breadth_missing_reason") == "canonical_source_missing":
             breadth_missing_rows += 1
-        macro_coverage_sum += float(row.get("macro_series_present_count", 0)) / 5.0
+        missingness_family_hist[str(row.get("missingness_family") or "unknown")] += 1
+        if row.get("macro_asof_ordering_violation"):
+            macro_asof_ordering_violation_rows += 1
+        if row.get("derived_macro_publish_time_present"):
+            derived_macro_publish_time_rows += 1
+        macro_coverage_sum += float(row.get("macro_series_present_count", 0)) / max(1.0, float(row.get("macro_series_scope_count", len(SIMILARITY_CTX_SERIES)) or len(SIMILARITY_CTX_SERIES)))
         zero_imputation_sum += float(row.get("zero_imputation_ratio", 0.0) or 0.0)
         if not row.get("sector_proxy_fallback_to_self"):
             sector_peer_rows += 1
@@ -238,17 +271,24 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     zero_imputation_ratio = zero_imputation_sum / max(1, total_rows)
     sector_self_fallback_ratio = fallback_hist.get("sector_proxy_fallback_to_self=True", 0) / max(1, total_rows)
     breadth_canonical_missing_ratio = breadth_missing_rows / max(1, total_rows)
-    medium_verdict_hold_recommended = (
-        sector_self_fallback_ratio > 0.10
-        or row_level_feature_sparsity_ratio > 0.10
-        or macro_coverage_ratio < 0.95
-        or data_quality_missing_ratio > 0.0
-        or stale_macro_ratio > 0.10
-    )
+    medium_verdict_hold_reasons: list[str] = []
+    if sector_self_fallback_ratio > 0.10:
+        medium_verdict_hold_reasons.append("sector_self_fallback_ratio_gt_0.10")
+    if row_level_feature_sparsity_ratio > 0.10:
+        medium_verdict_hold_reasons.append("row_level_feature_sparsity_ratio_gt_0.10")
+    if macro_coverage_ratio < 0.95:
+        medium_verdict_hold_reasons.append("macro_coverage_ratio_lt_0.95")
+    if data_quality_missing_ratio > 0.0:
+        medium_verdict_hold_reasons.append("data_quality_missing_ratio_gt_0.00")
+    if stale_macro_ratio > 0.10:
+        medium_verdict_hold_reasons.append("stale_macro_ratio_gt_0.10")
+    medium_verdict_hold_recommended = bool(medium_verdict_hold_reasons)
     return {
         "row_count": total_rows,
+        "breadth_policy": BREADTH_POLICY_DIAGNOSTICS_ONLY_V1,
         "query_available_ratio": query_available_ratio,
         "exclude_reason_histogram": dict(exclude_hist),
+        "missingness_family_histogram": dict(missingness_family_hist),
         "zero_filled_feature_histogram": {
             "raw_zero_defaults": dict(raw_zero_hist),
             "transform_missing_keys_filled_zero": dict(transform_zero_hist),
@@ -257,6 +297,8 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "fallback_histogram": dict(fallback_hist),
         "sector_peer_coverage_ratio": sector_peer_coverage_ratio,
         "macro_coverage_ratio": macro_coverage_ratio,
+        "macro_coverage_scope": MACRO_COVERAGE_SCOPE,
+        "macro_series_scope_count": len(SIMILARITY_CTX_SERIES),
         "row_level_feature_sparsity_ratio": row_level_feature_sparsity_ratio,
         "structural_missing_ratio": structural_missing_ratio,
         "stale_macro_ratio": stale_macro_ratio,
@@ -264,8 +306,12 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "zero_imputation_ratio": zero_imputation_ratio,
         "sector_self_fallback_ratio": sector_self_fallback_ratio,
         "breadth_canonical_missing_ratio": breadth_canonical_missing_ratio,
+        "breadth_blocking": False,
+        "query_macro_asof_ordering_violation_count": macro_asof_ordering_violation_rows,
+        "derived_macro_publish_time_ratio": derived_macro_publish_time_rows / max(1, total_rows),
         "too_sparse_row_count": sparse_rows,
         "medium_verdict_hold_recommended": medium_verdict_hold_recommended,
+        "medium_verdict_hold_reasons": medium_verdict_hold_reasons,
     }
 
 
@@ -273,11 +319,14 @@ def render_report(summary: dict[str, Any]) -> str:
     exclude_hist = summary.get("exclude_reason_histogram") or {}
     fallback_hist = summary.get("fallback_histogram") or {}
     zero_hist = (summary.get("zero_filled_feature_histogram") or {}).get("raw_zero_defaults") or {}
+    hold_reasons = ", ".join(summary.get("medium_verdict_hold_reasons") or []) or "none"
     top_excludes = ", ".join(f"{k}={v}" for k, v in sorted(exclude_hist.items(), key=lambda item: (-item[1], item[0]))[:5]) or "none"
     top_zero_keys = ", ".join(f"{k}={v}" for k, v in sorted(zero_hist.items(), key=lambda item: (-item[1], item[0]))[:5]) or "none"
     lines = [
         "# Representation Missingness Diagnosis",
         "",
+        f"- breadth_policy: {summary.get('breadth_policy')}",
+        f"- macro_coverage_scope: {summary.get('macro_coverage_scope')}",
         f"- rows: {summary.get('row_count', 0)}",
         f"- query_available_ratio: {summary.get('query_available_ratio', 0.0):.3f}",
         f"- sector_peer_coverage_ratio: {summary.get('sector_peer_coverage_ratio', 0.0):.3f}",
@@ -289,15 +338,86 @@ def render_report(summary: dict[str, Any]) -> str:
         f"- zero_imputation_ratio: {summary.get('zero_imputation_ratio', 0.0):.3f}",
         f"- sector_self_fallback_ratio: {summary.get('sector_self_fallback_ratio', 0.0):.3f}",
         f"- breadth_canonical_missing_ratio: {summary.get('breadth_canonical_missing_ratio', 0.0):.3f}",
+        f"- breadth_blocking: {bool(summary.get('breadth_blocking', False))}",
         f"- medium_verdict_hold_recommended: {bool(summary.get('medium_verdict_hold_recommended', False))}",
+        f"- medium_verdict_hold_reasons: {hold_reasons}",
+        f"- representation_landed: {bool(summary.get('representation_landed', False))}",
         "",
         f"- top exclude reasons: {top_excludes}",
         f"- fallback histogram: {json.dumps(fallback_hist, ensure_ascii=False, sort_keys=True)}",
         f"- top raw zero-default keys: {top_zero_keys}",
         "",
-        "Current representation should return to medium viability only after these coverage/fallback ratios look healthy.",
+        "Breadth is policy-disabled for v1 and remains diagnostics-only; non-breadth residual risks stay visible in this report.",
     ]
+    if summary.get("checkpoint_sha"):
+        lines.insert(2, f"- checkpoint_sha: {summary.get('checkpoint_sha')}")
+    if summary.get("landing_sha"):
+        lines.insert(3 if summary.get("checkpoint_sha") else 2, f"- landing_sha: {summary.get('landing_sha')}")
     return "\n".join(lines) + "\n"
+
+
+def render_landing_review(summary: dict[str, Any]) -> str:
+    contract_checks = dict(summary.get("contract_checks") or {})
+    residual_risks = list(summary.get("residual_risks") or [])
+    lines = [
+        "# Representation Landing Review",
+        "",
+        f"- checkpoint_sha: {summary.get('checkpoint_sha') or 'unknown'}",
+        f"- landing_sha: {summary.get('landing_sha') or 'unknown'}",
+        f"- breadth_policy: {summary.get('breadth_policy')}",
+        f"- representation_landed: {bool(summary.get('representation_landed', False))}",
+        f"- breadth_blocking: {bool(summary.get('breadth_blocking', False))}",
+        "",
+        "## Contract Checks",
+        "",
+        f"- session_anchor_semantics_consistent: {bool(contract_checks.get('session_anchor_semantics_consistent', False))}",
+        f"- macro_attach_respects_anchor_rule: {bool(contract_checks.get('macro_attach_respects_anchor_rule', False))}",
+        f"- missingness_taxonomy_partitioned: {bool(contract_checks.get('missingness_taxonomy_partitioned', False))}",
+        f"- zero_imputation_explicit: {bool(contract_checks.get('zero_imputation_explicit', False))}",
+        f"- breadth_excluded_from_similarity_and_gating: {bool(contract_checks.get('breadth_excluded_from_similarity_and_gating', False))}",
+        f"- summary_no_breadth_blocker: {bool(contract_checks.get('summary_no_breadth_blocker', False))}",
+        "",
+        "## Residual Risks",
+        "",
+    ]
+    if residual_risks:
+        lines.extend([f"- {risk}" for risk in residual_risks])
+    else:
+        lines.append("- none")
+    return "\n".join(lines) + "\n"
+
+
+def _finalize_landing_summary(summary: dict[str, Any], contract: dict[str, int]) -> dict[str, Any]:
+    missingness_family_keys = set((summary.get("missingness_family_histogram") or {}).keys())
+    contract_checks = {
+        "session_anchor_semantics_consistent": (
+            contract.get("query_rows_total", 0) > 0
+            and contract.get("event_records_total", 0) > 0
+            and contract.get("prototypes_total", 0) > 0
+            and contract.get("query_rows_total", 0) == contract.get("query_rows_with_anchor", 0)
+            and contract.get("event_records_total", 0) == contract.get("event_records_with_anchor", 0)
+            and contract.get("prototypes_total", 0) == contract.get("prototypes_with_anchor", 0)
+        ),
+        "macro_attach_respects_anchor_rule": contract.get("query_macro_asof_violations", 0) == 0 and contract.get("event_macro_asof_violations", 0) == 0,
+        "missingness_taxonomy_partitioned": missingness_family_keys.issubset(VALID_MISSINGNESS_FAMILIES),
+        "zero_imputation_explicit": contract.get("query_rows_total", 0) > 0 and contract.get("query_rows_total", 0) == contract.get("query_rows_with_zero_imputation_fields", 0),
+        "breadth_excluded_from_similarity_and_gating": "breadth" not in SIMILARITY_CTX_SERIES and contract.get("query_rows_total", 0) > 0 and contract.get("query_rows_total", 0) == contract.get("query_rows_with_expected_breadth_policy", 0),
+        "summary_no_breadth_blocker": not bool(summary.get("breadth_blocking", False)) and not any("breadth" in str(reason) for reason in list(summary.get("medium_verdict_hold_reasons") or [])),
+    }
+    residual_risks: list[str] = []
+    if float(summary.get("sector_self_fallback_ratio", 0.0) or 0.0) > 0.0:
+        residual_risks.append("sector self-fallback remains non-zero and can still distort similarity for peer-poor names.")
+    if contract.get("rows_with_derived_macro_publish_time", 0) > 0:
+        residual_risks.append("derived macro publish timestamps remain in use; as-of ordering is preserved but timestamp provenance stays approximate.")
+    summary.update(
+        {
+            "contract_checks": contract_checks,
+            "contract_check_counters": contract,
+            "residual_risks": residual_risks,
+            "representation_landed": all(contract_checks.values()),
+        }
+    )
+    return summary
 
 
 def write_outputs(*, rows: list[dict[str, Any]], summary: dict[str, Any], output_root: Path) -> dict[str, str]:
@@ -305,6 +425,7 @@ def write_outputs(*, rows: list[dict[str, Any]], summary: dict[str, Any], output
     rows_path = output_root / "rows.csv"
     summary_path = output_root / "summary.json"
     report_path = output_root / "report.md"
+    landing_review_path = output_root / "landing_review.md"
     fieldnames = sorted({key for row in rows for key in row.keys()})
     with rows_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -320,10 +441,12 @@ def write_outputs(*, rows: list[dict[str, Any]], summary: dict[str, Any], output
             )
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     report_path.write_text(render_report(summary), encoding="utf-8")
+    landing_review_path.write_text(render_landing_review(summary), encoding="utf-8")
     return {
         "rows_path": str(rows_path),
         "summary_path": str(summary_path),
         "report_path": str(report_path),
+        "landing_review_path": str(landing_review_path),
     }
 
 
@@ -365,6 +488,20 @@ def diagnose_missingness(
     if max_dates > 0:
         decision_dates = decision_dates[-max_dates:]
     rows: list[dict[str, Any]] = []
+    contract = {
+        "query_rows_total": 0,
+        "query_rows_with_anchor": 0,
+        "query_rows_with_zero_imputation_fields": 0,
+        "query_rows_with_expected_breadth_policy": 0,
+        "query_macro_asof_violations": 0,
+        "event_records_total": 0,
+        "event_records_with_anchor": 0,
+        "event_records_with_expected_breadth_policy": 0,
+        "event_macro_asof_violations": 0,
+        "prototypes_total": 0,
+        "prototypes_with_anchor": 0,
+        "rows_with_derived_macro_publish_time": 0,
+    }
     for decision_date in decision_dates:
         memory = build_event_memory_asof(
             decision_date=decision_date,
@@ -377,6 +514,18 @@ def diagnose_missingness(
             session_metadata_by_symbol=session_metadata_by_symbol,
             macro_series_history=macro_series_history,
         )
+        for record in memory["event_records"]:
+            contract["event_records_total"] += 1
+            if getattr(record, "feature_anchor_ts_utc", None):
+                contract["event_records_with_anchor"] += 1
+            if ((getattr(record, "diagnostics", {}) or {}).get("breadth_policy")) == BREADTH_POLICY_DIAGNOSTICS_ONLY_V1:
+                contract["event_records_with_expected_breadth_policy"] += 1
+            if _timestamp_order_violation(getattr(record, "macro_asof_ts_utc", None), getattr(record, "feature_anchor_ts_utc", None)):
+                contract["event_macro_asof_violations"] += 1
+        for prototype in memory["prototypes"]:
+            contract["prototypes_total"] += 1
+            if getattr(prototype, "feature_anchor_ts_utc", None):
+                contract["prototypes_with_anchor"] += 1
         query_panel, query_excluded = _build_query_panel(
             decision_dates=[decision_date],
             spec=spec,
@@ -390,6 +539,20 @@ def diagnose_missingness(
             macro_series_history=macro_series_history,
         )
         query_rows = query_panel.get(decision_date, {})
+        for query_item in query_rows.values():
+            query_meta = dict((query_item or {}).get("meta") or {})
+            contract["query_rows_total"] += 1
+            if query_meta.get("feature_anchor_ts_utc"):
+                contract["query_rows_with_anchor"] += 1
+            if "transform_missing_keys_filled_zero" in query_meta:
+                contract["query_rows_with_zero_imputation_fields"] += 1
+            if str(query_meta.get("breadth_policy") or "") == BREADTH_POLICY_DIAGNOSTICS_ONLY_V1:
+                contract["query_rows_with_expected_breadth_policy"] += 1
+            if _timestamp_order_violation(query_meta.get("macro_asof_ts_utc"), query_meta.get("feature_anchor_ts_utc")):
+                contract["query_macro_asof_violations"] += 1
+            freshness_summary = dict(query_meta.get("macro_freshness_summary") or {})
+            if any(bool((freshness_summary.get(series_name) or {}).get("source_ts_is_derived", False)) for series_name in SIMILARITY_CTX_SERIES):
+                contract["rows_with_derived_macro_publish_time"] += 1
         query_reasons_by_symbol: dict[str, list[str]] = {symbol: [] for symbol in symbols}
         library_reasons_by_symbol: dict[str, list[str]] = {symbol: [] for symbol in symbols}
         for item in query_excluded:
@@ -412,6 +575,7 @@ def diagnose_missingness(
                 )
             )
     summary = summarize_rows(rows)
+    summary = _finalize_landing_summary(summary, contract)
     summary.update(
         {
             "symbols": symbols,
@@ -432,6 +596,8 @@ def main() -> int:
     parser.add_argument("--end-date", default="")
     parser.add_argument("--max-dates", type=int, default=45)
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
+    parser.add_argument("--checkpoint-sha", default="")
+    parser.add_argument("--landing-sha", default="")
     args = parser.parse_args()
 
     symbols = _parse_symbols(args.symbols)
@@ -450,6 +616,10 @@ def main() -> int:
         end_date=end_date,
         max_dates=args.max_dates,
     )
+    if args.checkpoint_sha:
+        summary["checkpoint_sha"] = args.checkpoint_sha
+    if args.landing_sha:
+        summary["landing_sha"] = args.landing_sha
     outputs = write_outputs(rows=rows, summary=summary, output_root=Path(args.output_root))
     print(json.dumps(outputs, ensure_ascii=False))
     return 0

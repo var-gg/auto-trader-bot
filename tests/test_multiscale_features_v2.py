@@ -158,12 +158,14 @@ def test_macro_freshness_features_and_breadth_missingness_are_explicit():
             "vix_age_bucket": 1.0,
         },
         additional_metadata={
+            "breadth_policy": "diagnostics_only_v1",
             "breadth_present": False,
             "breadth_missing_reason": "canonical_source_missing",
         },
     )
     assert fv.raw_context_features["vix_days_since_update"] == 1.0
     assert fv.raw_context_features["vix_bars_since_update"] == 2.0
+    assert fv.metadata["breadth_policy"] == "diagnostics_only_v1"
     assert fv.metadata["breadth_present"] is False
     assert fv.metadata["breadth_missing_reason"] == "canonical_source_missing"
 

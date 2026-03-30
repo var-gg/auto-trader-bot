@@ -12,6 +12,7 @@ from backtest_app.configs.models import ResearchExperimentSpec
 from backtest_app.historical_data.features import (
     CTX_SERIES,
     REGIME_CONTEXT_PRIORITY_SUFFIXES,
+    SIMILARITY_CTX_SERIES,
     build_multiscale_feature_vector,
     build_raw_multiscale_feature_payload,
     compute_bar_features,
@@ -38,6 +39,7 @@ DECISION_CONVENTION = "EOD_T_SIGNAL__T1_OPEN_EXECUTION"
 REGIME_THRESHOLD = 0.2
 REGIME_SOURCE_NORMALIZED = "normalized_regime_context"
 REGIME_SOURCE_RAW = "raw_macro"
+BREADTH_POLICY_DIAGNOSTICS_ONLY_V1 = "diagnostics_only_v1"
 BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING = "canonical_source_missing"
 SIMILARITY_DISABLED_SERIES = {"breadth"}
 STALE_DAYS_THRESHOLD = 3
@@ -85,6 +87,28 @@ def _ev_config_from_metadata(metadata: dict | None = None, *, top_k: int = 3, ab
 
 def _default_spec(feature_window_bars: int = 60, horizon_days: int = 5) -> ResearchExperimentSpec:
     return ResearchExperimentSpec(feature_window_bars=feature_window_bars, horizon_days=horizon_days, lookback_horizons=[horizon_days])
+
+
+def _similarity_macro_series() -> tuple[str, ...]:
+    return tuple(SIMILARITY_CTX_SERIES)
+
+
+def _count_present_similarity_macro_series(latest_macro_by_series: Dict[str, Dict[str, Any]]) -> int:
+    return sum(1 for series_name in _similarity_macro_series() if latest_macro_by_series.get(series_name))
+
+
+def _breadth_diagnostics_payload(latest_macro_by_series: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    breadth_present = bool(latest_macro_by_series.get("breadth"))
+    return {
+        "breadth_policy": BREADTH_POLICY_DIAGNOSTICS_ONLY_V1,
+        "breadth_present": breadth_present,
+        "breadth_missing_reason": None if breadth_present else BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
+    }
+
+
+def _stale_similarity_macro(macro_freshness_summary: Dict[str, Dict[str, Any]] | None) -> bool:
+    summary = macro_freshness_summary or {}
+    return any(bool((summary.get(series_name) or {}).get("is_stale_flag", False)) for series_name in _similarity_macro_series())
 
 
 def _regime_from_macro_raw(macro_payload: Dict[str, float]) -> str:
@@ -308,11 +332,13 @@ def _macro_freshness_payload(
             freshness_summary[series_name] = {
                 "present": False,
                 "missing_reason": BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
+                "breadth_policy": BREADTH_POLICY_DIAGNOSTICS_ONLY_V1,
+                "policy_disabled": True,
                 "source_ts_utc": None,
                 "source_ts_is_derived": False,
                 "days_since_update": None,
                 "bars_since_update": None,
-                "is_stale_flag": True,
+                "is_stale_flag": False,
                 "source_timestamp_age_bucket": "missing",
             }
             continue
@@ -626,6 +652,7 @@ def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_sym
         feature_anchor_ts_utc=feature_anchor_ts_utc,
         session_metadata_by_symbol=session_metadata_by_symbol,
     )
+    breadth_diagnostics = _breadth_diagnostics_payload(latest_macro_by_series)
     fv = build_multiscale_feature_vector(
         symbol=symbol,
         bars=bars,
@@ -644,8 +671,7 @@ def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_sym
             "anchor_fields": dict(anchor_fields),
             "macro_asof_ts_utc": macro_asof_ts_utc,
             "macro_freshness_summary": macro_freshness_summary,
-            "breadth_present": bool(latest_macro_by_series.get("breadth")),
-            "breadth_missing_reason": None if latest_macro_by_series.get("breadth") else BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
+            **breadth_diagnostics,
         },
     )
     latest_macro_payload = _latest_macro_payload(macro_window)
@@ -672,11 +698,10 @@ def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_sym
         "regime_code": regime_code,
         "regime_code_raw_macro": regime_code_raw_macro,
         "macro_history_length": len(macro_window),
-        "macro_series_present_count": sum(1 for key in CTX_SERIES if latest_macro_by_series.get(key)),
+        "macro_series_present_count": _count_present_similarity_macro_series(latest_macro_by_series),
         "macro_asof_ts_utc": macro_asof_ts_utc,
         "macro_freshness_summary": macro_freshness_summary,
-        "breadth_present": bool(latest_macro_by_series.get("breadth")),
-        "breadth_missing_reason": None if latest_macro_by_series.get("breadth") else BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
+        **breadth_diagnostics,
         **anchor_fields,
         **fv.metadata,
     }
@@ -807,6 +832,7 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 feature_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
                 session_metadata_by_symbol=session_metadata_by_symbol,
             )
+            breadth_diagnostics = _breadth_diagnostics_payload(latest_macro_by_series)
             raw_payload = build_raw_multiscale_feature_payload(
                 symbol=lib_symbol,
                 bars=history_window,
@@ -823,8 +849,7 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                     "anchor_fields": dict(anchor_fields),
                     "macro_asof_ts_utc": macro_asof_ts_utc,
                     "macro_freshness_summary": macro_freshness_summary,
-                    "breadth_present": bool(latest_macro_by_series.get("breadth")),
-                    "breadth_missing_reason": None if latest_macro_by_series.get("breadth") else BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
+                    **breadth_diagnostics,
                 },
             )
             regime_inputs_summary = _regime_inputs_summary(raw_payload.normalized_regime_context_features)
@@ -842,13 +867,12 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 "regime_inputs_summary": regime_inputs_summary,
                 "history_window": history_window,
                 "macro_history_length": len(macro_window),
-                "macro_series_present_count": sum(1 for key in CTX_SERIES if latest_macro_by_series.get(key)),
+                "macro_series_present_count": _count_present_similarity_macro_series(latest_macro_by_series),
                 "raw_payload": raw_payload,
                 "anchor_fields": anchor_fields,
                 "macro_asof_ts_utc": macro_asof_ts_utc,
                 "macro_freshness_summary": macro_freshness_summary,
-                "breadth_present": bool(latest_macro_by_series.get("breadth")),
-                "breadth_missing_reason": None if latest_macro_by_series.get("breadth") else BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
+                **breadth_diagnostics,
             })
     transform = fit_feature_transform(raw_event_rows)
     scaler = transform.scaler
@@ -891,6 +915,7 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 "regime_inputs_summary": dict(pending["regime_inputs_summary"]),
                 "macro_freshness_summary": dict(pending["macro_freshness_summary"]),
                 "macro_asof_ts_utc": pending["macro_asof_ts_utc"],
+                "breadth_policy": pending["breadth_policy"],
                 "breadth_present": pending["breadth_present"],
                 "breadth_missing_reason": pending["breadth_missing_reason"],
                 **pending["anchor_fields"],
@@ -923,6 +948,7 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 "macro_series_present_count": pending["macro_series_present_count"],
                 "macro_freshness_summary": dict(pending["macro_freshness_summary"]),
                 "macro_asof_ts_utc": pending["macro_asof_ts_utc"],
+                "breadth_policy": pending["breadth_policy"],
                 "breadth_present": pending["breadth_present"],
                 "breadth_missing_reason": pending["breadth_missing_reason"],
                 "liquidity_score": max(0.0, min(1.0, compute_bar_features(pending["history_window"]).get("volume_mean", 0.0) / 1_000_000.0)),
@@ -1041,7 +1067,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
     spec = spec or _default_spec(feature_window_bars=feature_window_bars, horizon_days=horizon_days)
     sector_map = sector_map or {}
     ev_cfg = _ev_config_from_metadata(metadata, top_k=top_k, abstain_margin=abstain_margin)
-    diagnostics: Dict[str, dict] = {"pipeline": {"strategy_mode": "research_similarity_v2", "spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "lookback_bars": lookback_bars, "top_k": ev_cfg.top_k, "top_k_requested": top_k, "abstain_margin": abstain_margin, "feature_flags": {"use_macro_level_in_similarity": _feature_flag("use_macro_level_in_similarity", metadata, default=False), "use_dollar_volume_absolute": _feature_flag("use_dollar_volume_absolute", metadata, default=False)}, "session_alignment": {"mode": "session_aligned_v1", "symbols_with_session_metadata": sorted((session_metadata_by_symbol or {}).keys()), "missing_session_metadata_symbols": sorted(set(bars_by_symbol) - set((session_metadata_by_symbol or {}).keys()))}, "macro_join": {"mode": "anchor_asof_join", "series_rows": len(macro_series_history or []), "breadth_in_similarity": False}, "ev_config": {"kernel_temperature": ev_cfg.kernel_temperature, "use_kernel_weighting": ev_cfg.use_kernel_weighting, "min_effective_sample_size": ev_cfg.min_effective_sample_size, "max_uncertainty": ev_cfg.max_uncertainty, "max_return_interval_width": ev_cfg.max_return_interval_width, "min_regime_alignment": ev_cfg.min_regime_alignment, "min_expected_utility": ev_cfg.min_expected_utility, "diagnostic_disable_lower_bound_gate": ev_cfg.diagnostic_disable_lower_bound_gate, "diagnostic_disable_ess_gate": ev_cfg.diagnostic_disable_ess_gate}}}
+    diagnostics: Dict[str, dict] = {"pipeline": {"strategy_mode": "research_similarity_v2", "spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "lookback_bars": lookback_bars, "top_k": ev_cfg.top_k, "top_k_requested": top_k, "abstain_margin": abstain_margin, "feature_flags": {"use_macro_level_in_similarity": _feature_flag("use_macro_level_in_similarity", metadata, default=False), "use_dollar_volume_absolute": _feature_flag("use_dollar_volume_absolute", metadata, default=False)}, "session_alignment": {"mode": "session_aligned_v1", "symbols_with_session_metadata": sorted((session_metadata_by_symbol or {}).keys()), "missing_session_metadata_symbols": sorted(set(bars_by_symbol) - set((session_metadata_by_symbol or {}).keys()))}, "macro_join": {"mode": "anchor_asof_join", "series_rows": len(macro_series_history or []), "breadth_in_similarity": False, "breadth_policy": BREADTH_POLICY_DIAGNOSTICS_ONLY_V1}, "ev_config": {"kernel_temperature": ev_cfg.kernel_temperature, "use_kernel_weighting": ev_cfg.use_kernel_weighting, "min_effective_sample_size": ev_cfg.min_effective_sample_size, "max_uncertainty": ev_cfg.max_uncertainty, "max_return_interval_width": ev_cfg.max_return_interval_width, "min_regime_alignment": ev_cfg.min_regime_alignment, "min_expected_utility": ev_cfg.min_expected_utility, "diagnostic_disable_lower_bound_gate": ev_cfg.diagnostic_disable_lower_bound_gate, "diagnostic_disable_ess_gate": ev_cfg.diagnostic_disable_ess_gate}}}
     panel_rows: List[dict] = []
     out: List[SignalCandidate] = []
     scoring_cfg = ScoringConfig(min_liquidity_score=0.0)
@@ -1135,6 +1161,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
                     "macro_history_length": query_meta.get("macro_history_length", 0),
                     "macro_series_present_count": query_meta.get("macro_series_present_count", 0),
                     "macro_freshness_summary": query_meta.get("macro_freshness_summary", {}),
+                    "breadth_policy": query_meta.get("breadth_policy", BREADTH_POLICY_DIAGNOSTICS_ONLY_V1),
                     "breadth_present": query_meta.get("breadth_present", False),
                     "breadth_missing_reason": query_meta.get("breadth_missing_reason"),
                 },
@@ -1176,9 +1203,10 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
             row_diag["missingness"] = {
                 "taxonomy": {
                     "structural_missing": False,
-                    "stale_but_usable": any(bool((item or {}).get("is_stale_flag")) for item in (query_meta.get("macro_freshness_summary") or {}).values()),
+                    "stale_but_usable": _stale_similarity_macro(query_meta.get("macro_freshness_summary")),
                     "data_quality_missing": bool(query_meta.get("anchor_missing_reason")),
                 },
+                "breadth_policy": query_meta.get("breadth_policy", BREADTH_POLICY_DIAGNOSTICS_ONLY_V1),
                 "breadth_present": query_meta.get("breadth_present", False),
                 "breadth_missing_reason": query_meta.get("breadth_missing_reason"),
                 "zero_imputed_feature_keys": list(query_meta.get("transform_missing_keys_filled_zero", []) or []),

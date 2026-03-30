@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from backtest_app.historical_data.features import CTX_SERIES, SIMILARITY_CTX_SERIES, build_multiscale_feature_vector
 from backtest_app.historical_data.models import HistoricalBar
+from backtest_app.research.pipeline import BREADTH_POLICY_DIAGNOSTICS_ONLY_V1
 
 DOC_PATH = REPO_ROOT / "docs" / "research_representation_truth_audit.md"
 JSON_PATH = REPO_ROOT / "runs" / "representation_audit" / "current_contract_audit.json"
@@ -79,6 +80,7 @@ def build_audit_payload() -> dict[str, Any]:
                 "feature_anchor_ts_utc": "2025-03-01T21:00:00+00:00",
             },
             "macro_asof_ts_utc": "2025-03-01T21:00:00+00:00",
+            "breadth_policy": BREADTH_POLICY_DIAGNOSTICS_ONLY_V1,
             "breadth_present": False,
             "breadth_missing_reason": "canonical_source_missing",
         },
@@ -100,6 +102,7 @@ def build_audit_payload() -> dict[str, Any]:
             "use_dollar_volume_absolute": bool(sample.metadata.get("use_dollar_volume_absolute", False)),
             "absolute_macro_level_in_similarity_by_default": False,
             "raw_dollar_volume_in_similarity_by_default": False,
+            "breadth_policy": BREADTH_POLICY_DIAGNOSTICS_ONLY_V1,
         },
         "loader_canonical_macro_series": ["vix", "rate", "dollar", "oil"],
         "disabled_similarity_series": ["breadth"],
@@ -242,9 +245,9 @@ def build_audit_payload() -> dict[str, Any]:
             },
             {
                 "topic": "breadth similarity path",
-                "status": "disabled from similarity, explicit missingness only",
+                "status": "policy-disabled for v1, diagnostics only, non-blocking",
                 "risk": "acceptable but monitor",
-                "line_ref": _find_line_ref(pipeline_path, 'BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING'),
+                "line_ref": _find_line_ref(pipeline_path, "BREADTH_POLICY_DIAGNOSTICS_ONLY_V1"),
             },
             {
                 "topic": "calendar-day macro snapshot artifact",
@@ -280,6 +283,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"| Regime-only keys | {regime_only_keys} | {payload['files']['features']['path']} | acceptable but monitor |",
         f"| Absolute macro level in similarity by default | {defaults['absolute_macro_level_in_similarity_by_default']} | {next(item['line_ref'] for item in payload['risk_matrix'] if item['topic'] == 'absolute macro level in default similarity')} | harmless |",
         f"| Raw dollar volume in similarity by default | {defaults['raw_dollar_volume_in_similarity_by_default']} | {next(item['line_ref'] for item in payload['risk_matrix'] if item['topic'] == 'raw dollar volume in default similarity')} | harmless |",
+        f"| Breadth policy | {defaults['breadth_policy']} | {next(item['line_ref'] for item in payload['risk_matrix'] if item['topic'] == 'breadth similarity path')} | harmless |",
         f"| Session anchor fields | {', '.join(payload['session_alignment_contract']['anchor_fields'])} | {payload['session_alignment_contract']['anchor_derivation_line_ref']} | acceptable but monitor |",
         f"| Session metadata object | {', '.join(payload['session_alignment_contract']['session_metadata_object'])} | {payload['session_alignment_contract']['exchange_mapping_line_ref']} | acceptable but monitor |",
         "",
