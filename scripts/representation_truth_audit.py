@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from backtest_app.historical_data.features import CTX_SERIES, build_multiscale_feature_vector
+from backtest_app.historical_data.features import CTX_SERIES, SIMILARITY_CTX_SERIES, build_multiscale_feature_vector
 from backtest_app.historical_data.models import HistoricalBar
 
 DOC_PATH = REPO_ROOT / "docs" / "research_representation_truth_audit.md"
@@ -60,6 +60,7 @@ def build_audit_payload() -> dict[str, Any]:
     features_path = REPO_ROOT / "backtest_app" / "historical_data" / "features.py"
     pipeline_path = REPO_ROOT / "backtest_app" / "research" / "pipeline.py"
     loader_path = REPO_ROOT / "backtest_app" / "historical_data" / "local_postgres_loader.py"
+    session_path = REPO_ROOT / "backtest_app" / "historical_data" / "session_alignment.py"
 
     sample = build_multiscale_feature_vector(
         symbol="AAPL",
@@ -68,6 +69,19 @@ def build_audit_payload() -> dict[str, Any]:
         sector_bars=_sample_bars("TECH"),
         macro_history=_sample_macro_history(),
         sector_code="TECH",
+        macro_freshness_features={"vix_days_since_update": 1.0, "vix_bars_since_update": 1.0, "vix_is_stale": 0.0, "vix_age_bucket": 0.0},
+        additional_metadata={
+            "anchor_fields": {
+                "exchange_code": "NMS",
+                "exchange_tz": "America/New_York",
+                "session_date_local": "2025-03-01",
+                "session_close_ts_utc": "2025-03-01T21:00:00+00:00",
+                "feature_anchor_ts_utc": "2025-03-01T21:00:00+00:00",
+            },
+            "macro_asof_ts_utc": "2025-03-01T21:00:00+00:00",
+            "breadth_present": False,
+            "breadth_missing_reason": "canonical_source_missing",
+        },
     )
     similarity_keys = sorted(sample.raw_features.keys())
     regime_only_keys = sorted(sample.raw_regime_context_features.keys())
@@ -77,6 +91,7 @@ def build_audit_payload() -> dict[str, Any]:
             "features": {"path": "backtest_app/historical_data/features.py"},
             "pipeline": {"path": "backtest_app/research/pipeline.py"},
             "loader": {"path": "backtest_app/historical_data/local_postgres_loader.py"},
+            "session_alignment": {"path": "backtest_app/historical_data/session_alignment.py"},
         },
         "similarity_feature_keys": similarity_keys,
         "regime_only_keys": regime_only_keys,
@@ -87,7 +102,13 @@ def build_audit_payload() -> dict[str, Any]:
             "raw_dollar_volume_in_similarity_by_default": False,
         },
         "loader_canonical_macro_series": ["vix", "rate", "dollar", "oil"],
-        "unmapped_ctx_series": ["breadth"],
+        "disabled_similarity_series": ["breadth"],
+        "session_alignment_contract": {
+            "session_metadata_object": ["exchange_code", "country_code", "exchange_tz", "session_close_local_time"],
+            "anchor_fields": ["session_date_local", "session_close_ts_local", "session_close_ts_utc", "feature_anchor_ts_utc"],
+            "exchange_mapping_line_ref": _find_line_ref(session_path, '\"KOE\": ExchangeSessionConfig('),
+            "anchor_derivation_line_ref": _find_line_ref(session_path, "def derive_session_anchor_from_date"),
+        },
         "missingness_handling": [
             {
                 "category": "exclude row",
@@ -102,6 +123,11 @@ def build_audit_payload() -> dict[str, Any]:
                         "risk": "harmless",
                         "line_ref": _find_line_ref(pipeline_path, '"reason": "insufficient_bars"'),
                     },
+                    {
+                        "name": "unknown exchange/session metadata is classified as data_quality_missing",
+                        "risk": "likely distorts similarity",
+                        "line_ref": _find_line_ref(pipeline_path, '"reason": "unknown_exchange_session"'),
+                    },
                 ],
             },
             {
@@ -111,11 +137,6 @@ def build_audit_payload() -> dict[str, Any]:
                         "name": "context/liquidity/helper defaults collapse to zero when history is short or absent",
                         "risk": "acceptable but monitor",
                         "line_ref": _find_line_ref(features_path, "def _context_series_features"),
-                    },
-                    {
-                        "name": "sector residual falls back to market residual when sector proxy is absent",
-                        "risk": "likely distorts similarity",
-                        "line_ref": _find_line_ref(features_path, 'sec = _window_returns(sector_bars, horizon) if sector_bars else mkt'),
                     },
                 ],
             },
@@ -134,8 +155,8 @@ def build_audit_payload() -> dict[str, Any]:
                 "mechanisms": [
                     {
                         "name": "calendar-day macro history forward fill via last_seen",
-                        "risk": "likely distorts regime gate",
-                        "line_ref": _find_line_ref(loader_path, "by_date.setdefault(d, dict(last_seen))"),
+                        "risk": "acceptable but monitor",
+                        "line_ref": _find_line_ref(loader_path, "def _macro_history_by_obs_date"),
                     },
                 ],
             },
@@ -143,9 +164,9 @@ def build_audit_payload() -> dict[str, Any]:
                 "category": "fallback to market proxy",
                 "mechanisms": [
                     {
-                        "name": "sector residual uses market move when no sector proxy bars exist",
-                        "risk": "likely distorts similarity",
-                        "line_ref": _find_line_ref(features_path, 'sec = _window_returns(sector_bars, horizon) if sector_bars else mkt'),
+                        "name": "market proxy is session-aware same-exchange by default",
+                        "risk": "acceptable but monitor",
+                        "line_ref": _find_line_ref(pipeline_path, 'proxy_mode="session_aware_same_exchange"'),
                     },
                 ],
             },
@@ -153,7 +174,7 @@ def build_audit_payload() -> dict[str, Any]:
                 "category": "fallback to self sector proxy",
                 "mechanisms": [
                     {
-                        "name": "sector proxy falls back to the symbol itself when no peer exists",
+                        "name": "sector proxy falls back to the symbol itself when no same-exchange peer exists",
                         "risk": "likely distorts similarity",
                         "line_ref": _find_line_ref(pipeline_path, "fallback_to_self = not bool(peers)"),
                     },
@@ -171,6 +192,10 @@ def build_audit_payload() -> dict[str, Any]:
                 "value": "spec.feature_window_bars trailing bars ending at decision_date",
                 "line_ref": _find_line_ref(pipeline_path, "query_window = bars[idx - spec.feature_window_bars + 1 : idx + 1]"),
             },
+            "macro_join_scope": {
+                "value": "latest series observation whose source_ts_utc <= feature_anchor_ts_utc",
+                "line_ref": _find_line_ref(pipeline_path, "def _macro_history_until_anchor"),
+            },
         },
         "risk_matrix": [
             {
@@ -186,10 +211,16 @@ def build_audit_payload() -> dict[str, Any]:
                 "line_ref": _find_line_ref(features_path, "if use_dollar_volume_absolute:"),
             },
             {
-                "topic": "market/sector proxy alignment",
-                "status": "date aligned by trade_date union",
+                "topic": "session alignment",
+                "status": "exchange-local session metadata derives feature_anchor_ts_utc",
                 "risk": "acceptable but monitor",
-                "line_ref": _find_line_ref(pipeline_path, "all_dates = sorted({trade_date for date_map in symbol_date_bars.values() for trade_date in date_map.keys()})"),
+                "line_ref": _find_line_ref(session_path, "def derive_session_anchor_from_date"),
+            },
+            {
+                "topic": "market/sector proxy alignment",
+                "status": "same-exchange session-aware proxy",
+                "risk": "acceptable but monitor",
+                "line_ref": _find_line_ref(pipeline_path, "focus_symbol=symbol"),
             },
             {
                 "topic": "sector proxy self fallback",
@@ -204,21 +235,28 @@ def build_audit_payload() -> dict[str, Any]:
                 "line_ref": _find_line_ref(pipeline_path, '"regime_source": REGIME_SOURCE_NORMALIZED'),
             },
             {
-                "topic": "macro loader alias mapping",
-                "status": "canonicalizes vix/rate/dollar/oil; breadth remains unmapped in current DB source",
+                "topic": "macro as-of join",
+                "status": "anchor-time as-of join with derived source_ts_utc",
                 "risk": "acceptable but monitor",
-                "line_ref": _find_line_ref(loader_path, "def _canonical_macro_series_name"),
+                "line_ref": _find_line_ref(loader_path, "def _load_macro_series_history"),
             },
             {
-                "topic": "calendar-day macro forward fill",
-                "status": "still enabled",
+                "topic": "breadth similarity path",
+                "status": "disabled from similarity, explicit missingness only",
+                "risk": "acceptable but monitor",
+                "line_ref": _find_line_ref(pipeline_path, 'BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING'),
+            },
+            {
+                "topic": "calendar-day macro snapshot artifact",
+                "status": "legacy snapshot still persisted for compatibility, as-of join uses macro_series_history",
                 "risk": "likely distorts regime gate",
-                "line_ref": _find_line_ref(loader_path, "while cursor <= end:"),
+                "line_ref": _find_line_ref(loader_path, "def _macro_history_by_obs_date"),
             },
         ],
         "regime_only_keys_count": len(regime_only_keys),
         "similarity_feature_key_count": len(similarity_keys),
         "ctx_series": list(CTX_SERIES),
+        "similarity_ctx_series": list(SIMILARITY_CTX_SERIES),
     }
     return payload
 
@@ -232,7 +270,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
         "",
         "Current public-branch representation contract audit for `features.py`, `pipeline.py`, and `local_postgres_loader.py`.",
         "",
-        f"Canonical loader macro aliases: {', '.join(payload['loader_canonical_macro_series'])}. Unmapped ctx series: {', '.join(payload['unmapped_ctx_series'])}.",
+        f"Canonical loader macro aliases: {', '.join(payload['loader_canonical_macro_series'])}. Similarity-disabled series: {', '.join(payload['disabled_similarity_series'])}.",
         "",
         "## Contract Summary",
         "",
@@ -242,6 +280,8 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"| Regime-only keys | {regime_only_keys} | {payload['files']['features']['path']} | acceptable but monitor |",
         f"| Absolute macro level in similarity by default | {defaults['absolute_macro_level_in_similarity_by_default']} | {next(item['line_ref'] for item in payload['risk_matrix'] if item['topic'] == 'absolute macro level in default similarity')} | harmless |",
         f"| Raw dollar volume in similarity by default | {defaults['raw_dollar_volume_in_similarity_by_default']} | {next(item['line_ref'] for item in payload['risk_matrix'] if item['topic'] == 'raw dollar volume in default similarity')} | harmless |",
+        f"| Session anchor fields | {', '.join(payload['session_alignment_contract']['anchor_fields'])} | {payload['session_alignment_contract']['anchor_derivation_line_ref']} | acceptable but monitor |",
+        f"| Session metadata object | {', '.join(payload['session_alignment_contract']['session_metadata_object'])} | {payload['session_alignment_contract']['exchange_mapping_line_ref']} | acceptable but monitor |",
         "",
         "## Missingness Handling",
         "",

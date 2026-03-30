@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from statistics import mean
 from time import perf_counter
@@ -10,13 +11,15 @@ from typing import Any, Dict, List, Tuple
 from backtest_app.configs.models import ResearchExperimentSpec
 from backtest_app.historical_data.features import (
     CTX_SERIES,
+    REGIME_CONTEXT_PRIORITY_SUFFIXES,
     build_multiscale_feature_vector,
     build_raw_multiscale_feature_payload,
     compute_bar_features,
     fit_feature_scaler,
     fit_feature_transform,
 )
-from backtest_app.historical_data.models import HistoricalBar
+from backtest_app.historical_data.models import HistoricalBar, SymbolSessionMetadata
+from backtest_app.historical_data.session_alignment import derive_session_anchor_for_bar, derive_session_anchor_from_date, session_anchor_timestamp_utc, session_metadata_to_dict
 from backtest_app.portfolio import PortfolioConfig, PortfolioState, build_portfolio_decisions
 from backtest_app.quote_policy import QuotePolicyConfig, compare_policy_ab
 from backtest_app.simulated_broker.engine import SimulatedBroker
@@ -35,6 +38,10 @@ DECISION_CONVENTION = "EOD_T_SIGNAL__T1_OPEN_EXECUTION"
 REGIME_THRESHOLD = 0.2
 REGIME_SOURCE_NORMALIZED = "normalized_regime_context"
 REGIME_SOURCE_RAW = "raw_macro"
+BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING = "canonical_source_missing"
+SIMILARITY_DISABLED_SERIES = {"breadth"}
+STALE_DAYS_THRESHOLD = 3
+STALE_BARS_THRESHOLD = 3
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,9 @@ class ProxySeriesResult:
     peer_count_by_date: Dict[str, int]
     contributing_symbols_by_date: Dict[str, List[str]]
     fallback_to_self: bool = False
+    proxy_mode: str = "date_aligned"
+    same_exchange_peer_count: int = 0
+    cross_exchange_proxy_used: bool = False
 
 
 def _feature_flag(name: str, metadata: dict | None, default: bool = False) -> bool:
@@ -92,6 +102,271 @@ def _regime_from_macro(macro_payload: Dict[str, float]) -> str:
     # Deprecated compatibility wrapper. New runtime paths should prefer
     # _regime_from_context_features(normalized_regime_context_features).
     return _regime_from_macro_raw(macro_payload)
+
+
+def _resolve_session_metadata(
+    symbol: str,
+    session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None,
+) -> SymbolSessionMetadata | None:
+    if not session_metadata_by_symbol:
+        return None
+    value = session_metadata_by_symbol.get(symbol)
+    if value is None:
+        return None
+    if isinstance(value, SymbolSessionMetadata):
+        return value
+    if isinstance(value, dict):
+        if not value.get("exchange_code") or not value.get("exchange_tz") or not value.get("session_close_local_time"):
+            return None
+        return SymbolSessionMetadata(
+            symbol=str(value.get("symbol") or symbol),
+            exchange_code=str(value.get("exchange_code")),
+            country_code=(str(value.get("country_code")) if value.get("country_code") is not None else None),
+            exchange_tz=str(value.get("exchange_tz")),
+            session_close_local_time=str(value.get("session_close_local_time")),
+        )
+    return None
+
+
+def _anchor_fields_for_symbol_date(
+    *,
+    symbol: str,
+    session_date_local: str,
+    session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None,
+) -> Dict[str, Any]:
+    if session_metadata_by_symbol is None:
+        return {
+            "exchange_code": None,
+            "country_code": None,
+            "exchange_tz": None,
+            "session_date_local": session_date_local,
+            "session_close_ts_local": None,
+            "session_close_ts_utc": None,
+            "feature_anchor_ts_utc": None,
+            "missingness_family": None,
+            "anchor_missing_reason": None,
+        }
+    session_metadata = _resolve_session_metadata(symbol, session_metadata_by_symbol)
+    if session_metadata is None:
+        return {
+            "exchange_code": None,
+            "country_code": None,
+            "exchange_tz": None,
+            "session_date_local": session_date_local,
+            "session_close_ts_local": None,
+            "session_close_ts_utc": None,
+            "feature_anchor_ts_utc": None,
+            "missingness_family": "data_quality_missing",
+            "anchor_missing_reason": "unknown_exchange_session",
+        }
+    anchor = derive_session_anchor_from_date(
+        session_date_local=session_date_local,
+        session_metadata=session_metadata,
+    )
+    return {
+        **anchor,
+        "missingness_family": None,
+        "anchor_missing_reason": None,
+    }
+
+
+def _bar_anchor_ts_utc(
+    *,
+    symbol: str,
+    bar: HistoricalBar,
+    session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None,
+) -> datetime | None:
+    session_metadata = _resolve_session_metadata(symbol, session_metadata_by_symbol)
+    if session_metadata is None:
+        return None
+    return session_anchor_timestamp_utc(
+        session_date_local=str(bar.timestamp)[:10],
+        session_metadata=session_metadata,
+    )
+
+
+def _same_exchange_symbols(
+    *,
+    focus_symbol: str,
+    bars_by_symbol: Dict[str, List[HistoricalBar]],
+    session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None,
+) -> Dict[str, List[HistoricalBar]]:
+    if not session_metadata_by_symbol:
+        return dict(bars_by_symbol)
+    focus_meta = _resolve_session_metadata(focus_symbol, session_metadata_by_symbol)
+    if focus_meta is None:
+        return dict(bars_by_symbol)
+    return {
+        symbol: list(bars)
+        for symbol, bars in bars_by_symbol.items()
+        if (_resolve_session_metadata(symbol, session_metadata_by_symbol) or focus_meta).exchange_code == focus_meta.exchange_code
+    }
+
+
+def _derived_macro_rows_from_history(
+    macro_history_by_date: Dict[str, Dict[str, float]] | None,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for obs_date, payload in sorted((macro_history_by_date or {}).items()):
+        for series_name, value in sorted((payload or {}).items()):
+            if value is None:
+                continue
+            source_ts_utc = None
+            if series_name != "breadth":
+                source_ts_utc = datetime.fromisoformat(f"{str(obs_date)[:10]}T20:00:00+00:00").isoformat()
+            out.append(
+                {
+                    "obs_date": str(obs_date)[:10],
+                    "name": str(series_name),
+                    "value": float(value),
+                    "source_ts_utc": source_ts_utc,
+                    "source_ts_is_derived": source_ts_utc is not None,
+                }
+            )
+    return out
+
+
+def _macro_observation_rows(
+    *,
+    macro_history_by_date: Dict[str, Dict[str, float]] | None,
+    macro_series_history: List[Dict[str, Any]] | None = None,
+) -> List[Dict[str, Any]]:
+    rows = [dict(row) for row in list(macro_series_history or [])]
+    if rows:
+        rows.sort(key=lambda row: (str(row.get("source_ts_utc") or ""), str(row.get("obs_date") or ""), str(row.get("name") or "")))
+        return rows
+    return _derived_macro_rows_from_history(macro_history_by_date)
+
+
+def _macro_history_until_anchor(
+    *,
+    macro_history_by_date: Dict[str, Dict[str, float]],
+    macro_series_history: List[Dict[str, Any]] | None,
+    feature_anchor_ts_utc: str | None,
+    fallback_cutoff_date: str | None = None,
+) -> tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, Any]], str | None]:
+    rows = _macro_observation_rows(
+        macro_history_by_date=macro_history_by_date,
+        macro_series_history=macro_series_history,
+    )
+    if not feature_anchor_ts_utc:
+        fallback_history = _macro_history_until(macro_history_by_date, fallback_cutoff_date or max(macro_history_by_date.keys(), default=""))
+        latest_payload = _latest_macro_payload(fallback_history)
+        latest_by_series = {
+            series_name: {
+                "name": series_name,
+                "value": float(value),
+                "source_ts_utc": None,
+                "source_ts_is_derived": False,
+            }
+            for series_name, value in latest_payload.items()
+            if series_name != "breadth"
+        }
+        return fallback_history, latest_by_series, None
+    anchor_dt = datetime.fromisoformat(str(feature_anchor_ts_utc))
+    snapshots: Dict[str, Dict[str, float]] = {}
+    latest_by_series: Dict[str, Dict[str, Any]] = {}
+    last_seen: Dict[str, float] = {}
+    for row in rows:
+        source_ts = row.get("source_ts_utc")
+        if not source_ts:
+            continue
+        source_dt = datetime.fromisoformat(str(source_ts))
+        if source_dt > anchor_dt:
+            break
+        obs_date = str(row.get("obs_date") or "")[:10]
+        series_name = str(row.get("name") or "")
+        if series_name == "breadth":
+            continue
+        snapshots.setdefault(obs_date, dict(last_seen))
+        value = float(row.get("value") or 0.0)
+        last_seen[series_name] = value
+        snapshots[obs_date][series_name] = value
+        latest_by_series[series_name] = dict(row)
+    macro_asof_ts_utc = max((str(row.get("source_ts_utc")) for row in latest_by_series.values()), default=None)
+    return snapshots, latest_by_series, macro_asof_ts_utc
+
+
+def _macro_freshness_payload(
+    *,
+    symbol: str,
+    bars_by_symbol: Dict[str, List[HistoricalBar]],
+    latest_macro_by_series: Dict[str, Dict[str, Any]],
+    feature_anchor_ts_utc: str | None,
+    session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None,
+) -> tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
+    freshness_features: Dict[str, float] = {}
+    freshness_summary: Dict[str, Dict[str, Any]] = {}
+    anchor_dt = datetime.fromisoformat(str(feature_anchor_ts_utc)) if feature_anchor_ts_utc else None
+    symbol_bars = list(bars_by_symbol.get(symbol, []))
+    bar_anchor_dts = [
+        _bar_anchor_ts_utc(symbol=symbol, bar=bar, session_metadata_by_symbol=session_metadata_by_symbol)
+        for bar in symbol_bars
+    ]
+    for series_name in CTX_SERIES:
+        if series_name in SIMILARITY_DISABLED_SERIES:
+            freshness_summary[series_name] = {
+                "present": False,
+                "missing_reason": BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
+                "source_ts_utc": None,
+                "source_ts_is_derived": False,
+                "days_since_update": None,
+                "bars_since_update": None,
+                "is_stale_flag": True,
+                "source_timestamp_age_bucket": "missing",
+            }
+            continue
+        row = latest_macro_by_series.get(series_name)
+        if not row or not row.get("source_ts_utc") or anchor_dt is None:
+            freshness_summary[series_name] = {
+                "present": False,
+                "missing_reason": "not_published_yet",
+                "source_ts_utc": None,
+                "source_ts_is_derived": False,
+                "days_since_update": None,
+                "bars_since_update": None,
+                "is_stale_flag": True,
+                "source_timestamp_age_bucket": "missing",
+            }
+            freshness_features[f"{series_name}_is_stale"] = 1.0
+            freshness_features[f"{series_name}_age_bucket"] = 3.0
+            freshness_features[f"{series_name}_days_since_update"] = 999.0
+            freshness_features[f"{series_name}_bars_since_update"] = 999.0
+            continue
+        source_dt = datetime.fromisoformat(str(row["source_ts_utc"]))
+        days_since_update = max(0.0, (anchor_dt - source_dt).total_seconds() / 86400.0)
+        bars_since_update = float(sum(1 for bar_dt in bar_anchor_dts if bar_dt and source_dt < bar_dt <= anchor_dt))
+        is_stale_flag = days_since_update > STALE_DAYS_THRESHOLD or bars_since_update > STALE_BARS_THRESHOLD
+        if is_stale_flag:
+            age_bucket = 2 if days_since_update <= 7.0 else 3
+        elif days_since_update > 1.0:
+            age_bucket = 1
+        else:
+            age_bucket = 0
+        freshness_features[f"{series_name}_days_since_update"] = float(days_since_update)
+        freshness_features[f"{series_name}_bars_since_update"] = float(bars_since_update)
+        freshness_features[f"{series_name}_is_stale"] = 1.0 if is_stale_flag else 0.0
+        freshness_features[f"{series_name}_age_bucket"] = float(age_bucket)
+        freshness_summary[series_name] = {
+            "present": True,
+            "missing_reason": None,
+            "source_ts_utc": str(row["source_ts_utc"]),
+            "source_ts_is_derived": bool(row.get("source_ts_is_derived", False)),
+            "days_since_update": float(days_since_update),
+            "bars_since_update": float(bars_since_update),
+            "is_stale_flag": bool(is_stale_flag),
+            "source_timestamp_age_bucket": int(age_bucket),
+            "value": float(row.get("value") or 0.0),
+        }
+    return freshness_features, freshness_summary
+
+
+def _missingness_family_for_reason(reason: str) -> str:
+    if reason in {"insufficient_bars", "insufficient_query_history"}:
+        return "structural_missing"
+    if reason in {"unknown_exchange_session", "missing_session_metadata"}:
+        return "data_quality_missing"
+    return "data_quality_missing"
 
 
 def _bars_until_date(bars: List[HistoricalBar], cutoff_date: str | None) -> List[HistoricalBar]:
@@ -160,15 +435,42 @@ def _market_proxy_series(
     cutoff_date: str | None = None,
     *,
     proxy_symbol: str = "MKT",
+    focus_symbol: str | None = None,
+    session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None,
+    cutoff_anchor_ts_utc: str | None = None,
 ) -> ProxySeriesResult:
+    source_bars = (
+        _same_exchange_symbols(
+            focus_symbol=focus_symbol,
+            bars_by_symbol=bars_by_symbol,
+            session_metadata_by_symbol=session_metadata_by_symbol,
+        )
+        if focus_symbol
+        else dict(bars_by_symbol)
+    )
     symbol_date_bars: Dict[str, Dict[str, HistoricalBar]] = {}
-    for symbol, bars in bars_by_symbol.items():
+    for symbol, bars in source_bars.items():
         clipped = _bars_until_date(bars, cutoff_date)
+        if cutoff_anchor_ts_utc:
+            clipped = [
+                bar
+                for bar in clipped
+                if (_bar_anchor_ts_utc(symbol=symbol, bar=bar, session_metadata_by_symbol=session_metadata_by_symbol) or datetime.min.replace(tzinfo=timezone.utc))
+                <= datetime.fromisoformat(str(cutoff_anchor_ts_utc))
+            ]
         if not clipped:
             continue
         symbol_date_bars[symbol] = {_trade_date(bar): bar for bar in clipped}
     if not symbol_date_bars:
-        return ProxySeriesResult(bars=[], peer_count_by_date={}, contributing_symbols_by_date={}, fallback_to_self=False)
+        return ProxySeriesResult(
+            bars=[],
+            peer_count_by_date={},
+            contributing_symbols_by_date={},
+            fallback_to_self=False,
+            proxy_mode="session_aware_same_exchange" if focus_symbol and session_metadata_by_symbol else "date_aligned",
+            same_exchange_peer_count=max(0, len(source_bars)),
+            cross_exchange_proxy_used=False,
+        )
     all_dates = sorted({trade_date for date_map in symbol_date_bars.values() for trade_date in date_map.keys()})
     rows: List[HistoricalBar] = []
     peer_count_by_date: Dict[str, int] = {}
@@ -197,6 +499,9 @@ def _market_proxy_series(
         peer_count_by_date=peer_count_by_date,
         contributing_symbols_by_date=contributing_symbols_by_date,
         fallback_to_self=False,
+        proxy_mode="session_aware_same_exchange" if focus_symbol and session_metadata_by_symbol else "date_aligned",
+        same_exchange_peer_count=max(0, len(symbol_date_bars)),
+        cross_exchange_proxy_used=False,
     )
 
 
@@ -204,17 +509,39 @@ def _market_proxy_bars(bars_by_symbol: Dict[str, List[HistoricalBar]], cutoff_da
     return _market_proxy_series(bars_by_symbol, cutoff_date=cutoff_date).bars
 
 
-def _sector_proxy_series(symbol: str, bars_by_symbol: Dict[str, List[HistoricalBar]], sector_map: Dict[str, str], cutoff_date: str | None = None) -> ProxySeriesResult:
+def _sector_proxy_series(symbol: str, bars_by_symbol: Dict[str, List[HistoricalBar]], sector_map: Dict[str, str], cutoff_date: str | None = None, *, session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None, cutoff_anchor_ts_utc: str | None = None) -> ProxySeriesResult:
     sector = sector_map.get(symbol)
-    peers = {s: bars for s, bars in bars_by_symbol.items() if s != symbol and sector and sector_map.get(s) == sector}
+    focus_meta = _resolve_session_metadata(symbol, session_metadata_by_symbol)
+    peers = {
+        s: bars
+        for s, bars in bars_by_symbol.items()
+        if s != symbol
+        and sector
+        and sector_map.get(s) == sector
+        and (
+            focus_meta is None
+            or session_metadata_by_symbol is None
+            or (_resolve_session_metadata(s, session_metadata_by_symbol) and _resolve_session_metadata(s, session_metadata_by_symbol).exchange_code == focus_meta.exchange_code)
+        )
+    }
     fallback_to_self = not bool(peers)
     proxy_source = peers or {symbol: bars_by_symbol.get(symbol, [])}
-    result = _market_proxy_series(proxy_source, cutoff_date=cutoff_date, proxy_symbol=f"SECTOR:{sector or symbol}")
+    result = _market_proxy_series(
+        proxy_source,
+        cutoff_date=cutoff_date,
+        proxy_symbol=f"SECTOR:{sector or symbol}",
+        focus_symbol=symbol,
+        session_metadata_by_symbol=session_metadata_by_symbol,
+        cutoff_anchor_ts_utc=cutoff_anchor_ts_utc,
+    )
     return ProxySeriesResult(
         bars=result.bars,
         peer_count_by_date=result.peer_count_by_date,
         contributing_symbols_by_date=result.contributing_symbols_by_date,
         fallback_to_self=fallback_to_self,
+        proxy_mode=result.proxy_mode,
+        same_exchange_peer_count=result.same_exchange_peer_count,
+        cross_exchange_proxy_used=result.cross_exchange_proxy_used,
     )
 
 
@@ -228,11 +555,17 @@ def _proxy_diagnostics_payload(market_proxy: ProxySeriesResult, sector_proxy: Pr
             "peer_count_by_date": dict(market_proxy.peer_count_by_date),
             "contributing_symbols_by_date": dict(market_proxy.contributing_symbols_by_date),
             "fallback_to_self": False,
+            "proxy_mode": market_proxy.proxy_mode,
+            "same_exchange_peer_count": market_proxy.same_exchange_peer_count,
+            "cross_exchange_proxy_used": market_proxy.cross_exchange_proxy_used,
         },
         "sector": {
             "peer_count_by_date": dict(sector_proxy.peer_count_by_date),
             "contributing_symbols_by_date": dict(sector_proxy.contributing_symbols_by_date),
             "fallback_to_self": bool(sector_proxy.fallback_to_self),
+            "proxy_mode": sector_proxy.proxy_mode,
+            "same_exchange_peer_count": sector_proxy.same_exchange_peer_count,
+            "cross_exchange_proxy_used": sector_proxy.cross_exchange_proxy_used,
         },
     }
 
@@ -253,19 +586,52 @@ def _assert_similarity_macro_history_contract(macro_history: Dict[str, Dict[str,
         raise AssertionError("single-day macro history collapses context semantics")
 
 
-def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history: Dict[str, Dict[str, float]], sector_map: Dict[str, str], cutoff_date: str | None, spec: ResearchExperimentSpec | None = None, scaler=None, transform=None, use_macro_level_in_similarity: bool = False, use_dollar_volume_absolute: bool = False) -> tuple[list[float], dict]:
-    _assert_similarity_macro_history_contract(macro_history)
+def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history: Dict[str, Dict[str, float]], sector_map: Dict[str, str], cutoff_date: str | None, spec: ResearchExperimentSpec | None = None, scaler=None, transform=None, use_macro_level_in_similarity: bool = False, use_dollar_volume_absolute: bool = False, session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None, macro_series_history: List[Dict[str, Any]] | None = None) -> tuple[list[float], dict]:
     sector_code = sector_map.get(symbol)
     shape_horizons = list((spec.lookback_horizons if spec and spec.lookback_horizons else [spec.horizon_days] if spec else []) or [])
     resolved_scaler = scaler or (transform.scaler if transform is not None else None)
-    market_proxy = _market_proxy_series(bars_by_symbol, cutoff_date=cutoff_date)
-    sector_proxy = _sector_proxy_series(symbol, bars_by_symbol, sector_map, cutoff_date=cutoff_date)
+    session_date_local = cutoff_date or (str(bars[-1].timestamp)[:10] if bars else None)
+    anchor_fields = _anchor_fields_for_symbol_date(
+        symbol=symbol,
+        session_date_local=str(session_date_local),
+        session_metadata_by_symbol=session_metadata_by_symbol,
+    ) if session_date_local else {}
+    feature_anchor_ts_utc = anchor_fields.get("feature_anchor_ts_utc")
+    market_proxy = _market_proxy_series(
+        bars_by_symbol,
+        cutoff_date=cutoff_date,
+        focus_symbol=symbol,
+        session_metadata_by_symbol=session_metadata_by_symbol,
+        cutoff_anchor_ts_utc=feature_anchor_ts_utc,
+    )
+    sector_proxy = _sector_proxy_series(
+        symbol,
+        bars_by_symbol,
+        sector_map,
+        cutoff_date=cutoff_date,
+        session_metadata_by_symbol=session_metadata_by_symbol,
+        cutoff_anchor_ts_utc=feature_anchor_ts_utc,
+    )
+    macro_window, latest_macro_by_series, macro_asof_ts_utc = _macro_history_until_anchor(
+        macro_history_by_date=macro_history,
+        macro_series_history=macro_series_history,
+        feature_anchor_ts_utc=feature_anchor_ts_utc,
+        fallback_cutoff_date=cutoff_date,
+    )
+    _assert_similarity_macro_history_contract(macro_window)
+    macro_freshness_features, macro_freshness_summary = _macro_freshness_payload(
+        symbol=symbol,
+        bars_by_symbol=bars_by_symbol,
+        latest_macro_by_series=latest_macro_by_series,
+        feature_anchor_ts_utc=feature_anchor_ts_utc,
+        session_metadata_by_symbol=session_metadata_by_symbol,
+    )
     fv = build_multiscale_feature_vector(
         symbol=symbol,
         bars=bars,
         market_bars=market_proxy.bars,
         sector_bars=sector_proxy.bars,
-        macro_history=macro_history,
+        macro_history=macro_window,
         sector_code=sector_code,
         scaler=resolved_scaler,
         transform=transform,
@@ -273,8 +639,16 @@ def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_sym
         use_macro_level_in_similarity=use_macro_level_in_similarity,
         use_dollar_volume_absolute=use_dollar_volume_absolute,
         proxy_diagnostics=_proxy_diagnostics_payload(market_proxy, sector_proxy),
+        macro_freshness_features=macro_freshness_features,
+        additional_metadata={
+            "anchor_fields": dict(anchor_fields),
+            "macro_asof_ts_utc": macro_asof_ts_utc,
+            "macro_freshness_summary": macro_freshness_summary,
+            "breadth_present": bool(latest_macro_by_series.get("breadth")),
+            "breadth_missing_reason": None if latest_macro_by_series.get("breadth") else BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
+        },
     )
-    latest_macro_payload = _latest_macro_payload(macro_history)
+    latest_macro_payload = _latest_macro_payload(macro_window)
     regime_inputs_summary = _regime_inputs_summary(fv.normalized_regime_context_features)
     regime_code = _regime_from_context_features(fv.normalized_regime_context_features)
     regime_code_raw_macro = _regime_from_macro_raw(latest_macro_payload)
@@ -297,8 +671,13 @@ def build_query_embedding(*, symbol: str, bars: List[HistoricalBar], bars_by_sym
         "regime_inputs_summary": regime_inputs_summary,
         "regime_code": regime_code,
         "regime_code_raw_macro": regime_code_raw_macro,
-        "macro_history_length": len(macro_history),
-        "macro_series_present_count": sum(1 for key in CTX_SERIES if latest_macro_payload.get(key) is not None),
+        "macro_history_length": len(macro_window),
+        "macro_series_present_count": sum(1 for key in CTX_SERIES if latest_macro_by_series.get(key)),
+        "macro_asof_ts_utc": macro_asof_ts_utc,
+        "macro_freshness_summary": macro_freshness_summary,
+        "breadth_present": bool(latest_macro_by_series.get("breadth")),
+        "breadth_missing_reason": None if latest_macro_by_series.get("breadth") else BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
+        **anchor_fields,
         **fv.metadata,
     }
 
@@ -327,12 +706,16 @@ def _side_diag(ev, surface, side: str) -> dict:
     return {
         "side": side,
         "expected_net_return": getattr(ev, "expected_net_return", 0.0),
+        "expected_mae": getattr(ev, "expected_mae", 0.0),
+        "expected_mfe": getattr(ev, "expected_mfe", 0.0),
         "fallback_raw_ev": utility.get("fallback_raw_ev", getattr(ev, "expected_utility", 0.0)),
         "q10": interval.get("q10", 0.0),
         "q50": interval.get("q50", 0.0),
         "q90": interval.get("q90", 0.0),
         "uncertainty": getattr(ev, "uncertainty", 0.0),
+        "regime_alignment": getattr(ev, "regime_alignment", 0.0),
         "lower_bound": interval.get("q10", 0.0) - float(getattr(ev, "uncertainty", 0.0) or 0.0),
+        "interval_width": float(interval.get("q90", 0.0) or 0.0) - float(interval.get("q10", 0.0) or 0.0),
         "support_count": float(sum(support_counts)),
         "n_eff": getattr(ev, "effective_sample_size", 0.0),
         "p_target": utility.get("p_target_first", getattr(ev, "p_up_first", 0.0)),
@@ -361,7 +744,7 @@ def _macro_history_until(macro_history_by_date: Dict[str, Dict[str, float]], fea
     return {k: dict(v) for k, v in sorted(macro_history_by_date.items()) if k <= feature_end_date}
 
 
-def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, lookback_bars: int = 5, metadata: dict | None = None) -> dict:
+def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, lookback_bars: int = 5, metadata: dict | None = None, session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None, macro_series_history: List[Dict[str, Any]] | None = None) -> dict:
     min_required_bars = max(lookback_bars, spec.feature_window_bars)
     label_cfg = _label_cfg(spec)
     use_macro_level_in_similarity = _feature_flag("use_macro_level_in_similarity", metadata, default=False)
@@ -372,8 +755,12 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
     excluded_reasons: list[dict] = []
     pending_records: list[dict] = []
     for lib_symbol, lib_bars in bars_by_symbol.items():
+        session_metadata = _resolve_session_metadata(lib_symbol, session_metadata_by_symbol)
+        if session_metadata_by_symbol and session_metadata is None:
+            excluded_reasons.append({"symbol": lib_symbol, "reason": "unknown_exchange_session", "missingness_family": "data_quality_missing"})
+            continue
         if len(lib_bars) < min_required_bars + spec.horizon_days + 2:
-            excluded_reasons.append({"symbol": lib_symbol, "reason": "insufficient_bars"})
+            excluded_reasons.append({"symbol": lib_symbol, "reason": "insufficient_bars", "missingness_family": "structural_missing"})
             continue
         lib_sector = sector_map.get(lib_symbol)
         for j in range(min_required_bars - 1, len(lib_bars) - spec.horizon_days - 1):
@@ -385,11 +772,41 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 break
             history_window = lib_bars[j - spec.feature_window_bars + 1 : j + 1]
             future_window = lib_bars[j + 1 : j + 1 + spec.horizon_days]
-            macro_window = _macro_history_until(macro_history_by_date, feature_end_date)
-            macro_payload = dict(macro_history_by_date.get(feature_end_date, {}))
+            anchor_fields = _anchor_fields_for_symbol_date(
+                symbol=lib_symbol,
+                session_date_local=feature_end_date,
+                session_metadata_by_symbol=session_metadata_by_symbol,
+            )
+            macro_window, latest_macro_by_series, macro_asof_ts_utc = _macro_history_until_anchor(
+                macro_history_by_date=macro_history_by_date,
+                macro_series_history=macro_series_history,
+                feature_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
+                fallback_cutoff_date=feature_end_date,
+            )
+            macro_payload = _latest_macro_payload(macro_window)
             event = build_event_outcome_record(future_window, label_cfg)
-            market_proxy = _market_proxy_series(bars_by_symbol, cutoff_date=feature_end_date)
-            sector_proxy = _sector_proxy_series(lib_symbol, bars_by_symbol, sector_map, cutoff_date=feature_end_date)
+            market_proxy = _market_proxy_series(
+                bars_by_symbol,
+                cutoff_date=feature_end_date,
+                focus_symbol=lib_symbol,
+                session_metadata_by_symbol=session_metadata_by_symbol,
+                cutoff_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
+            )
+            sector_proxy = _sector_proxy_series(
+                lib_symbol,
+                bars_by_symbol,
+                sector_map,
+                cutoff_date=feature_end_date,
+                session_metadata_by_symbol=session_metadata_by_symbol,
+                cutoff_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
+            )
+            macro_freshness_features, macro_freshness_summary = _macro_freshness_payload(
+                symbol=lib_symbol,
+                bars_by_symbol=bars_by_symbol,
+                latest_macro_by_series=latest_macro_by_series,
+                feature_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
+                session_metadata_by_symbol=session_metadata_by_symbol,
+            )
             raw_payload = build_raw_multiscale_feature_payload(
                 symbol=lib_symbol,
                 bars=history_window,
@@ -401,6 +818,14 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 use_macro_level_in_similarity=use_macro_level_in_similarity,
                 use_dollar_volume_absolute=use_dollar_volume_absolute,
                 proxy_diagnostics=_proxy_diagnostics_payload(market_proxy, sector_proxy),
+                macro_freshness_features=macro_freshness_features,
+                additional_metadata={
+                    "anchor_fields": dict(anchor_fields),
+                    "macro_asof_ts_utc": macro_asof_ts_utc,
+                    "macro_freshness_summary": macro_freshness_summary,
+                    "breadth_present": bool(latest_macro_by_series.get("breadth")),
+                    "breadth_missing_reason": None if latest_macro_by_series.get("breadth") else BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
+                },
             )
             regime_inputs_summary = _regime_inputs_summary(raw_payload.normalized_regime_context_features)
             regime_code = _regime_from_context_features(raw_payload.normalized_regime_context_features)
@@ -417,8 +842,13 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 "regime_inputs_summary": regime_inputs_summary,
                 "history_window": history_window,
                 "macro_history_length": len(macro_window),
-                "macro_series_present_count": sum(1 for key in CTX_SERIES if macro_payload.get(key) is not None),
+                "macro_series_present_count": sum(1 for key in CTX_SERIES if latest_macro_by_series.get(key)),
                 "raw_payload": raw_payload,
+                "anchor_fields": anchor_fields,
+                "macro_asof_ts_utc": macro_asof_ts_utc,
+                "macro_freshness_summary": macro_freshness_summary,
+                "breadth_present": bool(latest_macro_by_series.get("breadth")),
+                "breadth_missing_reason": None if latest_macro_by_series.get("breadth") else BREADTH_MISSING_REASON_CANONICAL_SOURCE_MISSING,
             })
     transform = fit_feature_transform(raw_event_rows)
     scaler = transform.scaler
@@ -436,6 +866,14 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
             event_date=pending["feature_end_date"],
             outcome_end_date=pending["outcome_end_date"],
             schema_version=spec.label_version,
+            exchange_code=pending["anchor_fields"].get("exchange_code"),
+            country_code=pending["anchor_fields"].get("country_code"),
+            exchange_tz=pending["anchor_fields"].get("exchange_tz"),
+            session_date_local=pending["anchor_fields"].get("session_date_local"),
+            session_close_ts_local=pending["anchor_fields"].get("session_close_ts_local"),
+            session_close_ts_utc=pending["anchor_fields"].get("session_close_ts_utc"),
+            feature_anchor_ts_utc=pending["anchor_fields"].get("feature_anchor_ts_utc"),
+            macro_asof_ts_utc=pending["macro_asof_ts_utc"],
             path_summary={
                 **pending["event"].path_summary,
                 "path_label": pending["event"].path_label,
@@ -451,6 +889,11 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 "transform_missing_keys_filled_zero": transform_missing_keys_filled_zero,
                 "regime_source": REGIME_SOURCE_NORMALIZED,
                 "regime_inputs_summary": dict(pending["regime_inputs_summary"]),
+                "macro_freshness_summary": dict(pending["macro_freshness_summary"]),
+                "macro_asof_ts_utc": pending["macro_asof_ts_utc"],
+                "breadth_present": pending["breadth_present"],
+                "breadth_missing_reason": pending["breadth_missing_reason"],
+                **pending["anchor_fields"],
             },
             side_outcomes=pending["event"].side_payload,
             diagnostics={
@@ -478,8 +921,13 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
                 "transformed_zero_feature_keys": transformed_zero_feature_keys,
                 "macro_history_length": pending["macro_history_length"],
                 "macro_series_present_count": pending["macro_series_present_count"],
+                "macro_freshness_summary": dict(pending["macro_freshness_summary"]),
+                "macro_asof_ts_utc": pending["macro_asof_ts_utc"],
+                "breadth_present": pending["breadth_present"],
+                "breadth_missing_reason": pending["breadth_missing_reason"],
                 "liquidity_score": max(0.0, min(1.0, compute_bar_features(pending["history_window"]).get("volume_mean", 0.0) / 1_000_000.0)),
                 "quality_score": float(pending["event"].quality_score),
+                **pending["anchor_fields"],
             },
         ))
     prototypes = build_state_prototypes_from_event_memory(event_records=event_records, as_of_date=decision_date, memory_version=spec.memory_version, spec_hash=spec.spec_hash(), config=PrototypeConfig(dedup_similarity_threshold=0.985, memory_version=spec.memory_version)) if event_records else []
@@ -487,7 +935,7 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
     return {"spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "as_of_date": decision_date, "coverage": coverage, "excluded_reasons": excluded_reasons, "event_records": event_records, "anchor_library": anchor_library, "prototypes": prototypes, "scaler": scaler, "transform": transform}
 
 
-def _build_query_panel(*, decision_dates: list[str], spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], scaler=None, transform=None, metadata: dict | None = None):
+def _build_query_panel(*, decision_dates: list[str], spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], scaler=None, transform=None, metadata: dict | None = None, session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None, macro_series_history: List[Dict[str, Any]] | None = None):
     out = {}
     excluded_reasons = []
     allowed = set(decision_dates)
@@ -496,33 +944,36 @@ def _build_query_panel(*, decision_dates: list[str], spec: ResearchExperimentSpe
     for decision_date in decision_dates:
         per_date = {}
         for symbol, bars in bars_by_symbol.items():
+            if session_metadata_by_symbol and _resolve_session_metadata(symbol, session_metadata_by_symbol) is None:
+                excluded_reasons.append({"symbol": symbol, "reason": "unknown_exchange_session", "decision_date": decision_date, "missingness_family": "data_quality_missing"})
+                continue
             eligible = [i for i, bar in enumerate(bars) if str(bar.timestamp)[:10] == decision_date]
             if not eligible:
                 continue
             idx = eligible[0]
             if idx < spec.feature_window_bars - 1 or idx + 1 >= len(bars):
-                excluded_reasons.append({"symbol": symbol, "reason": "insufficient_query_history", "decision_date": decision_date})
+                excluded_reasons.append({"symbol": symbol, "reason": "insufficient_query_history", "decision_date": decision_date, "missingness_family": "structural_missing"})
                 continue
             query_window = bars[idx - spec.feature_window_bars + 1 : idx + 1]
-            embedding, meta = build_query_embedding(symbol=symbol, bars=query_window, bars_by_symbol=bars_by_symbol, macro_history=_macro_history_until(macro_history_by_date, decision_date), sector_map=sector_map, cutoff_date=decision_date, spec=spec, scaler=scaler, transform=transform, use_macro_level_in_similarity=use_macro_level_in_similarity, use_dollar_volume_absolute=use_dollar_volume_absolute)
+            embedding, meta = build_query_embedding(symbol=symbol, bars=query_window, bars_by_symbol=bars_by_symbol, macro_history=macro_history_by_date, sector_map=sector_map, cutoff_date=decision_date, spec=spec, scaler=scaler, transform=transform, use_macro_level_in_similarity=use_macro_level_in_similarity, use_dollar_volume_absolute=use_dollar_volume_absolute, session_metadata_by_symbol=session_metadata_by_symbol, macro_series_history=macro_series_history)
             per_date[symbol] = {"idx": idx, "query_window": query_window, "embedding": embedding, "meta": meta, "execution_bar": bars[idx + 1]}
         if decision_date in allowed:
             out[decision_date] = per_date
     return out, excluded_reasons
 
 
-def fit_train_artifacts(*, run_id: str, artifact_store: JsonResearchArtifactStore, train_end: str, test_start: str, purge: int, embargo: int, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, calibration_artifact: dict | None = None, quote_policy_calibration: dict | None = None, metadata: dict | None = None) -> dict:
-    memory = build_event_memory_asof(decision_date=train_end, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market, metadata=metadata)
+def fit_train_artifacts(*, run_id: str, artifact_store: JsonResearchArtifactStore, train_end: str, test_start: str, purge: int, embargo: int, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, calibration_artifact: dict | None = None, quote_policy_calibration: dict | None = None, metadata: dict | None = None, session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None, macro_series_history: List[Dict[str, Any]] | None = None) -> dict:
+    memory = build_event_memory_asof(decision_date=train_end, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market, metadata=metadata, session_metadata_by_symbol=session_metadata_by_symbol, macro_series_history=macro_series_history)
     max_train_date = max((r.event_date for r in memory["event_records"]), default=None)
     max_outcome_end = max((r.outcome_end_date for r in memory["event_records"] if r.outcome_end_date), default=None)
     if max_outcome_end and max_outcome_end >= test_start:
         raise AssertionError("future event/outcome mixed into train artifact")
     snapshot_id = f"{run_id}:{train_end}:{spec.spec_hash()}"
     artifact_store.save_prototype_snapshot(run_id=run_id, as_of_date=train_end, memory_version=spec.memory_version, payload={"spec_hash": spec.spec_hash(), "snapshot_id": snapshot_id, "prototype_count": len(memory["prototypes"]), "prototypes": [p.__dict__ for p in memory["prototypes"]]})
-    return {"run_id": run_id, "snapshot_id": snapshot_id, "spec_hash": spec.spec_hash(), "as_of_date": train_end, "train_end": train_end, "test_start": test_start, "purge": purge, "embargo": embargo, "memory_version": spec.memory_version, "prototype_snapshot_name": "prototype_snapshot", "max_train_date": max_train_date, "max_outcome_end_date": max_outcome_end, "prototypes": [p.__dict__ for p in memory["prototypes"]], "scaler": memory["transform"].scaler, "transform": memory["transform"], "calibration": dict(calibration_artifact or {"method": "logistic", "slope": 1.0, "intercept": 0.0, "ev_slope": 1.0, "ev_intercept": 0.0}), "quote_policy_calibration": dict(quote_policy_calibration or {"ev_threshold": 0.005, "uncertainty_cap": 0.12, "min_effective_sample_size": 1.5, "min_fill_probability": 0.1, "abstain_margin": 0.05}), "metadata": dict(metadata or {}), "snapshot_ids": {"prototype_snapshot_id": snapshot_id}}
+    return {"run_id": run_id, "snapshot_id": snapshot_id, "spec_hash": spec.spec_hash(), "as_of_date": train_end, "train_end": train_end, "test_start": test_start, "purge": purge, "embargo": embargo, "memory_version": spec.memory_version, "prototype_snapshot_name": "prototype_snapshot", "max_train_date": max_train_date, "max_outcome_end_date": max_outcome_end, "prototypes": [p.__dict__ for p in memory["prototypes"]], "scaler": memory["transform"].scaler, "transform": memory["transform"], "calibration": dict(calibration_artifact or {"method": "logistic", "slope": 1.0, "intercept": 0.0, "ev_slope": 1.0, "ev_intercept": 0.0}), "quote_policy_calibration": dict(quote_policy_calibration or {"ev_threshold": 0.005, "uncertainty_cap": 0.12, "min_effective_sample_size": 1.5, "min_fill_probability": 0.1, "abstain_margin": 0.05}), "metadata": dict(metadata or {}), "session_metadata_by_symbol": {symbol: session_metadata_to_dict(meta) for symbol, meta in (session_metadata_by_symbol or {}).items()}, "macro_series_history": list(macro_series_history or []), "snapshot_ids": {"prototype_snapshot_id": snapshot_id}}
 
 
-def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: JsonResearchArtifactStore, decision_dates: list[str], spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, top_k: int | None = None) -> dict:
+def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: JsonResearchArtifactStore, decision_dates: list[str], spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, top_k: int | None = None, session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None, macro_series_history: List[Dict[str, Any]] | None = None) -> dict:
     if not train_artifact:
         raise AssertionError("train artifact required")
     min_test_decision_date = min(decision_dates) if decision_dates else None
@@ -534,7 +985,7 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
     if not prototype_pool and train_artifact.get("prototypes"):
         from .models import StatePrototype
         prototype_pool = [StatePrototype(**p) for p in train_artifact.get("prototypes") or []]
-    query_panel, excluded = _build_query_panel(decision_dates=decision_dates, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=train_artifact.get("scaler"), transform=train_artifact.get("transform"), metadata=train_artifact.get("metadata"))
+    query_panel, excluded = _build_query_panel(decision_dates=decision_dates, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=train_artifact.get("scaler"), transform=train_artifact.get("transform"), metadata=train_artifact.get("metadata"), session_metadata_by_symbol=session_metadata_by_symbol or train_artifact.get("session_metadata_by_symbol"), macro_series_history=macro_series_history or train_artifact.get("macro_series_history"))
     scoring_cfg = ScoringConfig(min_liquidity_score=0.0)
     qp = train_artifact.get("quote_policy_calibration") or {}
     metadata = train_artifact.get("metadata") or {}
@@ -585,12 +1036,12 @@ def generate_similarity_candidates(*, bars_by_symbol: Dict[str, List[HistoricalB
     return candidates, diagnostics
 
 
-def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[HistoricalBar]], market: str, macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str] | None = None, lookback_bars: int = 5, feature_window_bars: int = 60, horizon_days: int = 5, top_k: int = 3, abstain_margin: float = 0.05, spec: ResearchExperimentSpec | None = None, metadata: dict | None = None, progress_callback=None) -> Tuple[List[SignalCandidate], Dict[str, dict]]:
+def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[HistoricalBar]], market: str, macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str] | None = None, lookback_bars: int = 5, feature_window_bars: int = 60, horizon_days: int = 5, top_k: int = 3, abstain_margin: float = 0.05, spec: ResearchExperimentSpec | None = None, metadata: dict | None = None, progress_callback=None, session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None, macro_series_history: List[Dict[str, Any]] | None = None) -> Tuple[List[SignalCandidate], Dict[str, dict]]:
     t0 = perf_counter()
     spec = spec or _default_spec(feature_window_bars=feature_window_bars, horizon_days=horizon_days)
     sector_map = sector_map or {}
     ev_cfg = _ev_config_from_metadata(metadata, top_k=top_k, abstain_margin=abstain_margin)
-    diagnostics: Dict[str, dict] = {"pipeline": {"strategy_mode": "research_similarity_v2", "spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "lookback_bars": lookback_bars, "top_k": ev_cfg.top_k, "top_k_requested": top_k, "abstain_margin": abstain_margin, "feature_flags": {"use_macro_level_in_similarity": _feature_flag("use_macro_level_in_similarity", metadata, default=False), "use_dollar_volume_absolute": _feature_flag("use_dollar_volume_absolute", metadata, default=False)}, "ev_config": {"kernel_temperature": ev_cfg.kernel_temperature, "use_kernel_weighting": ev_cfg.use_kernel_weighting, "min_effective_sample_size": ev_cfg.min_effective_sample_size, "max_uncertainty": ev_cfg.max_uncertainty, "max_return_interval_width": ev_cfg.max_return_interval_width, "min_regime_alignment": ev_cfg.min_regime_alignment, "min_expected_utility": ev_cfg.min_expected_utility, "diagnostic_disable_lower_bound_gate": ev_cfg.diagnostic_disable_lower_bound_gate, "diagnostic_disable_ess_gate": ev_cfg.diagnostic_disable_ess_gate}}}
+    diagnostics: Dict[str, dict] = {"pipeline": {"strategy_mode": "research_similarity_v2", "spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "lookback_bars": lookback_bars, "top_k": ev_cfg.top_k, "top_k_requested": top_k, "abstain_margin": abstain_margin, "feature_flags": {"use_macro_level_in_similarity": _feature_flag("use_macro_level_in_similarity", metadata, default=False), "use_dollar_volume_absolute": _feature_flag("use_dollar_volume_absolute", metadata, default=False)}, "session_alignment": {"mode": "session_aligned_v1", "symbols_with_session_metadata": sorted((session_metadata_by_symbol or {}).keys()), "missing_session_metadata_symbols": sorted(set(bars_by_symbol) - set((session_metadata_by_symbol or {}).keys()))}, "macro_join": {"mode": "anchor_asof_join", "series_rows": len(macro_series_history or []), "breadth_in_similarity": False}, "ev_config": {"kernel_temperature": ev_cfg.kernel_temperature, "use_kernel_weighting": ev_cfg.use_kernel_weighting, "min_effective_sample_size": ev_cfg.min_effective_sample_size, "max_uncertainty": ev_cfg.max_uncertainty, "max_return_interval_width": ev_cfg.max_return_interval_width, "min_regime_alignment": ev_cfg.min_regime_alignment, "min_expected_utility": ev_cfg.min_expected_utility, "diagnostic_disable_lower_bound_gate": ev_cfg.diagnostic_disable_lower_bound_gate, "diagnostic_disable_ess_gate": ev_cfg.diagnostic_disable_ess_gate}}}
     panel_rows: List[dict] = []
     out: List[SignalCandidate] = []
     scoring_cfg = ScoringConfig(min_liquidity_score=0.0)
@@ -621,8 +1072,8 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
 
     _emit_progress(0, force=True)
     for idx, decision_date in enumerate(decision_dates, start=1):
-        memory = build_event_memory_asof(decision_date=decision_date, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market, lookback_bars=lookback_bars, metadata=metadata)
-        query_panel, query_excluded = _build_query_panel(decision_dates=[decision_date], spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=memory["scaler"], transform=memory["transform"], metadata=metadata)
+        memory = build_event_memory_asof(decision_date=decision_date, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market, lookback_bars=lookback_bars, metadata=metadata, session_metadata_by_symbol=session_metadata_by_symbol, macro_series_history=macro_series_history)
+        query_panel, query_excluded = _build_query_panel(decision_dates=[decision_date], spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=memory["scaler"], transform=memory["transform"], metadata=metadata, session_metadata_by_symbol=session_metadata_by_symbol, macro_series_history=macro_series_history)
         event_record_batches.append({"decision_date": decision_date, "records": [{"symbol": r.symbol, "event_date": r.event_date, "outcome_end_date": r.outcome_end_date, "side_outcomes": r.side_outcomes} for r in memory["event_records"]]})
         all_excluded_reasons.extend([{**r, "decision_date": decision_date} for r in memory["excluded_reasons"] + query_excluded])
         total_prototype_count += len(memory["prototypes"])
@@ -657,6 +1108,14 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
                     "insufficient_history": False,
                     "shape_horizons": query_meta.get("shape_horizons", []),
                     "transform_version": query_meta.get("transform_version"),
+                    "exchange_code": query_meta.get("exchange_code"),
+                    "country_code": query_meta.get("country_code"),
+                    "exchange_tz": query_meta.get("exchange_tz"),
+                    "session_date_local": query_meta.get("session_date_local"),
+                    "session_close_ts_local": query_meta.get("session_close_ts_local"),
+                    "session_close_ts_utc": query_meta.get("session_close_ts_utc"),
+                    "feature_anchor_ts_utc": query_meta.get("feature_anchor_ts_utc"),
+                    "macro_asof_ts_utc": query_meta.get("macro_asof_ts_utc"),
                     "feature_flags": {
                         "use_macro_level_in_similarity": query_meta.get("use_macro_level_in_similarity", False),
                         "use_dollar_volume_absolute": query_meta.get("use_dollar_volume_absolute", False),
@@ -664,12 +1123,20 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
                     "regime_context_features": query_meta.get("regime_context_features", {}),
                     "normalized_regime_context_features": query_meta.get("normalized_regime_context_features", {}),
                     "proxy_diagnostics": query_meta.get("proxy_diagnostics", {}),
+                    "proxy_mode": (((query_meta.get("proxy_diagnostics", {}) or {}).get("market") or {}).get("proxy_mode")),
+                    "same_exchange_peer_count": (((query_meta.get("proxy_diagnostics", {}) or {}).get("market") or {}).get("same_exchange_peer_count")),
+                    "cross_exchange_proxy_used": bool((((query_meta.get("proxy_diagnostics", {}) or {}).get("market") or {}).get("cross_exchange_proxy_used", False))),
                     "sector_proxy_fallback_to_self": bool((((query_meta.get("proxy_diagnostics", {}) or {}).get("sector") or {}).get("fallback_to_self", False))),
                     "raw_zero_default_keys": query_meta.get("raw_zero_default_keys", []),
+                    "zero_imputed_feature_keys": query_meta.get("transform_missing_keys_filled_zero", []),
+                    "zero_imputed_feature_count": len(query_meta.get("transform_missing_keys_filled_zero", [])),
                     "transform_missing_keys_filled_zero": query_meta.get("transform_missing_keys_filled_zero", []),
                     "transformed_zero_feature_keys": query_meta.get("transformed_zero_feature_keys", []),
                     "macro_history_length": query_meta.get("macro_history_length", 0),
                     "macro_series_present_count": query_meta.get("macro_series_present_count", 0),
+                    "macro_freshness_summary": query_meta.get("macro_freshness_summary", {}),
+                    "breadth_present": query_meta.get("breadth_present", False),
+                    "breadth_missing_reason": query_meta.get("breadth_missing_reason"),
                 },
                 "library": {
                     "event_record_count": len(memory["event_records"]),
@@ -706,13 +1173,24 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
                 "scorer_diagnostics": {"buy": _side_diag(long_ev, surface, "BUY"), "sell": _side_diag(short_ev, surface, "SELL")},
                 "top_matches": {"long": surface.buy.top_matches, "short": surface.sell.top_matches},
             }
+            row_diag["missingness"] = {
+                "taxonomy": {
+                    "structural_missing": False,
+                    "stale_but_usable": any(bool((item or {}).get("is_stale_flag")) for item in (query_meta.get("macro_freshness_summary") or {}).values()),
+                    "data_quality_missing": bool(query_meta.get("anchor_missing_reason")),
+                },
+                "breadth_present": query_meta.get("breadth_present", False),
+                "breadth_missing_reason": query_meta.get("breadth_missing_reason"),
+                "zero_imputed_feature_keys": list(query_meta.get("transform_missing_keys_filled_zero", []) or []),
+                "zero_imputed_feature_count": len(list(query_meta.get("transform_missing_keys_filled_zero", []) or [])),
+            }
             panel_rows.append(row_diag)
             diagnostics[f"{decision_date}:{symbol}"] = row_diag
             if surface.abstain:
                 continue
             chosen_side = Side.BUY if surface.chosen_side == Side.BUY.value else Side.SELL
             chosen = long_scores[0] if chosen_side == Side.BUY and long_scores else short_scores[0] if short_scores else None
-            out.append(SignalCandidate(symbol=symbol, ticker_id=None, market=MarketCode(market), side_bias=chosen_side, signal_strength=float((long_ev.calibrated_ev if chosen_side == Side.BUY else short_ev.calibrated_ev) if chosen else 0.0), confidence=float(long_ev.calibrated_win_prob if chosen_side == Side.BUY else short_ev.calibrated_win_prob), anchor_date=decision_date, reference_date=decision_date, current_price=float(execution_bar.open), atr_pct=float(max(0.01, compute_bar_features(q["query_window"]).get("range_pct", 0.02) / 3.0)), target_return_pct=spec.target_return_pct, max_reverse_pct=spec.stop_return_pct, expected_horizon_days=spec.horizon_days, outcome_label=OutcomeLabel.UNKNOWN, provenance={"strategy_mode": "research_similarity_v2", "decision_date": decision_date, "execution_date": execution_date, "spec_hash": spec.spec_hash()}, diagnostics=row_diag, notes=[f"prototype_id={(chosen.prototype_id if chosen else '')}"]))
+            out.append(SignalCandidate(symbol=symbol, ticker_id=None, market=MarketCode(market), side_bias=chosen_side, signal_strength=float((long_ev.calibrated_ev if chosen_side == Side.BUY else short_ev.calibrated_ev) if chosen else 0.0), confidence=float(long_ev.calibrated_win_prob if chosen_side == Side.BUY else short_ev.calibrated_win_prob), anchor_date=decision_date, reference_date=decision_date, current_price=float(execution_bar.open), atr_pct=float(max(0.01, compute_bar_features(q["query_window"]).get("range_pct", 0.02) / 3.0)), target_return_pct=spec.target_return_pct, max_reverse_pct=spec.stop_return_pct, expected_horizon_days=spec.horizon_days, outcome_label=OutcomeLabel.UNKNOWN, provenance={"strategy_mode": "research_similarity_v2", "decision_date": decision_date, "execution_date": execution_date, "spec_hash": spec.spec_hash(), "exchange_code": query_meta.get("exchange_code"), "feature_anchor_ts_utc": query_meta.get("feature_anchor_ts_utc"), "macro_asof_ts_utc": query_meta.get("macro_asof_ts_utc")}, diagnostics=row_diag, notes=[f"prototype_id={(chosen.prototype_id if chosen else '')}"]))
         _emit_progress(idx)
     _emit_progress(len(decision_dates), force=True)
     diagnostics["signal_panel"] = panel_rows

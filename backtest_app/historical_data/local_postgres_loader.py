@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Dict, Iterable, List
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Any, Dict, Iterable, List
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
@@ -11,7 +12,8 @@ from backtest_app.research.pipeline import generate_similarity_candidates, gener
 from shared.domain.models import MarketCode, MarketSnapshot, OutcomeLabel, Side, SignalCandidate
 
 from .features import CTX_SERIES, compute_bar_features
-from .models import HistoricalBar, HistoricalSlice
+from .models import HistoricalBar, HistoricalSlice, SymbolSessionMetadata
+from .session_alignment import build_symbol_session_metadata, session_metadata_to_dict
 
 WARMUP_DAYS = 120
 MACRO_SERIES_NAME_TO_CANONICAL = {
@@ -26,6 +28,12 @@ MACRO_SERIES_NAME_TO_CANONICAL = {
     "Crude Oil Prices: West Texas Intermediate (WTI) - Cushing, Oklahoma": "oil",
 }
 CANONICAL_MACRO_SOURCE_NAMES = sorted(MACRO_SERIES_NAME_TO_CANONICAL.keys())
+MACRO_SOURCE_CONFIG = {
+    "vix": {"exchange_tz": "America/New_York", "session_close_local_time": "16:00"},
+    "rate": {"exchange_tz": "America/New_York", "session_close_local_time": "16:00"},
+    "dollar": {"exchange_tz": "America/New_York", "session_close_local_time": "16:00"},
+    "oil": {"exchange_tz": "America/New_York", "session_close_local_time": "16:00"},
+}
 
 
 def _canonical_macro_series_name(raw_name: str | None) -> str | None:
@@ -51,6 +59,39 @@ def _canonicalize_macro_rows(rows: List[Dict[str, object]]) -> List[Dict[str, ob
     return out
 
 
+def _derived_macro_source_ts_utc(*, obs_date: str | date, series_name: str) -> str | None:
+    cfg = MACRO_SOURCE_CONFIG.get(str(series_name))
+    if cfg is None:
+        return None
+    local_date = obs_date if isinstance(obs_date, date) else datetime.fromisoformat(str(obs_date)[:10]).date()
+    local_dt = datetime.combine(
+        local_date,
+        time.fromisoformat(str(cfg["session_close_local_time"])),
+        tzinfo=ZoneInfo(str(cfg["exchange_tz"])),
+    )
+    return local_dt.astimezone(timezone.utc).isoformat()
+
+
+def _macro_history_by_obs_date(rows: List[Dict[str, Any]], *, start_date: str, end_date: str, prewarm_days: int) -> Dict[str, Dict[str, float]]:
+    by_date: Dict[str, Dict[str, float]] = {}
+    last_seen: Dict[str, float] = {}
+    prewarm_start = (datetime.fromisoformat(start_date) - timedelta(days=prewarm_days)).date().isoformat()
+    filtered = [row for row in rows if prewarm_start <= str(row.get("obs_date")) <= end_date]
+    for row in filtered:
+        d = str(row["obs_date"])
+        by_date.setdefault(d, dict(last_seen))
+        last_seen[str(row["name"])] = float(row["value"])
+        by_date[d][str(row["name"])] = float(row["value"])
+    cursor = datetime.fromisoformat(start_date)
+    end = datetime.fromisoformat(end_date)
+    while cursor <= end:
+        d = cursor.date().isoformat()
+        by_date.setdefault(d, dict(last_seen))
+        last_seen = dict(by_date[d])
+        cursor += timedelta(days=1)
+    return by_date
+
+
 class LocalPostgresLoader:
     def __init__(self, session_factory: sessionmaker[Session], *, schema: str = "trading"):
         self.session_factory = session_factory
@@ -64,6 +105,7 @@ class LocalPostgresLoader:
         bars_end_date = train_end or end_date
         bars_by_symbol = self._load_bars(start_date=start_date, end_date=bars_end_date, symbols=symbols, warmup_days=max(WARMUP_DAYS, spec.feature_window_bars * 2))
         sector_map = self._load_sector_map(symbols)
+        session_metadata_by_symbol, missing_session_metadata_symbols = self._load_session_metadata(symbols)
         features_by_symbol: Dict[str, Dict[str, float]] = {symbol: compute_bar_features(bars) for symbol, bars in bars_by_symbol.items()}
 
         if strategy_mode == "research_similarity_v1":
@@ -72,25 +114,27 @@ class LocalPostgresLoader:
             snapshot_ts = self._resolve_snapshot_ts(bars_by_symbol)
             enriched = self._enrich_candidates(candidates, features_by_symbol)
             snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False, macro_state=macro_payload)
-            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "diagnostics": research_diag, "sector_map": sector_map})
+            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, session_metadata_by_symbol=session_metadata_by_symbol, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "diagnostics": research_diag, "sector_map": sector_map, "session_metadata_by_symbol": {symbol: session_metadata_to_dict(meta) for symbol, meta in session_metadata_by_symbol.items()}, "missing_session_metadata_symbols": missing_session_metadata_symbols})
 
         if strategy_mode == "research_similarity_v2":
-            macro_history = self._load_macro_history(start_date=start_date, end_date=end_date, prewarm_days=max(WARMUP_DAYS, spec.feature_window_bars * 2))
+            prewarm_days = max(WARMUP_DAYS, spec.feature_window_bars * 2)
+            macro_series_history = self._load_macro_series_history(start_date=start_date, end_date=end_date, prewarm_days=prewarm_days)
+            macro_history = _macro_history_by_obs_date(macro_series_history, start_date=start_date, end_date=end_date, prewarm_days=prewarm_days)
             resolved_metadata = dict(metadata or {})
             abstain_margin = float(resolved_metadata.get("abstain_margin", 0.05) or 0.05)
-            candidates, research_diag = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market=market, macro_history_by_date=macro_history, sector_map=sector_map, spec=spec, abstain_margin=abstain_margin, metadata=resolved_metadata, progress_callback=progress_callback)
+            candidates, research_diag = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market=market, macro_history_by_date=macro_history, macro_series_history=macro_series_history, sector_map=sector_map, session_metadata_by_symbol=session_metadata_by_symbol, spec=spec, abstain_margin=abstain_margin, metadata=resolved_metadata, progress_callback=progress_callback)
             snapshot_ts = self._resolve_snapshot_ts(bars_by_symbol)
             enriched = self._enrich_candidates(candidates, features_by_symbol)
             snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False)
             if decision_dates:
                 allowed_dates = {str(d)[:10] for d in decision_dates}
                 enriched = [c for c in enriched if str(c.reference_date)[:10] in allowed_dates]
-            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "train_end": train_end, "decision_dates": [str(d)[:10] for d in decision_dates] if decision_dates else None, "diagnostics": research_diag, "signal_panel_artifact": research_diag.get("signal_panel", []), "memory_snapshot_artifact": research_diag.get("artifacts", {}), "macro_history_by_date": macro_history, "sector_map": sector_map})
+            return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, session_metadata_by_symbol=session_metadata_by_symbol, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "research_spec": spec.to_dict(), "train_end": train_end, "decision_dates": [str(d)[:10] for d in decision_dates] if decision_dates else None, "diagnostics": research_diag, "signal_panel_artifact": research_diag.get("signal_panel", []), "memory_snapshot_artifact": research_diag.get("artifacts", {}), "macro_history_by_date": macro_history, "macro_series_history": macro_series_history, "sector_map": sector_map, "session_metadata_by_symbol": {symbol: session_metadata_to_dict(meta) for symbol, meta in session_metadata_by_symbol.items()}, "missing_session_metadata_symbols": missing_session_metadata_symbols})
 
         candidates, snapshot_ts = self._load_candidates(scenario_id=scenario_id, market=market, start_date=start_date, end_date=end_date, symbols=symbols)
         enriched = self._enrich_candidates(candidates, features_by_symbol)
         snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False)
-        return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "sector_map": sector_map})
+        return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, session_metadata_by_symbol=session_metadata_by_symbol, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "sector_map": sector_map, "session_metadata_by_symbol": {symbol: session_metadata_to_dict(meta) for symbol, meta in session_metadata_by_symbol.items()}, "missing_session_metadata_symbols": missing_session_metadata_symbols})
 
     def _enrich_candidates(self, candidates: List[SignalCandidate], features_by_symbol: Dict[str, Dict[str, float]]) -> List[SignalCandidate]:
         enriched: List[SignalCandidate] = []
@@ -128,6 +172,10 @@ class LocalPostgresLoader:
             return {}
 
     def _load_macro_history(self, *, start_date: str, end_date: str, prewarm_days: int = 0) -> Dict[str, Dict[str, float]]:
+        rows = self._load_macro_series_history(start_date=start_date, end_date=end_date, prewarm_days=prewarm_days)
+        return _macro_history_by_obs_date(rows, start_date=start_date, end_date=end_date, prewarm_days=prewarm_days)
+
+    def _load_macro_series_history(self, *, start_date: str, end_date: str, prewarm_days: int = 0) -> List[Dict[str, Any]]:
         sql = text(f"""
             SELECT v.obs_date, s.name, v.value
               FROM {self.schema}.macro_data_series_value v
@@ -136,27 +184,28 @@ class LocalPostgresLoader:
                AND s.name = ANY(:series_names)
              ORDER BY v.obs_date, s.name
             """)
-        by_date: Dict[str, Dict[str, float]] = {}
-        last_seen: Dict[str, float] = {}
         try:
             prewarm_start = (datetime.fromisoformat(start_date) - timedelta(days=prewarm_days)).date().isoformat()
             with self.session_factory() as session:
                 rows = [dict(r._mapping) for r in session.execute(sql, {"prewarm_start": prewarm_start, "end_date": end_date, "series_names": CANONICAL_MACRO_SOURCE_NAMES})]
-            for row in _canonicalize_macro_rows(rows):
-                d = str(row["obs_date"])
-                by_date.setdefault(d, dict(last_seen))
-                last_seen[str(row["name"])] = float(row["value"])
-                by_date[d][str(row["name"])] = float(row["value"])
-            cursor = datetime.fromisoformat(start_date)
-            end = datetime.fromisoformat(end_date)
-            while cursor <= end:
-                d = cursor.date().isoformat()
-                by_date.setdefault(d, dict(last_seen))
-                last_seen = dict(by_date[d])
-                cursor += timedelta(days=1)
-            return by_date
+            canonical_rows = _canonicalize_macro_rows(rows)
+            enriched_rows: List[Dict[str, Any]] = []
+            for row in canonical_rows:
+                series_name = str(row["name"])
+                source_ts_utc = _derived_macro_source_ts_utc(obs_date=str(row["obs_date"]), series_name=series_name)
+                enriched_rows.append(
+                    {
+                        "obs_date": str(row["obs_date"]),
+                        "name": series_name,
+                        "raw_name": str(row.get("raw_name") or ""),
+                        "value": float(row["value"]),
+                        "source_ts_utc": source_ts_utc,
+                        "source_ts_is_derived": source_ts_utc is not None,
+                    }
+                )
+            return enriched_rows
         except Exception:
-            return {}
+            return []
 
     def _load_sector_map(self, symbols: List[str]) -> Dict[str, str]:
         sql = text(f"""
@@ -170,6 +219,30 @@ class LocalPostgresLoader:
         with self.session_factory() as session:
             rows = [dict(r._mapping) for r in session.execute(sql, {"symbols": symbols})]
         return {str(r["symbol"]): str(r["sector_code"]) for r in rows if r.get("sector_code")}
+
+    def _load_session_metadata(self, symbols: List[str]) -> tuple[Dict[str, SymbolSessionMetadata], List[str]]:
+        sql = text(f"""
+        SELECT symbol, exchange, country
+          FROM {self.schema}.bt_mirror_ticker
+         WHERE symbol = ANY(:symbols)
+        """)
+        session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] = {}
+        missing: List[str] = []
+        with self.session_factory() as session:
+            rows = [dict(r._mapping) for r in session.execute(sql, {"symbols": symbols})]
+        by_symbol = {str(row["symbol"]): row for row in rows}
+        for symbol in symbols:
+            row = by_symbol.get(symbol)
+            metadata = build_symbol_session_metadata(
+                symbol=symbol,
+                exchange_code=(row or {}).get("exchange"),
+                country_code=(row or {}).get("country"),
+            )
+            if metadata is None:
+                missing.append(symbol)
+                continue
+            session_metadata_by_symbol[symbol] = metadata
+        return session_metadata_by_symbol, sorted(set(missing))
 
     def _load_candidates(self, *, scenario_id: str, market: str, start_date: str, end_date: str, symbols: List[str]):
         sql = text(f"""

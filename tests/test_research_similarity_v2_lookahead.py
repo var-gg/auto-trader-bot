@@ -1,4 +1,5 @@
-from backtest_app.historical_data.models import HistoricalBar
+from backtest_app.historical_data.models import HistoricalBar, SymbolSessionMetadata
+from backtest_app.historical_data.session_alignment import derive_session_anchor_from_date
 from backtest_app.research.pipeline import _bars_until_date, _market_proxy_bars, _market_proxy_series, _sector_proxy_series
 
 
@@ -66,3 +67,52 @@ def test_sector_proxy_series_marks_self_fallback_when_peer_missing():
     assert proxy.peer_count_by_date
     assert all(count == 1 for count in proxy.peer_count_by_date.values())
     assert all(symbols == ["AAPL"] for symbols in proxy.contributing_symbols_by_date.values())
+
+
+def test_session_anchor_differs_between_kr_and_us_for_same_date():
+    kr = SymbolSessionMetadata(symbol="005930", exchange_code="KOE", country_code="KR", exchange_tz="Asia/Seoul", session_close_local_time="15:30")
+    us = SymbolSessionMetadata(symbol="AAPL", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00")
+    kr_anchor = derive_session_anchor_from_date(session_date_local="2026-03-28", session_metadata=kr)
+    us_anchor = derive_session_anchor_from_date(session_date_local="2026-03-28", session_metadata=us)
+    assert kr_anchor["session_date_local"] == us_anchor["session_date_local"] == "2026-03-28"
+    assert kr_anchor["feature_anchor_ts_utc"] != us_anchor["feature_anchor_ts_utc"]
+
+
+def test_market_proxy_series_prefers_same_exchange_peers():
+    bars_by_symbol = {
+        "AAPL": _bars_for_dates("AAPL", ["2026-03-27", "2026-03-28"], [100.0, 101.0]),
+        "MSFT": _bars_for_dates("MSFT", ["2026-03-27", "2026-03-28"], [200.0, 202.0]),
+        "005930": _bars_for_dates("005930", ["2026-03-27", "2026-03-28"], [50.0, 49.0]),
+    }
+    session_metadata = {
+        "AAPL": SymbolSessionMetadata(symbol="AAPL", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+        "MSFT": SymbolSessionMetadata(symbol="MSFT", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+        "005930": SymbolSessionMetadata(symbol="005930", exchange_code="KOE", country_code="KR", exchange_tz="Asia/Seoul", session_close_local_time="15:30"),
+    }
+    us_anchor = derive_session_anchor_from_date(session_date_local="2026-03-28", session_metadata=session_metadata["AAPL"])
+    proxy = _market_proxy_series(
+        bars_by_symbol,
+        cutoff_date="2026-03-28",
+        focus_symbol="AAPL",
+        session_metadata_by_symbol=session_metadata,
+        cutoff_anchor_ts_utc=us_anchor["feature_anchor_ts_utc"],
+    )
+    closes = {str(bar.timestamp)[:10]: float(bar.close) for bar in proxy.bars}
+    assert closes["2026-03-28"] == 151.5
+    assert proxy.same_exchange_peer_count == 2
+    assert proxy.cross_exchange_proxy_used is False
+
+
+def test_sector_proxy_series_marks_same_exchange_self_fallback():
+    bars_by_symbol = {
+        "AAPL": _bars_for_dates("AAPL", ["2026-03-27", "2026-03-28"], [100.0, 101.0]),
+        "005930": _bars_for_dates("005930", ["2026-03-27", "2026-03-28"], [50.0, 49.0]),
+    }
+    sector_map = {"AAPL": "TECH", "005930": "TECH"}
+    session_metadata = {
+        "AAPL": SymbolSessionMetadata(symbol="AAPL", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+        "005930": SymbolSessionMetadata(symbol="005930", exchange_code="KOE", country_code="KR", exchange_tz="Asia/Seoul", session_close_local_time="15:30"),
+    }
+    proxy = _sector_proxy_series("AAPL", bars_by_symbol, sector_map, cutoff_date="2026-03-28", session_metadata_by_symbol=session_metadata, cutoff_anchor_ts_utc=derive_session_anchor_from_date(session_date_local="2026-03-28", session_metadata=session_metadata["AAPL"])["feature_anchor_ts_utc"])
+    assert proxy.fallback_to_self is True
+    assert proxy.same_exchange_peer_count == 1

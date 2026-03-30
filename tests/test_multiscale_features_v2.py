@@ -46,10 +46,11 @@ def test_multiscale_feature_vector_exposes_shape_ctx_and_metadata():
     for key in ("mkt_rel_ret_1", "sector_rel_ret_1", "beta_residual_20", "vol_normalized_residual_20"):
         assert key in fv.residual_features
     assert "vix_level" not in fv.context_features
-    for key in ("vix_zscore_20", "vix_change_5", "vix_pct_change_20", "breadth_percentile_20"):
+    for key in ("vix_zscore_20", "vix_change_5", "vix_pct_change_20", "oil_percentile_20"):
         assert key in fv.context_features
-    for key in ("vix_level", "vix_change", "vix_zscore", "breadth_level"):
+    for key in ("vix_level", "vix_change", "vix_zscore"):
         assert key in fv.regime_context_features
+    assert "breadth_percentile_20" not in fv.context_features
     assert "vix_level" not in fv.metadata["feature_keys"]
     assert "vix_level" in fv.metadata["regime_ctx_keys"]
 
@@ -121,6 +122,7 @@ def test_normalized_regime_context_features_are_exposed_without_raw_levels():
     assert all(not key.endswith("_level") for key in fv.normalized_regime_context_features)
     assert set(fv.normalized_regime_context_features).issubset(set(fv.raw_context_features))
     assert fv.metadata["normalized_regime_ctx_keys"] == sorted(fv.normalized_regime_context_features.keys())
+    assert all(not key.startswith("breadth_") for key in fv.normalized_regime_context_features)
 
 
 def test_transform_zero_fill_bookkeeping_is_recorded():
@@ -139,6 +141,31 @@ def test_transform_zero_fill_bookkeeping_is_recorded():
     assert "vix_zscore_20" in missing_keys
     assert "rate_pct_change_20" in missing_keys
     assert fv_query.metadata["transformed_zero_feature_keys"]
+
+
+def test_macro_freshness_features_and_breadth_missingness_are_explicit():
+    fv = build_multiscale_feature_vector(
+        symbol="AAPL",
+        bars=_bars("AAPL"),
+        market_bars=_bars("MKT"),
+        sector_bars=_bars("TECH"),
+        macro_history=_macro_history(),
+        sector_code="TECH",
+        macro_freshness_features={
+            "vix_days_since_update": 1.0,
+            "vix_bars_since_update": 2.0,
+            "vix_is_stale": 0.0,
+            "vix_age_bucket": 1.0,
+        },
+        additional_metadata={
+            "breadth_present": False,
+            "breadth_missing_reason": "canonical_source_missing",
+        },
+    )
+    assert fv.raw_context_features["vix_days_since_update"] == 1.0
+    assert fv.raw_context_features["vix_bars_since_update"] == 2.0
+    assert fv.metadata["breadth_present"] is False
+    assert fv.metadata["breadth_missing_reason"] == "canonical_source_missing"
 
 
 def test_normalized_regime_path_is_more_scale_stable_than_raw_macro_average():

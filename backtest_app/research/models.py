@@ -41,6 +41,14 @@ class EventOutcomeRecord:
     event_date: str
     outcome_end_date: Optional[str]
     schema_version: str
+    exchange_code: Optional[str] = None
+    country_code: Optional[str] = None
+    exchange_tz: Optional[str] = None
+    session_date_local: Optional[str] = None
+    session_close_ts_local: Optional[str] = None
+    session_close_ts_utc: Optional[str] = None
+    feature_anchor_ts_utc: Optional[str] = None
+    macro_asof_ts_utc: Optional[str] = None
     path_summary: Dict[str, Any] = field(default_factory=dict)
     side_outcomes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
@@ -69,6 +77,12 @@ class ResearchAnchor:
     sector_code: Optional[str] = None
     liquidity_score: Optional[float] = None
     prototype_id: Optional[str] = None
+    exchange_code: Optional[str] = None
+    country_code: Optional[str] = None
+    exchange_tz: Optional[str] = None
+    session_date_local: Optional[str] = None
+    session_close_ts_utc: Optional[str] = None
+    feature_anchor_ts_utc: Optional[str] = None
     prototype_membership: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -105,6 +119,12 @@ class PrototypeAnchor:
     liquidity_bucket: Optional[str] = None
     regime_bucket: Optional[str] = None
     sector_bucket: Optional[str] = None
+    exchange_code: Optional[str] = None
+    country_code: Optional[str] = None
+    exchange_tz: Optional[str] = None
+    session_date_local: Optional[str] = None
+    session_close_ts_utc: Optional[str] = None
+    feature_anchor_ts_utc: Optional[str] = None
     prototype_membership: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -131,6 +151,12 @@ class StatePrototype:
     support_count: int = 0
     decayed_support: float = 0.0
     freshness_days: Optional[float] = None
+    exchange_code: Optional[str] = None
+    country_code: Optional[str] = None
+    exchange_tz: Optional[str] = None
+    session_date_local: Optional[str] = None
+    session_close_ts_utc: Optional[str] = None
+    feature_anchor_ts_utc: Optional[str] = None
     prototype_membership: Dict[str, Any] = field(default_factory=dict)
     side_stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)

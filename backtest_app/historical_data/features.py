@@ -11,6 +11,7 @@ FEATURE_VERSION = "multiscale_manual_v2"
 FEATURE_TRANSFORM_VERSION = "feature_contract_v1"
 DEFAULT_SHAPE_HORIZONS = (1, 3, 5, 10, 20, 60)
 CTX_SERIES = ("vix", "rate", "dollar", "oil", "breadth")
+SIMILARITY_CTX_SERIES = tuple(series for series in CTX_SERIES if series != "breadth")
 DEFAULT_CONTEXT_LOOKBACKS = (5, 20)
 REGIME_CONTEXT_PRIORITY_SUFFIXES = ("zscore_20", "pct_change_20", "pct_change_5", "slope_5", "percentile_20")
 
@@ -304,7 +305,7 @@ def _build_context_features(macro_history: Mapping[str, Mapping[str, float]], *,
         return {}, {}
     similarity_out: Dict[str, float] = {}
     regime_out: Dict[str, float] = {}
-    for name in CTX_SERIES:
+    for name in SIMILARITY_CTX_SERIES:
         series_hist = {date: payload.get(name, 0.0) for date, payload in macro_history.items() if name in payload}
         if not series_hist:
             continue
@@ -370,6 +371,8 @@ def build_raw_multiscale_feature_payload(
     use_macro_level_in_similarity: bool = False,
     use_dollar_volume_absolute: bool = False,
     proxy_diagnostics: Mapping[str, Mapping[str, object]] | None = None,
+    macro_freshness_features: Mapping[str, float] | None = None,
+    additional_metadata: Mapping[str, object] | None = None,
 ) -> RawFeaturePayload:
     bars = list(bars)
     market_bars = list(market_bars or [])
@@ -403,6 +406,8 @@ def build_raw_multiscale_feature_payload(
     residual["vol_normalized_residual_20"] = _safe_div(residual["beta_residual_20"], shape["realized_vol_20"])
 
     context, regime_context = _build_context_features(macro_history, use_macro_level_in_similarity=use_macro_level_in_similarity)
+    freshness_features = {str(key): float(value or 0.0) for key, value in dict(macro_freshness_features or {}).items()}
+    context.update(freshness_features)
     normalized_regime_context = _normalized_regime_context_features(context)
     raw_features = {**shape, **residual, **context}
     raw_zero_default_keys = sorted(key for key, value in raw_features.items() if abs(float(value)) <= 1e-12)
@@ -423,6 +428,8 @@ def build_raw_multiscale_feature_payload(
             "use_dollar_volume_absolute": use_dollar_volume_absolute,
             "proxy_diagnostics": _trim_proxy_diagnostics(proxy_diagnostics, bars),
             "raw_zero_default_keys": raw_zero_default_keys,
+            "macro_freshness_feature_keys": sorted(freshness_features.keys()),
+            **dict(additional_metadata or {}),
         },
     )
 
@@ -441,6 +448,8 @@ def build_multiscale_feature_vector(
     use_macro_level_in_similarity: bool = False,
     use_dollar_volume_absolute: bool = False,
     proxy_diagnostics: Mapping[str, Mapping[str, object]] | None = None,
+    macro_freshness_features: Mapping[str, float] | None = None,
+    additional_metadata: Mapping[str, object] | None = None,
 ) -> FeatureVector:
     raw_payload = build_raw_multiscale_feature_payload(
         symbol=symbol,
@@ -453,6 +462,8 @@ def build_multiscale_feature_vector(
         use_macro_level_in_similarity=use_macro_level_in_similarity,
         use_dollar_volume_absolute=use_dollar_volume_absolute,
         proxy_diagnostics=proxy_diagnostics,
+        macro_freshness_features=macro_freshness_features,
+        additional_metadata=additional_metadata,
     )
     resolved_transform = transform
     if resolved_transform is None and scaler is not None:

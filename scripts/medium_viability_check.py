@@ -117,6 +117,10 @@ SUMMARY_COLS = [
     "head_commit",
     "dirty_worktree",
     "diff_fingerprint",
+    "forecast_selected_count",
+    "forecast_selected_dates",
+    "forecast_viable",
+    "deploy_viable",
     "candidate_count",
     "candidate_dates",
     "buy_pass_count",
@@ -453,6 +457,7 @@ def _annotate_tiny_row(row: dict[str, Any]) -> dict[str, Any]:
 
 def _rank_key(row: dict[str, Any]):
     return (
+        int(row.get("forecast_selected_count", 0)),
         int(row.get("candidate_count", 0)),
         int(row.get("fills_count", 0)),
         int(row.get("trades_count", 0)),
@@ -477,7 +482,7 @@ def _load_tiny_rows(tiny_root: Path) -> list[dict[str, Any]]:
 
 def _pick_best_two_allowed(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     filtered = [_annotate_tiny_row(r) for r in rows if _is_allowed_tiny_candidate(r)]
-    filtered.sort(key=lambda row: (-int(row.get("candidate_count", 0)), -int(row.get("fills_count", 0)), -int(row.get("trades_count", 0)), -(int(row.get("buy_pass_count", 0)) + int(row.get("sell_pass_count", 0))), str(row.get("run_label", ""))))
+    filtered.sort(key=lambda row: (-int(row.get("forecast_selected_count", 0)), -int(row.get("candidate_count", 0)), -int(row.get("fills_count", 0)), -int(row.get("trades_count", 0)), -(int(row.get("buy_pass_count", 0)) + int(row.get("sell_pass_count", 0))), str(row.get("run_label", ""))))
     selected: list[dict[str, Any]] = []
     seen_fingerprints: set[str] = set()
     for row in filtered:
@@ -604,7 +609,7 @@ def _build_diagnosis_lines(*, output_root: Path, tiny_root: Path, pair_payload: 
     ]
     for row in medium_rows:
         lines.append(
-            f"- {row['run_label']}: candidates={row.get('candidate_count', 0)}, fills={row.get('fills_count', 0)}, trades={row.get('trades_count', 0)}, authoritative={row.get('authoritative')}, verdict_eligible={row.get('verdict_eligible')}, exclusion_reasons={json.dumps(row.get('exclusion_reasons') or [], ensure_ascii=False)}, result=`{row.get('result_path')}`"
+            f"- {row['run_label']}: forecast_selected={row.get('forecast_selected_count', 0)}, candidates={row.get('candidate_count', 0)}, fills={row.get('fills_count', 0)}, trades={row.get('trades_count', 0)}, authoritative={row.get('authoritative')}, verdict_eligible={row.get('verdict_eligible')}, exclusion_reasons={json.dumps(row.get('exclusion_reasons') or [], ensure_ascii=False)}, result=`{row.get('result_path')}`"
         )
     lines.append("")
     lines.append(f"## Verdict\n- **{verdict}**")
@@ -648,8 +653,15 @@ def _rebuild_medium_root_outputs(*, output_root: Path, tiny_root: Path, driver: 
         verdict = "authoritative rerun required"
         verdict_basis = "best1/best2 completed without any verdict-eligible authoritative runs."
     else:
-        viable = any(int(row.get("candidate_count", 0)) > 0 and int(row.get("fills_count", 0)) > 0 and int(row.get("trades_count", 0)) > 0 for row in eligible_best_runs)
-        verdict = "TOBE v1 viable" if viable else "current TOBE v1 fails"
+        forecast_viable = any(bool(row.get("forecast_viable")) for row in eligible_best_runs)
+        deploy_viable = any(bool(row.get("deploy_viable")) for row in eligible_best_runs)
+        viable = deploy_viable
+        if not forecast_viable:
+            verdict = "forecast_not_viable"
+        elif forecast_viable and not deploy_viable:
+            verdict = "forecast_viable_but_not_deployable"
+        else:
+            verdict = "TOBE_v1_viable"
         verdict_basis = f"evaluated {len(eligible_best_runs)} authoritative run(s) after excluding non-authoritative or metadata-misaligned runs."
     summary_payload = {
         "output_root": str(output_root),
@@ -663,6 +675,8 @@ def _rebuild_medium_root_outputs(*, output_root: Path, tiny_root: Path, driver: 
         "eligible_medium_run_labels": [row.get("run_label") for row in eligible_best_runs],
         "verdict": verdict,
         "verdict_basis": verdict_basis,
+        "forecast_viable": None if not eligible_best_runs else any(bool(row.get("forecast_viable")) for row in eligible_best_runs),
+        "deploy_viable": None if not eligible_best_runs else any(bool(row.get("deploy_viable")) for row in eligible_best_runs),
         "viable": viable,
         "holdout_executed": bool(holdout_summary),
         "holdout_summary": holdout_summary,
@@ -697,8 +711,15 @@ def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, A
     n_eff_histogram: dict[str, int] = {}
     top1_weight_histogram: dict[str, int] = {}
     candidate_dates = sorted({str(item.get("decision_date")) for item in selected if item.get("decision_date")})
+    forecast_selected_count = 0
+    forecast_selected_dates: set[str] = set()
     for row in panel:
         ds = row.get("decision_surface") or {}
+        chosen_side = str(ds.get("chosen_side") or "ABSTAIN")
+        if not bool(ds.get("abstain", False)) and chosen_side != "ABSTAIN":
+            forecast_selected_count += 1
+            if row.get("decision_date"):
+                forecast_selected_dates.add(str(row.get("decision_date")))
         for reason in ds.get("abstain_reasons") or []:
             abstain[str(reason)] = abstain.get(str(reason), 0) + 1
         buy_reasons = (((row.get("ev") or {}).get("buy") or {}).get("abstain_reasons") or [])
@@ -732,6 +753,10 @@ def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, A
         "dirty_worktree": reproducibility.get("dirty_worktree"),
         "changed_tracked_files": reproducibility.get("changed_tracked_files", []),
         "diff_fingerprint": reproducibility.get("diff_fingerprint"),
+        "forecast_selected_count": forecast_selected_count,
+        "forecast_selected_dates": sorted(forecast_selected_dates),
+        "forecast_viable": forecast_selected_count > 0,
+        "deploy_viable": len(filled) > 0 and len(plans) > 0,
         "candidate_count": len(selected),
         "candidate_dates": candidate_dates,
         "buy_pass_count": buy_pass_count,

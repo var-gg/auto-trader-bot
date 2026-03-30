@@ -1,7 +1,8 @@
 from datetime import date, datetime
+from pathlib import Path
 
 from backtest_app.configs.models import ResearchExperimentSpec
-from backtest_app.historical_data.models import HistoricalBar, HistoricalSlice
+from backtest_app.historical_data.models import HistoricalBar, HistoricalSlice, SymbolSessionMetadata
 from backtest_app.research.artifacts import JsonResearchArtifactStore
 import pytest
 
@@ -44,7 +45,12 @@ class FakeRollingDateLoader:
             market_snapshot=MarketSnapshot(market=MarketCode.US, as_of=datetime(2026, 1, 31, 0, 0, 0), session_label="BACKTEST", is_open=False),
             bars_by_symbol=bars,
             candidates=[cand("AAPL", "2026-01-01", 0.09), cand("MSFT", "2026-01-01", 0.08), cand("XOM", "2026-01-02", 0.07), cand("AAPL", "2025-12-31", 0.12)],
-            metadata={"diagnostics": {}, "signal_panel_artifact": []},
+            session_metadata_by_symbol={
+                "AAPL": SymbolSessionMetadata(symbol="AAPL", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+                "MSFT": SymbolSessionMetadata(symbol="MSFT", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+                "XOM": SymbolSessionMetadata(symbol="XOM", exchange_code="NYQ", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+            },
+            metadata={"diagnostics": {}, "signal_panel_artifact": [{"decision_date": "2026-01-01", "symbol": "AAPL", "query": {"exchange_code": "NMS", "exchange_tz": "America/New_York", "session_date_local": "2026-01-01", "session_close_ts_utc": "2026-01-01T21:00:00+00:00", "feature_anchor_ts_utc": "2026-01-01T21:00:00+00:00", "macro_asof_ts_utc": "2026-01-01T21:00:00+00:00", "macro_freshness_summary": {"vix": {"is_stale_flag": False}}}, "decision_surface": {"chosen_side": "BUY", "abstain": False, "abstain_reasons": [], "chosen_lower_bound": 0.01, "chosen_interval_width": 0.03}, "scorer_diagnostics": {"buy": {"expected_net_return": 0.05, "q10": 0.01, "q50": 0.03, "q90": 0.08, "expected_mae": 0.01, "expected_mfe": 0.04, "n_eff": 3.0, "uncertainty": 0.02, "top_matches_summary": []}, "sell": {"expected_net_return": -0.01, "q10": -0.04, "q50": -0.01, "q90": 0.01, "expected_mae": 0.02, "expected_mfe": 0.01, "n_eff": 2.0, "uncertainty": 0.03, "top_matches_summary": []}}, "ev": {"buy": {"regime_alignment": 1.0, "abstain_reasons": []}, "sell": {"regime_alignment": 0.0, "abstain_reasons": ["low_ev"]}}, "missingness": {"zero_imputed_feature_count": 0}}], "session_metadata_by_symbol": {"AAPL": {"exchange_code": "NMS"}, "MSFT": {"exchange_code": "NMS"}, "XOM": {"exchange_code": "NYQ"}}},
         )
 
 
@@ -86,6 +92,20 @@ def test_run_backtest_research_similarity_v2_is_date_by_date_and_excludes_warmup
     assert len(result["portfolio"]["date_artifacts"][1]["selected"]) <= 2
     assert any(row["decision_date"] == "2025-12-31" for row in result["artifacts"]["warmup_candidates"])
     assert all(d["decision_date"] >= "2026-01-01" for d in result["portfolio"]["cash_path"])
+
+
+def test_run_backtest_persists_forecast_panel_sidecars(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "create_backtest_session_factory", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli, "LocalPostgresLoader", FakeRollingDateLoader)
+    request = cli.RunnerRequest(
+        scenario=cli.BacktestScenario(scenario_id="scn-r2", market="US", start_date="2026-01-01", end_date="2026-01-02", symbols=["AAPL", "MSFT", "XOM"]),
+        config=cli.BacktestConfig(initial_capital=10000.0, research_spec=ResearchExperimentSpec(feature_window_bars=20, horizon_days=2)),
+    )
+    result = cli.run_backtest(request, None, data_source="local-db", scenario_id="scn-r2", strategy_mode="research_similarity_v2", output_dir=str(tmp_path), enable_validation=False)
+    forecast_panel = dict((result.get("artifacts") or {}).get("forecast_panel") or {})
+    assert forecast_panel["row_count"] == 1
+    assert Path(str(forecast_panel["csv_path"])).exists()
+    assert Path(str(forecast_panel["parquet_path"])).exists()
 
 
 def test_build_event_memory_asof_is_reproducible_and_leak_free(tmp_path):
@@ -134,29 +154,45 @@ def _macro_history_for_bars(bars):
     return out
 
 
+def _session_metadata(symbol: str = "AAA"):
+    return {
+        symbol: SymbolSessionMetadata(
+            symbol=symbol,
+            exchange_code="NMS",
+            country_code="US",
+            exchange_tz="America/New_York",
+            session_close_local_time="16:00",
+        )
+    }
+
+
 def test_event_and_query_use_identical_feature_contract_for_same_date():
     spec = ResearchExperimentSpec(feature_window_bars=5, horizon_days=2, target_return_pct=0.02, stop_return_pct=0.02)
     bars = [HistoricalBar(symbol="AAA", timestamp=f"2025-11-{i:02d}", open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1_000_000 + i * 1000) for i in range(1, 15)]
     bars_by_symbol = {"AAA": bars}
     macro_history = _macro_history_sample()
-    memory = build_event_memory_asof(decision_date="2025-11-12", spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history, sector_map={}, market="US")
+    session_metadata = _session_metadata("AAA")
+    memory = build_event_memory_asof(decision_date="2025-11-12", spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history, sector_map={}, market="US", session_metadata_by_symbol=session_metadata)
     target = next(r for r in memory["event_records"] if r.event_date == "2025-11-09")
     query_idx = next(i for i, bar in enumerate(bars) if str(bar.timestamp)[:10] == "2025-11-09")
-    query_embedding, meta = build_query_embedding(symbol="AAA", bars=bars[query_idx - spec.feature_window_bars + 1: query_idx + 1], bars_by_symbol=bars_by_symbol, macro_history={k: v for k, v in macro_history.items() if k <= "2025-11-09"}, sector_map={}, cutoff_date="2025-11-09", spec=spec, transform=memory["transform"])
+    query_embedding, meta = build_query_embedding(symbol="AAA", bars=bars[query_idx - spec.feature_window_bars + 1: query_idx + 1], bars_by_symbol=bars_by_symbol, macro_history={k: v for k, v in macro_history.items() if k <= "2025-11-09"}, sector_map={}, cutoff_date="2025-11-09", spec=spec, transform=memory["transform"], session_metadata_by_symbol=session_metadata)
     assert memory["transform"] is not None
     assert target.diagnostics["transform_version"] == meta["transform_version"]
     assert target.diagnostics["raw_features"] == meta["raw_features"]
     assert target.diagnostics["transformed_features"] == meta["transformed_features"]
     assert target.diagnostics["embedding"] == query_embedding
+    assert target.feature_anchor_ts_utc == meta["feature_anchor_ts_utc"]
+    assert target.exchange_code == meta["exchange_code"] == "NMS"
     matching_prototype = next(p for p in memory["prototypes"] if p.representative_date == target.event_date)
     assert matching_prototype.embedding == target.diagnostics["embedding"]
     assert matching_prototype.metadata["transformed_features"] == target.diagnostics["transformed_features"]
+    assert matching_prototype.feature_anchor_ts_utc == target.feature_anchor_ts_utc
 
 
 def test_build_event_memory_uses_transform_scaler_alias():
     spec = ResearchExperimentSpec(feature_window_bars=5, horizon_days=2, target_return_pct=0.02, stop_return_pct=0.02)
     bars = [HistoricalBar(symbol="AAA", timestamp=f"2025-11-{i:02d}", open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1_000_000 + i * 1000) for i in range(1, 15)]
-    memory = build_event_memory_asof(decision_date="2025-11-12", spec=spec, bars_by_symbol={"AAA": bars}, macro_history_by_date=_macro_history_sample(), sector_map={}, market="US")
+    memory = build_event_memory_asof(decision_date="2025-11-12", spec=spec, bars_by_symbol={"AAA": bars}, macro_history_by_date=_macro_history_sample(), sector_map={}, market="US", session_metadata_by_symbol=_session_metadata("AAA"))
     assert memory["transform"] is not None
     assert memory["scaler"] is memory["transform"].scaler
 
@@ -166,13 +202,14 @@ def test_single_day_macro_history_contract_collapse_is_detected():
     bars = [HistoricalBar(symbol="AAA", timestamp=f"2025-11-{i:02d}", open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1_000_000 + i * 1000) for i in range(1, 15)]
     bars_by_symbol = {"AAA": bars}
     macro_history = _macro_history_sample()
-    memory = build_event_memory_asof(decision_date="2025-11-12", spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history, sector_map={}, market="US")
+    session_metadata = _session_metadata("AAA")
+    memory = build_event_memory_asof(decision_date="2025-11-12", spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history, sector_map={}, market="US", session_metadata_by_symbol=session_metadata)
     target = next(r for r in memory["event_records"] if r.event_date == "2025-11-09")
     query_idx = next(i for i, bar in enumerate(bars) if str(bar.timestamp)[:10] == "2025-11-09")
     assert target.diagnostics["raw_features"]["vix_change_5"] != 0.0
     assert target.diagnostics["raw_features"]["vix_zscore_20"] != 0.0
     with pytest.raises(AssertionError, match="single-day macro history collapses context semantics"):
-        build_query_embedding(symbol="AAA", bars=bars[query_idx - spec.feature_window_bars + 1: query_idx + 1], bars_by_symbol=bars_by_symbol, macro_history={"2025-11-09": macro_history["2025-11-09"]}, sector_map={}, cutoff_date="2025-11-09", spec=spec, transform=memory["transform"])
+        build_query_embedding(symbol="AAA", bars=bars[query_idx - spec.feature_window_bars + 1: query_idx + 1], bars_by_symbol=bars_by_symbol, macro_history={"2025-11-09": macro_history["2025-11-09"]}, sector_map={}, cutoff_date="2025-11-09", spec=spec, transform=memory["transform"], session_metadata_by_symbol=session_metadata)
 
 
 def test_generate_similarity_candidates_rolling_records_runtime_support_metadata():
@@ -184,6 +221,7 @@ def test_generate_similarity_candidates_rolling_records_runtime_support_metadata
         bars_by_symbol=bars_by_symbol,
         market="US",
         macro_history_by_date=macro_history,
+        session_metadata_by_symbol=_session_metadata("AAA"),
         sector_map={},
         top_k=3,
         abstain_margin=0.01,
@@ -206,6 +244,7 @@ def test_generate_similarity_candidates_rolling_records_runtime_support_metadata
     panel = diagnostics["signal_panel"]
     assert panel
     assert all((((row.get("decision_surface") or {}).get("gate_ablation") or {}).get("diagnostic_disable_ess_gate")) is True for row in panel)
+    assert all(((row.get("query") or {}).get("exchange_code")) == "NMS" for row in panel)
 
 
 def test_generate_similarity_candidates_rolling_emits_candidate_generation_progress_phase():
@@ -215,6 +254,7 @@ def test_generate_similarity_candidates_rolling_emits_candidate_generation_progr
         bars_by_symbol={"AAA": bars},
         market="US",
         macro_history_by_date=_macro_history_for_bars(bars),
+        session_metadata_by_symbol=_session_metadata("AAA"),
         sector_map={},
         top_k=3,
         abstain_margin=0.01,
@@ -226,3 +266,31 @@ def test_generate_similarity_candidates_rolling_emits_candidate_generation_progr
     phases = {str(update.get("phase")) for update in progress_updates}
     assert "candidate_generation" in phases
     assert "load_historical" not in phases
+
+
+def test_macro_asof_join_uses_only_prior_source_timestamp():
+    spec = ResearchExperimentSpec(feature_window_bars=5, horizon_days=2, target_return_pct=0.02, stop_return_pct=0.02)
+    bars = [HistoricalBar(symbol="AAA", timestamp=f"2025-11-{i:02d}", open=100 + i, high=101 + i, low=99 + i, close=100.5 + i, volume=1_000_000 + i * 1000) for i in range(1, 15)]
+    bars_by_symbol = {"AAA": bars}
+    session_metadata = {
+        "AAA": SymbolSessionMetadata(symbol="AAA", exchange_code="KOE", country_code="KR", exchange_tz="Asia/Seoul", session_close_local_time="15:30")
+    }
+    macro_history = {
+        "2025-11-08": {"vix": 18.0, "rate": 4.0, "dollar": 100.0, "oil": 70.0},
+        "2025-11-09": {"vix": 99.0, "rate": 9.0, "dollar": 199.0, "oil": 170.0},
+    }
+    macro_series_history = [
+        {"obs_date": "2025-11-08", "name": "vix", "value": 18.0, "source_ts_utc": "2025-11-08T21:00:00+00:00", "source_ts_is_derived": True},
+        {"obs_date": "2025-11-08", "name": "rate", "value": 4.0, "source_ts_utc": "2025-11-08T21:00:00+00:00", "source_ts_is_derived": True},
+        {"obs_date": "2025-11-08", "name": "dollar", "value": 100.0, "source_ts_utc": "2025-11-08T21:00:00+00:00", "source_ts_is_derived": True},
+        {"obs_date": "2025-11-08", "name": "oil", "value": 70.0, "source_ts_utc": "2025-11-08T21:00:00+00:00", "source_ts_is_derived": True},
+        {"obs_date": "2025-11-09", "name": "vix", "value": 99.0, "source_ts_utc": "2025-11-09T21:00:00+00:00", "source_ts_is_derived": True},
+        {"obs_date": "2025-11-09", "name": "rate", "value": 9.0, "source_ts_utc": "2025-11-09T21:00:00+00:00", "source_ts_is_derived": True},
+        {"obs_date": "2025-11-09", "name": "dollar", "value": 199.0, "source_ts_utc": "2025-11-09T21:00:00+00:00", "source_ts_is_derived": True},
+        {"obs_date": "2025-11-09", "name": "oil", "value": 170.0, "source_ts_utc": "2025-11-09T21:00:00+00:00", "source_ts_is_derived": True},
+    ]
+    memory = build_event_memory_asof(decision_date="2025-11-12", spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history, macro_series_history=macro_series_history, sector_map={}, market="US", session_metadata_by_symbol=session_metadata)
+    target = next(r for r in memory["event_records"] if r.event_date == "2025-11-09")
+    assert target.feature_anchor_ts_utc == "2025-11-09T06:30:00+00:00"
+    assert target.macro_asof_ts_utc == "2025-11-08T21:00:00+00:00"
+    assert target.diagnostics["macro_freshness_summary"]["vix"]["source_ts_utc"] == "2025-11-08T21:00:00+00:00"

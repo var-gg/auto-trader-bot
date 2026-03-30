@@ -127,6 +127,10 @@ def build_row_record(
     raw_feature_count = len(dict(query_meta.get("raw_features") or {}))
     transform_feature_count = len(list(query_meta.get("feature_keys") or []))
     sector_proxy_fallback_to_self = bool(sector_proxy.get("fallback_to_self", False))
+    macro_freshness_summary = dict(query_meta.get("macro_freshness_summary") or {})
+    stale_macro = any(bool((item or {}).get("is_stale_flag", False)) for item in macro_freshness_summary.values())
+    breadth_present = bool(query_meta.get("breadth_present", False))
+    breadth_missing_reason = query_meta.get("breadth_missing_reason")
     macro_series_present_count = int(query_meta.get("macro_series_present_count") or sum(1 for key in CTX_SERIES if latest_macro.get(key) is not None))
     feature_coverage_score = compute_feature_coverage_score(
         raw_zero_default_keys_count=len(raw_zero_default_keys),
@@ -137,6 +141,9 @@ def build_row_record(
         sector_proxy_fallback_to_self=sector_proxy_fallback_to_self,
     )
     exclude_reasons = sorted(set(query_reasons + library_reasons))
+    structural_missing = bool("insufficient_query_history" in exclude_reasons or "insufficient_bars" in exclude_reasons or "missing_decision_bar" in exclude_reasons)
+    data_quality_missing = bool("unknown_exchange_session" in exclude_reasons or query_meta.get("anchor_missing_reason"))
+    zero_imputation_ratio = len(transform_missing_keys) / max(1, transform_feature_count)
     return {
         "decision_date": decision_date,
         "symbol": symbol,
@@ -156,7 +163,24 @@ def build_row_record(
         "raw_zero_default_keys_top_n": _top_n(raw_zero_default_keys),
         "transform_missing_keys_filled_zero_count": len(transform_missing_keys),
         "transform_missing_keys_filled_zero_top_n": _top_n(transform_missing_keys),
+        "zero_imputed_feature_keys": _top_n(transform_missing_keys),
+        "zero_imputed_feature_count": len(transform_missing_keys),
+        "zero_imputation_ratio": zero_imputation_ratio,
         "transformed_zero_dominant_keys_top_n": _top_n(transformed_zero_keys),
+        "exchange_code": query_meta.get("exchange_code"),
+        "exchange_tz": query_meta.get("exchange_tz"),
+        "session_date_local": query_meta.get("session_date_local"),
+        "feature_anchor_ts_utc": query_meta.get("feature_anchor_ts_utc"),
+        "macro_asof_ts_utc": query_meta.get("macro_asof_ts_utc"),
+        "proxy_mode": market_proxy.get("proxy_mode"),
+        "same_exchange_peer_count": int(market_proxy.get("same_exchange_peer_count") or 0),
+        "cross_exchange_proxy_used": bool(market_proxy.get("cross_exchange_proxy_used", False)),
+        "stale_macro": stale_macro,
+        "breadth_present": breadth_present,
+        "breadth_missing_reason": breadth_missing_reason,
+        "structural_missing": structural_missing,
+        "data_quality_missing": data_quality_missing,
+        "missingness_family": "data_quality_missing" if data_quality_missing else "structural_missing" if structural_missing else "stale_but_usable" if stale_macro else "none",
         "feature_coverage_score": feature_coverage_score,
         "too_sparse": feature_coverage_score < 0.6,
     }
@@ -172,12 +196,26 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     macro_coverage_sum = 0.0
     sector_peer_rows = 0
     query_available_rows = 0
+    structural_missing_rows = 0
+    stale_macro_rows = 0
+    data_quality_missing_rows = 0
+    breadth_missing_rows = 0
+    zero_imputation_sum = 0.0
     for row in rows:
         if row.get("query_available"):
             query_available_rows += 1
         if row.get("too_sparse"):
             sparse_rows += 1
+        if row.get("structural_missing"):
+            structural_missing_rows += 1
+        if row.get("stale_macro"):
+            stale_macro_rows += 1
+        if row.get("data_quality_missing"):
+            data_quality_missing_rows += 1
+        if row.get("breadth_missing_reason") == "canonical_source_missing":
+            breadth_missing_rows += 1
         macro_coverage_sum += float(row.get("macro_series_present_count", 0)) / 5.0
+        zero_imputation_sum += float(row.get("zero_imputation_ratio", 0.0) or 0.0)
         if not row.get("sector_proxy_fallback_to_self"):
             sector_peer_rows += 1
         fallback_hist[f"sector_proxy_fallback_to_self={bool(row.get('sector_proxy_fallback_to_self'))}"] += 1
@@ -194,10 +232,18 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     macro_coverage_ratio = macro_coverage_sum / max(1, total_rows)
     row_level_feature_sparsity_ratio = sparse_rows / max(1, total_rows)
     query_available_ratio = query_available_rows / max(1, total_rows)
+    structural_missing_ratio = structural_missing_rows / max(1, total_rows)
+    stale_macro_ratio = stale_macro_rows / max(1, total_rows)
+    data_quality_missing_ratio = data_quality_missing_rows / max(1, total_rows)
+    zero_imputation_ratio = zero_imputation_sum / max(1, total_rows)
+    sector_self_fallback_ratio = fallback_hist.get("sector_proxy_fallback_to_self=True", 0) / max(1, total_rows)
+    breadth_canonical_missing_ratio = breadth_missing_rows / max(1, total_rows)
     medium_verdict_hold_recommended = (
-        fallback_hist.get("sector_proxy_fallback_to_self=True", 0) / max(1, total_rows) > 0.10
+        sector_self_fallback_ratio > 0.10
         or row_level_feature_sparsity_ratio > 0.10
         or macro_coverage_ratio < 0.95
+        or data_quality_missing_ratio > 0.0
+        or stale_macro_ratio > 0.10
     )
     return {
         "row_count": total_rows,
@@ -212,6 +258,12 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "sector_peer_coverage_ratio": sector_peer_coverage_ratio,
         "macro_coverage_ratio": macro_coverage_ratio,
         "row_level_feature_sparsity_ratio": row_level_feature_sparsity_ratio,
+        "structural_missing_ratio": structural_missing_ratio,
+        "stale_macro_ratio": stale_macro_ratio,
+        "data_quality_missing_ratio": data_quality_missing_ratio,
+        "zero_imputation_ratio": zero_imputation_ratio,
+        "sector_self_fallback_ratio": sector_self_fallback_ratio,
+        "breadth_canonical_missing_ratio": breadth_canonical_missing_ratio,
         "too_sparse_row_count": sparse_rows,
         "medium_verdict_hold_recommended": medium_verdict_hold_recommended,
     }
@@ -231,6 +283,12 @@ def render_report(summary: dict[str, Any]) -> str:
         f"- sector_peer_coverage_ratio: {summary.get('sector_peer_coverage_ratio', 0.0):.3f}",
         f"- macro_coverage_ratio: {summary.get('macro_coverage_ratio', 0.0):.3f}",
         f"- row_level_feature_sparsity_ratio: {summary.get('row_level_feature_sparsity_ratio', 0.0):.3f}",
+        f"- structural_missing_ratio: {summary.get('structural_missing_ratio', 0.0):.3f}",
+        f"- stale_macro_ratio: {summary.get('stale_macro_ratio', 0.0):.3f}",
+        f"- data_quality_missing_ratio: {summary.get('data_quality_missing_ratio', 0.0):.3f}",
+        f"- zero_imputation_ratio: {summary.get('zero_imputation_ratio', 0.0):.3f}",
+        f"- sector_self_fallback_ratio: {summary.get('sector_self_fallback_ratio', 0.0):.3f}",
+        f"- breadth_canonical_missing_ratio: {summary.get('breadth_canonical_missing_ratio', 0.0):.3f}",
         f"- medium_verdict_hold_recommended: {bool(summary.get('medium_verdict_hold_recommended', False))}",
         "",
         f"- top exclude reasons: {top_excludes}",
@@ -291,7 +349,13 @@ def diagnose_missingness(
         symbols=symbols,
         warmup_days=max(120, spec.feature_window_bars * 2),
     )
+    session_metadata_by_symbol, missing_session_metadata_symbols = loader._load_session_metadata(symbols)
     macro_history_by_date = loader._load_macro_history(
+        start_date=start_date,
+        end_date=end_date,
+        prewarm_days=max(120, spec.feature_window_bars * 2),
+    )
+    macro_series_history = loader._load_macro_series_history(
         start_date=start_date,
         end_date=end_date,
         prewarm_days=max(120, spec.feature_window_bars * 2),
@@ -310,6 +374,8 @@ def diagnose_missingness(
             sector_map=sector_map,
             market="US",
             metadata=None,
+            session_metadata_by_symbol=session_metadata_by_symbol,
+            macro_series_history=macro_series_history,
         )
         query_panel, query_excluded = _build_query_panel(
             decision_dates=[decision_date],
@@ -320,6 +386,8 @@ def diagnose_missingness(
             scaler=memory["scaler"],
             transform=memory["transform"],
             metadata=None,
+            session_metadata_by_symbol=session_metadata_by_symbol,
+            macro_series_history=macro_series_history,
         )
         query_rows = query_panel.get(decision_date, {})
         query_reasons_by_symbol: dict[str, list[str]] = {symbol: [] for symbol in symbols}
@@ -351,6 +419,7 @@ def diagnose_missingness(
             "end_date": end_date,
             "max_dates": max_dates,
             "discovery_only": True,
+            "missing_session_metadata_symbols": missing_session_metadata_symbols,
         }
     )
     return rows, summary
