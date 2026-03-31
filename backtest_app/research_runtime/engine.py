@@ -157,6 +157,10 @@ def _forecast_rows(signal_panel_payload: Any) -> list[dict[str, Any]]:
         scorer = dict(row.get("scorer_diagnostics") or {})
         buy = dict(scorer.get("buy") or {})
         sell = dict(scorer.get("sell") or {})
+        chosen_side = str(decision_surface.get("chosen_side") or "ABSTAIN")
+        chosen_payload = dict(row.get("chosen_side_payload") or decision_surface.get("chosen_payload") or {})
+        if not chosen_payload:
+            chosen_payload = buy if chosen_side == "BUY" else sell if chosen_side == "SELL" else {}
         missingness = dict(row.get("missingness") or {})
         rows.append(
             {
@@ -169,12 +173,21 @@ def _forecast_rows(signal_panel_payload: Any) -> list[dict[str, Any]]:
                 "session_close_ts_utc": query.get("session_close_ts_utc"),
                 "feature_anchor_ts_utc": query.get("feature_anchor_ts_utc"),
                 "macro_asof_ts_utc": query.get("macro_asof_ts_utc"),
-                "chosen_side_before_deploy": decision_surface.get("chosen_side"),
+                "chosen_side_before_deploy": chosen_side,
                 "abstain": bool(decision_surface.get("abstain", False)),
                 "abstain_reasons": json.dumps(decision_surface.get("abstain_reasons") or [], ensure_ascii=False),
-                "forecast_selected": bool(not decision_surface.get("abstain", False) and str(decision_surface.get("chosen_side") or "ABSTAIN") != "ABSTAIN"),
+                "forecast_selected": bool(not decision_surface.get("abstain", False) and chosen_side != "ABSTAIN"),
                 "lower_bound": decision_surface.get("chosen_lower_bound"),
                 "interval_width": decision_surface.get("chosen_interval_width"),
+                "expected_net_return": chosen_payload.get("expected_net_return"),
+                "q10": chosen_payload.get("q10_return", chosen_payload.get("q10")),
+                "q50": chosen_payload.get("q50_return", chosen_payload.get("q50")),
+                "q90": chosen_payload.get("q90_return", chosen_payload.get("q90")),
+                "expected_mae": chosen_payload.get("expected_mae"),
+                "expected_mfe": chosen_payload.get("expected_mfe"),
+                "effective_sample_size": chosen_payload.get("effective_sample_size", chosen_payload.get("n_eff")),
+                "uncertainty": chosen_payload.get("uncertainty"),
+                "regime_alignment": chosen_payload.get("regime_alignment"),
                 "buy_expected_net_return": buy.get("expected_net_return"),
                 "buy_q10": buy.get("q10"),
                 "buy_q50": buy.get("q50"),
@@ -195,7 +208,7 @@ def _forecast_rows(signal_panel_payload: Any) -> list[dict[str, Any]]:
                 "sell_uncertainty": sell.get("uncertainty"),
                 "sell_regime_alignment": dict((row.get("ev") or {}).get("sell") or {}).get("regime_alignment"),
                 "sell_abstain_reasons": json.dumps(dict((row.get("ev") or {}).get("sell") or {}).get("abstain_reasons") or [], ensure_ascii=False),
-                "top_matches_summary": json.dumps((buy.get("top_matches_summary") if str(decision_surface.get("chosen_side")) == "BUY" else sell.get("top_matches_summary")) or [], ensure_ascii=False),
+                "top_matches_summary": json.dumps((buy.get("top_matches_summary") if chosen_side == "BUY" else sell.get("top_matches_summary")) or [], ensure_ascii=False),
                 "missingness_summary": json.dumps(missingness, ensure_ascii=False),
                 "freshness_summary": json.dumps(query.get("macro_freshness_summary") or {}, ensure_ascii=False),
             }
@@ -441,6 +454,7 @@ def _authoritative_summary_payload(
 
 def _write_authoritative_summary_artifact(*, output_dir: str, payload: dict[str, Any]) -> str:
     path = Path(output_dir) / "authoritative_summary.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     return str(path)
 

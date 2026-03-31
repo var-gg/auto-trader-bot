@@ -1,3 +1,5 @@
+import csv
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
@@ -101,11 +103,60 @@ def test_run_backtest_persists_forecast_panel_sidecars(monkeypatch, tmp_path):
         scenario=cli.BacktestScenario(scenario_id="scn-r2", market="US", start_date="2026-01-01", end_date="2026-01-02", symbols=["AAPL", "MSFT", "XOM"]),
         config=cli.BacktestConfig(initial_capital=10000.0, research_spec=ResearchExperimentSpec(feature_window_bars=20, horizon_days=2)),
     )
-    result = cli.run_backtest(request, None, data_source="local-db", scenario_id="scn-r2", strategy_mode="research_similarity_v2", output_dir=str(tmp_path), enable_validation=False)
+    output_dir = tmp_path / "nested" / "artifacts"
+    result = cli.run_backtest(request, None, data_source="local-db", scenario_id="scn-r2", strategy_mode="research_similarity_v2", output_dir=str(output_dir), enable_validation=False)
     forecast_panel = dict((result.get("artifacts") or {}).get("forecast_panel") or {})
     assert forecast_panel["row_count"] == 1
     assert Path(str(forecast_panel["csv_path"])).exists()
     assert Path(str(forecast_panel["parquet_path"])).exists()
+    assert (output_dir / "authoritative_summary.json").exists()
+    with Path(str(forecast_panel["csv_path"])).open(encoding="utf-8", newline="") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["chosen_side_before_deploy"] == "BUY"
+    assert float(row["q10"]) == 0.01
+    assert float(row["q50"]) == 0.03
+    assert float(row["q90"]) == 0.08
+    assert float(row["effective_sample_size"]) == 3.0
+    assert float(row["lower_bound"]) == 0.01
+    assert float(row["interval_width"]) == 0.03
+
+
+def test_cli_main_serializes_non_json_native_result_payloads(monkeypatch, tmp_path):
+    def fake_execute(*args, **kwargs):
+        return {
+            "bars": [HistoricalBar(symbol="AAPL", timestamp="2026-01-01", open=100, high=101, low=99, close=100, volume=1_000_000)],
+            "portfolio": {"decisions": []},
+        }
+
+    output_path = tmp_path / "cli_result.json"
+    monkeypatch.setattr(cli, "execute_research_backtest", fake_execute)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--scenario-id",
+            "scn-cli",
+            "--market",
+            "US",
+            "--start-date",
+            "2026-01-01",
+            "--end-date",
+            "2026-01-02",
+            "--symbols",
+            "AAPL",
+            "--data-source",
+            "json",
+            "--data",
+            "ignored.json",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert cli.main() == 0
+    assert output_path.exists()
+    assert "HistoricalBar(" in output_path.read_text(encoding="utf-8")
 
 
 def test_build_event_memory_asof_is_reproducible_and_leak_free(tmp_path):

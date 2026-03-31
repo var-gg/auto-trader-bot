@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from statistics import mean
 from time import perf_counter
@@ -712,8 +712,13 @@ def _topk(scores: List[CandidateScore], k: int) -> List[dict]:
 
 
 def _side_diag(ev, surface, side: str) -> dict:
-    utility = dict(getattr(ev, "diagnostics", {}).get("ev_decomposition") or {})
-    interval = dict(getattr(ev, "diagnostics", {}).get("interval") or {})
+    diagnostics = dict(getattr(ev, "diagnostics", {}) or {})
+    utility = dict(diagnostics.get("ev_decomposition") or getattr(ev, "utility", {}) or {})
+    interval = dict(diagnostics.get("interval") or {
+        "q10": getattr(ev, "q10_return", 0.0),
+        "q50": getattr(ev, "q50_return", 0.0),
+        "q90": getattr(ev, "q90_return", 0.0),
+    })
     top_matches = list(getattr(ev, "top_matches", []) or [])
     support_counts = [float(((m or {}).get("why") or {}).get("support", 0.0) or 0.0) for m in top_matches]
     summary = []
@@ -758,6 +763,29 @@ def _side_diag(ev, surface, side: str) -> dict:
             "abstain_reasons": list(getattr(ev, "abstain_reasons", []) or []),
             "decision_summary": (surface.diagnostics.get("decision_rule") or {}).get("why_summary"),
         },
+    }
+
+
+def _chosen_side_payload(*, surface, buy_side_diag: dict[str, Any], sell_side_diag: dict[str, Any]) -> dict[str, Any]:
+    chosen_side = str(getattr(surface, "chosen_side", "ABSTAIN") or "ABSTAIN")
+    chosen_diag = buy_side_diag if chosen_side == Side.BUY.value else sell_side_diag if chosen_side == Side.SELL.value else {}
+    decision_rule = dict((getattr(surface, "diagnostics", {}) or {}).get("decision_rule") or {})
+    return {
+        "chosen_side": chosen_side,
+        "available": bool(chosen_diag) and not bool(getattr(surface, "abstain", False)),
+        "expected_net_return": chosen_diag.get("expected_net_return"),
+        "q10_return": chosen_diag.get("q10"),
+        "q50_return": chosen_diag.get("q50"),
+        "q90_return": chosen_diag.get("q90"),
+        "expected_mae": chosen_diag.get("expected_mae"),
+        "expected_mfe": chosen_diag.get("expected_mfe"),
+        "effective_sample_size": chosen_diag.get("n_eff"),
+        "uncertainty": chosen_diag.get("uncertainty"),
+        "regime_alignment": chosen_diag.get("regime_alignment"),
+        "fill_probability_proxy": chosen_diag.get("p_target"),
+        "lower_bound": decision_rule.get("chosen_lower_bound", chosen_diag.get("lower_bound")),
+        "interval_width": decision_rule.get("chosen_interval_width", chosen_diag.get("interval_width")),
+        "abstain_reasons": list(getattr(surface, "abstain_reasons", []) or []),
     }
 
 
@@ -1033,6 +1061,9 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
             regime_code = _query_regime_code(q["meta"])
             sector_code = sector_map.get(symbol)
             surface = build_decision_surface(query_embedding=q["embedding"], prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
+            buy_side_diag = _side_diag(surface.buy, surface, Side.BUY.value)
+            sell_side_diag = _side_diag(surface.sell, surface, Side.SELL.value)
+            chosen_side_payload = _chosen_side_payload(surface=surface, buy_side_diag=buy_side_diag, sell_side_diag=sell_side_diag)
             long_scores = score_candidates_exact(query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex(), side=Side.BUY.value)
             short_scores = score_candidates_exact(query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex(), side=Side.SELL.value)
             panel_rows.append({"decision_date": decision_date, "symbol": symbol, "prototype_snapshot_id": train_artifact["snapshot_ids"]["prototype_snapshot_id"], "prototype_count": len(prototype_pool), "chosen_side": surface.chosen_side, "top_matches": {"long": _topk(long_scores, effective_top_k), "short": _topk(short_scores, effective_top_k)}})
@@ -1042,7 +1073,7 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
             raw_ev = float(surface.buy.expected_net_return if chosen_side == Side.BUY else surface.sell.expected_net_return)
             score = ev_slope * raw_ev + ev_intercept
             confidence = calibration.calibrate_prob(score)
-            candidate = SignalCandidate(symbol=symbol, ticker_id=None, market=MarketCode(market), side_bias=chosen_side, signal_strength=score, confidence=confidence, anchor_date=decision_date, reference_date=decision_date, current_price=float(q["execution_bar"].open), atr_pct=float(max(0.01, compute_bar_features(q["query_window"]).get("range_pct", 0.02) / 3.0)), target_return_pct=spec.target_return_pct, max_reverse_pct=spec.stop_return_pct, expected_horizon_days=spec.horizon_days, outcome_label=OutcomeLabel.UNKNOWN, provenance={"strategy_mode": "research_similarity_v2", "decision_date": decision_date, "execution_date": str(q["execution_bar"].timestamp)[:10], "spec_hash": spec.spec_hash(), "frozen_from_train_artifacts": True}, diagnostics={"decision_surface": {"chosen_side": surface.chosen_side}, "top_matches": panel_rows[-1]["top_matches"]}, notes=["frozen_validation_path=true"])
+            candidate = SignalCandidate(symbol=symbol, ticker_id=None, market=MarketCode(market), side_bias=chosen_side, signal_strength=score, confidence=confidence, anchor_date=date.fromisoformat(decision_date), reference_date=date.fromisoformat(decision_date), current_price=float(q["execution_bar"].open), atr_pct=float(max(0.01, compute_bar_features(q["query_window"]).get("range_pct", 0.02) / 3.0)), target_return_pct=spec.target_return_pct, max_reverse_pct=spec.stop_return_pct, expected_horizon_days=spec.horizon_days, outcome_label=OutcomeLabel.UNKNOWN, provenance={"strategy_mode": "research_similarity_v2", "decision_date": decision_date, "execution_date": str(q["execution_bar"].timestamp)[:10], "spec_hash": spec.spec_hash(), "frozen_from_train_artifacts": True}, diagnostics={"query": {"regime_code": regime_code, "sector_code": sector_code}, "decision_surface": {"chosen_side": surface.chosen_side, "decision_rule": surface.diagnostics.get("decision_rule"), "chosen_payload": chosen_side_payload}, "chosen_side_payload": chosen_side_payload, "scorer_diagnostics": {"buy": buy_side_diag, "sell": sell_side_diag}, "ev": {"buy": {"expected_net_return": surface.buy.expected_net_return, "effective_sample_size": surface.buy.effective_sample_size, "uncertainty": surface.buy.uncertainty}, "sell": {"expected_net_return": surface.sell.expected_net_return, "effective_sample_size": surface.sell.effective_sample_size, "uncertainty": surface.sell.uncertainty}}, "top_matches": panel_rows[-1]["top_matches"]}, notes=["frozen_validation_path=true"])
             batch.append(candidate)
             candidates.append(candidate)
         grouped_candidates[decision_date] = batch
@@ -1115,6 +1146,9 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
             long_ev = estimate_expected_value(side=Side.BUY.value, query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
             short_ev = estimate_expected_value(side=Side.SELL.value, query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
             surface = build_decision_surface(query_embedding=q["embedding"], prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
+            buy_side_diag = _side_diag(long_ev, surface, "BUY")
+            sell_side_diag = _side_diag(short_ev, surface, "SELL")
+            chosen_side_payload = _chosen_side_payload(surface=surface, buy_side_diag=buy_side_diag, sell_side_diag=sell_side_diag)
             row_diag = {
                 "decision_date": decision_date,
                 "symbol": symbol,
@@ -1180,7 +1214,9 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
                     "chosen_uncertainty": (surface.diagnostics.get("decision_rule") or {}).get("chosen_uncertainty"),
                     "gate_ablation": surface.diagnostics.get("gate_ablation"),
                     "decision_rule": surface.diagnostics.get("decision_rule"),
+                    "chosen_payload": chosen_side_payload,
                 },
+                "chosen_side_payload": chosen_side_payload,
                 "ev": {
                     "buy": {
                         "expected_utility": long_ev.expected_utility,
@@ -1197,7 +1233,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
                         "abstain_reasons": short_ev.abstain_reasons,
                     },
                 },
-                "scorer_diagnostics": {"buy": _side_diag(long_ev, surface, "BUY"), "sell": _side_diag(short_ev, surface, "SELL")},
+                "scorer_diagnostics": {"buy": buy_side_diag, "sell": sell_side_diag},
                 "top_matches": {"long": surface.buy.top_matches, "short": surface.sell.top_matches},
             }
             row_diag["missingness"] = {
@@ -1218,7 +1254,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
                 continue
             chosen_side = Side.BUY if surface.chosen_side == Side.BUY.value else Side.SELL
             chosen = long_scores[0] if chosen_side == Side.BUY and long_scores else short_scores[0] if short_scores else None
-            out.append(SignalCandidate(symbol=symbol, ticker_id=None, market=MarketCode(market), side_bias=chosen_side, signal_strength=float((long_ev.calibrated_ev if chosen_side == Side.BUY else short_ev.calibrated_ev) if chosen else 0.0), confidence=float(long_ev.calibrated_win_prob if chosen_side == Side.BUY else short_ev.calibrated_win_prob), anchor_date=decision_date, reference_date=decision_date, current_price=float(execution_bar.open), atr_pct=float(max(0.01, compute_bar_features(q["query_window"]).get("range_pct", 0.02) / 3.0)), target_return_pct=spec.target_return_pct, max_reverse_pct=spec.stop_return_pct, expected_horizon_days=spec.horizon_days, outcome_label=OutcomeLabel.UNKNOWN, provenance={"strategy_mode": "research_similarity_v2", "decision_date": decision_date, "execution_date": execution_date, "spec_hash": spec.spec_hash(), "exchange_code": query_meta.get("exchange_code"), "feature_anchor_ts_utc": query_meta.get("feature_anchor_ts_utc"), "macro_asof_ts_utc": query_meta.get("macro_asof_ts_utc")}, diagnostics=row_diag, notes=[f"prototype_id={(chosen.prototype_id if chosen else '')}"]))
+            out.append(SignalCandidate(symbol=symbol, ticker_id=None, market=MarketCode(market), side_bias=chosen_side, signal_strength=float((long_ev.calibrated_ev if chosen_side == Side.BUY else short_ev.calibrated_ev) if chosen else 0.0), confidence=float(long_ev.calibrated_win_prob if chosen_side == Side.BUY else short_ev.calibrated_win_prob), anchor_date=date.fromisoformat(decision_date), reference_date=date.fromisoformat(decision_date), current_price=float(execution_bar.open), atr_pct=float(max(0.01, compute_bar_features(q["query_window"]).get("range_pct", 0.02) / 3.0)), target_return_pct=spec.target_return_pct, max_reverse_pct=spec.stop_return_pct, expected_horizon_days=spec.horizon_days, outcome_label=OutcomeLabel.UNKNOWN, provenance={"strategy_mode": "research_similarity_v2", "decision_date": decision_date, "execution_date": execution_date, "spec_hash": spec.spec_hash(), "exchange_code": query_meta.get("exchange_code"), "feature_anchor_ts_utc": query_meta.get("feature_anchor_ts_utc"), "macro_asof_ts_utc": query_meta.get("macro_asof_ts_utc")}, diagnostics=row_diag, notes=[f"prototype_id={(chosen.prototype_id if chosen else '')}"]))
         _emit_progress(idx)
     _emit_progress(len(decision_dates), force=True)
     diagnostics["signal_panel"] = panel_rows
