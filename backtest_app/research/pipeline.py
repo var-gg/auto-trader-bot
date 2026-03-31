@@ -100,6 +100,23 @@ def _topk(scores: List[CandidateScore], k: int) -> List[dict]:
     return [asdict(s) for s in scores[:k]]
 
 
+def _match_weight_shares(matches: list[dict[str, Any]]) -> list[float]:
+    weights = [float((match or {}).get("weight", 0.0) or 0.0) for match in matches]
+    total = sum(weights)
+    if total <= 1e-12:
+        return [0.0 for _ in matches]
+    return [float(weight) / float(total) for weight in weights]
+
+
+def _consensus_signature_from_matches(matches: list[dict[str, Any]]) -> str:
+    tokens: list[str] = []
+    for match in matches[:3]:
+        token = str((match or {}).get("representative_hash") or (match or {}).get("prototype_id") or "").strip()
+        if token:
+            tokens.append(token)
+    return "|".join(tokens)
+
+
 def _side_diag(ev, surface, side: str) -> dict:
     diagnostics = dict(getattr(ev, "diagnostics", {}) or {})
     utility = dict(diagnostics.get("ev_decomposition") or {})
@@ -110,13 +127,16 @@ def _side_diag(ev, surface, side: str) -> dict:
     })
     top_matches = list(getattr(ev, "top_matches", []) or [])
     support_counts = [float(((m or {}).get("why") or {}).get("support", 0.0) or 0.0) for m in top_matches]
+    weight_shares = _match_weight_shares(top_matches)
     summary = []
-    for match in top_matches[:3]:
+    for idx, match in enumerate(top_matches[:3]):
         why = dict((match or {}).get("why") or {})
         summary.append({
             "prototype_id": match.get("prototype_id"),
+            "representative_hash": match.get("representative_hash"),
             "representative_symbol": match.get("representative_symbol"),
             "weight": match.get("weight"),
+            "weight_share": weight_shares[idx] if idx < len(weight_shares) else 0.0,
             "similarity": why.get("similarity"),
             "support": why.get("support"),
             "expected_return": match.get("expected_return"),
@@ -138,10 +158,20 @@ def _side_diag(ev, surface, side: str) -> dict:
         "p_flat": utility.get("p_flat", 0.0),
         "p_ambiguous": utility.get("p_ambiguous", 0.0),
         "p_no_trade": utility.get("p_no_trade", 0.0),
+        "prototype_pool_size": int((surface.diagnostics.get("prototype_pool_size") or 0)),
+        "ranked_candidate_count": len(top_matches),
+        "positive_weight_candidate_count": sum(1 for share in weight_shares if share > 0.0),
+        "pre_truncation_candidate_count": len(top_matches),
+        "top1_weight_share": weight_shares[0] if weight_shares else 0.0,
+        "cumulative_weight_top3": float(sum(weight_shares[:3])),
+        "mixture_ess": getattr(ev, "effective_sample_size", 0.0),
+        "member_support_sum": float(sum(support_counts)),
+        "consensus_signature": _consensus_signature_from_matches(summary),
         "top_matches_summary": summary,
         "side_stats_summary": {
             "match_count": len(top_matches),
             "prototype_ids": [m.get("prototype_id") for m in top_matches[:3]],
+            "representative_hashes": [m.get("representative_hash") for m in summary[:3]],
             "representative_symbols": [m.get("representative_symbol") for m in top_matches[:3]],
             "mean_support": (sum(support_counts) / len(support_counts)) if support_counts else 0.0,
             "max_support": max(support_counts) if support_counts else 0.0,
@@ -170,6 +200,15 @@ def _chosen_side_payload(*, surface, buy_side_diag: dict[str, Any], sell_side_di
         "fill_probability_proxy": chosen_diag.get("p_target"),
         "lower_bound": decision_rule.get("chosen_lower_bound", chosen_diag.get("lower_bound")),
         "interval_width": decision_rule.get("chosen_interval_width"),
+        "prototype_pool_size": chosen_diag.get("prototype_pool_size"),
+        "ranked_candidate_count": chosen_diag.get("ranked_candidate_count"),
+        "positive_weight_candidate_count": chosen_diag.get("positive_weight_candidate_count"),
+        "pre_truncation_candidate_count": chosen_diag.get("pre_truncation_candidate_count"),
+        "top1_weight_share": chosen_diag.get("top1_weight_share"),
+        "cumulative_weight_top3": chosen_diag.get("cumulative_weight_top3"),
+        "mixture_ess": chosen_diag.get("mixture_ess"),
+        "member_support_sum": chosen_diag.get("member_support_sum"),
+        "consensus_signature": chosen_diag.get("consensus_signature"),
         "abstain_reasons": list(getattr(surface, "abstain_reasons", []) or []),
     }
 

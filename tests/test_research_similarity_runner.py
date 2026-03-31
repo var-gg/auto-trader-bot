@@ -1,4 +1,5 @@
 import csv
+import json
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -73,7 +74,7 @@ class FakeRollingDateLoader:
                                 "expected_mfe": 0.04,
                                 "n_eff": 3.0,
                                 "uncertainty": 0.02,
-                                "top_matches_summary": [],
+                                "top_matches_summary": [{"prototype_id": "buy-1", "support": 12.0, "similarity": 0.25}],
                             },
                             "sell": {
                                 "expected_net_return": -0.01,
@@ -84,7 +85,7 @@ class FakeRollingDateLoader:
                                 "expected_mfe": 0.01,
                                 "n_eff": 2.0,
                                 "uncertainty": 0.03,
-                                "top_matches_summary": [],
+                                "top_matches_summary": [{"prototype_id": "sell-1", "support": 7.0, "similarity": 0.12}],
                             },
                         },
                         "ev": {
@@ -161,6 +162,14 @@ def test_run_backtest_persists_forecast_panel_sidecars(monkeypatch, tmp_path):
     assert float(row["effective_sample_size"]) == 3.0
     assert float(row["lower_bound"]) == 0.01
     assert float(row["interval_width"]) == 0.03
+    assert json.loads(row["buy_top_matches_summary"])[0]["prototype_id"] == "buy-1"
+    assert json.loads(row["sell_top_matches_summary"])[0]["prototype_id"] == "sell-1"
+    assert int(row["buy_top_match_count"]) == 1
+    assert int(row["sell_top_match_count"]) == 1
+    assert float(row["buy_top_match_support_sum"]) == 12.0
+    assert float(row["sell_top_match_support_sum"]) == 7.0
+    assert float(row["buy_top_match_max_similarity"]) == 0.25
+    assert float(row["sell_top_match_max_similarity"]) == 0.12
 
 
 def test_cli_main_serializes_non_json_native_result_payloads(monkeypatch, tmp_path):

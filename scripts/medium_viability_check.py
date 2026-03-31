@@ -98,6 +98,9 @@ COUNTER_KEYS = [
 ]
 SUMMARY_COLS = [
     "run_label",
+    "pre_optuna_ready",
+    "pre_optuna_verdict",
+    "next_optuna_target_scope",
     "candidate_count",
     "candidate_dates",
     "buy_pass_count",
@@ -312,6 +315,7 @@ def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, A
     n_eff_histogram: dict[str, int] = {}
     top1_weight_histogram: dict[str, int] = {}
     candidate_dates = sorted({str(item.get("decision_date")) for item in selected if item.get("decision_date")})
+    pre_optuna_packet = dict((((result.get("artifacts") or {}).get("pre_optuna") or {}).get("packet") or {}))
     for row in panel:
         ds = row.get("decision_surface") or {}
         for reason in ds.get("abstain_reasons") or []:
@@ -339,6 +343,9 @@ def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, A
         "scenario_id": scenario.scenario_id,
         "window": {"start_date": scenario.start_date, "end_date": scenario.end_date},
         "symbols": list(scenario.symbols),
+        "pre_optuna_ready": bool(pre_optuna_packet.get("pre_optuna_ready", False)),
+        "pre_optuna_verdict": pre_optuna_packet.get("verdict"),
+        "next_optuna_target_scope": pre_optuna_packet.get("next_optuna_target_scope"),
         "candidate_count": len(selected),
         "candidate_dates": candidate_dates,
         "buy_pass_count": buy_pass_count,

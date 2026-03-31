@@ -262,7 +262,7 @@ def estimate_distribution(*, side: str, query_embedding: list[float], candidates
     lower_bound = _resolve_lower_bound(formula=cfg.diagnostic_lower_bound_formula, q10=q10, q25=q25, q50=q50, q90=q90, expected_net_return=exp_ret, uncertainty=uncertainty)
     upper_bound = q90 + uncertainty
     utility = {"expected_net_return": exp_ret, "p_target_first": p_target, "p_stop_first": p_stop, "p_flat": p_flat, "p_ambiguous": p_ambiguous, "p_no_trade": p_no_trade, "mae_penalty": 0.5 * exp_mae, "mfe_credit": 0.25 * exp_mfe, "ambiguous_penalty": 0.5 * p_ambiguous, "no_trade_penalty": 0.75 * p_no_trade, "uncertainty_penalty": uncertainty, "fallback_raw_ev": exp_ret - 0.5 * exp_mae + 0.25 * exp_mfe - 0.5 * p_ambiguous - 0.75 * p_no_trade - uncertainty, "q25_return": q25, "interval_width": float(q90 - q10), "lower_bound_formula": cfg.diagnostic_lower_bound_formula}
-    top_matches = [{"prototype_id": r["candidate"].prototype_id, "weight": r["weight"], "why": {"similarity": r["similarity"], "support": float(r["side_stats"].get("support_count", 0.0)), "freshness_days": float(r["side_stats"].get("freshness_days", 0.0)), "target_first_count": r["side_stats"].get("target_first_count", 0), "stop_first_count": r["side_stats"].get("stop_first_count", 0), "flat_count": r["side_stats"].get("flat_count", 0), "ambiguous_count": r["side_stats"].get("ambiguous_count", 0), "no_trade_count": r["side_stats"].get("no_trade_count", 0)}, "representative_symbol": r["candidate"].representative_symbol, "expected_return": r["side_stats"].get("mean_return_pct"), "uncertainty": r["side_stats"].get("uncertainty")} for r in rows]
+    top_matches = [{"prototype_id": r["candidate"].prototype_id, "representative_hash": r["candidate"].representative_hash, "weight": r["weight"], "why": {"similarity": r["similarity"], "support": float(r["side_stats"].get("support_count", 0.0)), "freshness_days": float(r["side_stats"].get("freshness_days", 0.0)), "target_first_count": r["side_stats"].get("target_first_count", 0), "stop_first_count": r["side_stats"].get("stop_first_count", 0), "flat_count": r["side_stats"].get("flat_count", 0), "ambiguous_count": r["side_stats"].get("ambiguous_count", 0), "no_trade_count": r["side_stats"].get("no_trade_count", 0)}, "representative_symbol": r["candidate"].representative_symbol, "expected_return": r["side_stats"].get("mean_return_pct"), "uncertainty": r["side_stats"].get("uncertainty")} for r in rows]
     return DistributionEstimate(side=side, p_target_first=calibration.calibrate_prob(p_target), p_stop_first=calibration.calibrate_prob(p_stop), p_flat=max(0.0, min(1.0, p_flat)), expected_net_return=calibration.calibrate_ev(exp_ret), expected_mae=exp_mae, expected_mfe=exp_mfe, q10_return=q10, q50_return=q50, q90_return=q90, effective_sample_size=n_eff, regime_alignment=regime_alignment, uncertainty=uncertainty, lower_bound_return=lower_bound, upper_bound_return=upper_bound, utility=utility, top_matches=top_matches)
 
 
@@ -274,7 +274,7 @@ def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iter
     def _side_reasons(dist: DistributionEstimate) -> tuple[list[str], float]:
         side_reasons = []
         side_interval_width = dist.q90_return - dist.q10_return
-        if dist.effective_sample_size < cfg.min_effective_sample_size:
+        if dist.effective_sample_size < cfg.min_effective_sample_size and not cfg.diagnostic_disable_ess_gate:
             side_reasons.append("low_ess")
         if dist.uncertainty > cfg.max_uncertainty:
             side_reasons.append("high_uncertainty")
