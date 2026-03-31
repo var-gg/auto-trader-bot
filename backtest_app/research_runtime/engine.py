@@ -13,7 +13,6 @@ from backtest_app.configs.models import BacktestConfig, RunnerRequest
 from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory, guard_backtest_local_only
 from backtest_app.historical_data.loader import JsonHistoricalDataLoader
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
-from backtest_app.observability.git_provenance import collect_git_provenance
 from backtest_app.portfolio import PortfolioConfig, PortfolioState, build_portfolio_decisions
 from backtest_app.quote_policy import QuotePolicyConfig, compare_policy_ab
 from backtest_app.reporting.summary import build_summary
@@ -24,6 +23,12 @@ from backtest_app.simulated_broker.models import SimulationRules
 from backtest_app.validation import run_fold_validation, sensitivity_sweep
 from shared.domain.execution import build_order_plan_from_candidate
 from shared.domain.models import ExecutionVenue, FillStatus, Side
+
+try:
+    from backtest_app.observability.git_provenance import collect_git_provenance
+except ImportError:  # pragma: no cover - legacy public branches may not ship observability helpers
+    def collect_git_provenance() -> dict[str, Any]:
+        return {}
 
 
 def _meta_flag(metadata: dict[str, Any] | None, key: str, default: bool = False) -> bool:
