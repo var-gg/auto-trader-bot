@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List
+from typing import Any, Callable, Dict, Iterable, List
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
@@ -16,12 +16,17 @@ from .models import HistoricalBar, HistoricalSlice
 WARMUP_DAYS = 120
 
 
+def _emit_progress(progress_callback: Callable[[dict[str, Any]], None] | None, payload: dict[str, Any]) -> None:
+    if progress_callback:
+        progress_callback(payload)
+
+
 class LocalPostgresLoader:
     def __init__(self, session_factory: sessionmaker[Session], *, schema: str = "trading"):
         self.session_factory = session_factory
         self.schema = schema
 
-    def load_for_scenario(self, *, scenario_id: str, market: str, start_date: str, end_date: str, symbols: Iterable[str], strategy_mode: str = "legacy_event_window", research_spec: ResearchExperimentSpec | None = None, train_end: str | None = None, decision_dates: Iterable[str] | None = None, metadata: Dict[str, str] | None = None) -> HistoricalSlice:
+    def load_for_scenario(self, *, scenario_id: str, market: str, start_date: str, end_date: str, symbols: Iterable[str], strategy_mode: str = "legacy_event_window", research_spec: ResearchExperimentSpec | None = None, train_end: str | None = None, decision_dates: Iterable[str] | None = None, metadata: Dict[str, str] | None = None, progress_callback: Callable[[dict[str, Any]], None] | None = None) -> HistoricalSlice:
         symbols = [s for s in symbols if s]
         if not symbols:
             raise ValueError("symbols required")
@@ -30,9 +35,22 @@ class LocalPostgresLoader:
         bars_by_symbol = self._load_bars(start_date=start_date, end_date=bars_end_date, symbols=symbols, warmup_days=max(WARMUP_DAYS, spec.feature_window_bars * 2))
         sector_map = self._load_sector_map(symbols)
         features_by_symbol: Dict[str, Dict[str, float]] = {symbol: compute_bar_features(bars) for symbol, bars in bars_by_symbol.items()}
+        _emit_progress(progress_callback, {
+            "phase": "load_historical",
+            "status": "running",
+            "loaded_ohlcv_rows": sum(len(bars) for bars in bars_by_symbol.values()),
+            "loaded_sector_rows": len(sector_map),
+        })
 
         if strategy_mode == "research_similarity_v1":
             macro_payload = self._load_macro_payload(as_of=end_date)
+            _emit_progress(progress_callback, {
+                "phase": "load_historical",
+                "status": "running",
+                "loaded_ohlcv_rows": sum(len(bars) for bars in bars_by_symbol.values()),
+                "loaded_macro_rows": len(macro_payload),
+                "loaded_sector_rows": len(sector_map),
+            })
             candidates, research_diag = generate_similarity_candidates(bars_by_symbol=bars_by_symbol, market=market, macro_payload=macro_payload, sector_map=sector_map, spec=spec)
             snapshot_ts = self._resolve_snapshot_ts(bars_by_symbol)
             enriched = self._enrich_candidates(candidates, features_by_symbol)
@@ -41,9 +59,16 @@ class LocalPostgresLoader:
 
         if strategy_mode == "research_similarity_v2":
             macro_history = self._load_macro_history(start_date=start_date, end_date=end_date, prewarm_days=max(WARMUP_DAYS, spec.feature_window_bars * 2))
+            _emit_progress(progress_callback, {
+                "phase": "load_historical",
+                "status": "running",
+                "loaded_ohlcv_rows": sum(len(bars) for bars in bars_by_symbol.values()),
+                "loaded_macro_rows": sum(len(row or {}) for row in macro_history.values()),
+                "loaded_sector_rows": len(sector_map),
+            })
             resolved_metadata = dict(metadata or {})
             abstain_margin = float(resolved_metadata.get("abstain_margin", 0.05) or 0.05)
-            candidates, research_diag = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market=market, macro_history_by_date=macro_history, sector_map=sector_map, spec=spec, abstain_margin=abstain_margin, metadata=resolved_metadata)
+            candidates, research_diag = generate_similarity_candidates_rolling(bars_by_symbol=bars_by_symbol, market=market, macro_history_by_date=macro_history, sector_map=sector_map, spec=spec, abstain_margin=abstain_margin, metadata=resolved_metadata, progress_callback=progress_callback)
             snapshot_ts = self._resolve_snapshot_ts(bars_by_symbol)
             enriched = self._enrich_candidates(candidates, features_by_symbol)
             snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False)
