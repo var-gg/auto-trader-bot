@@ -13,6 +13,7 @@ from backtest_app.configs.models import BacktestConfig, RunnerRequest
 from backtest_app.db.local_session import LocalBacktestDbConfig, create_backtest_session_factory, guard_backtest_local_only
 from backtest_app.historical_data.loader import JsonHistoricalDataLoader
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
+from backtest_app.observability.git_provenance import collect_git_provenance
 from backtest_app.portfolio import PortfolioConfig, PortfolioState, build_portfolio_decisions
 from backtest_app.quote_policy import QuotePolicyConfig, compare_policy_ab
 from backtest_app.reporting.summary import build_summary
@@ -58,9 +59,12 @@ def _history_from_reuse_payload(payload: dict) -> SimpleNamespace:
     metadata.setdefault("source", "reuse")
     metadata.setdefault("diagnostics", payload.get("diagnostics") or {})
     metadata.setdefault("signal_panel_artifact", payload.get("signal_panel") or [])
+    metadata.setdefault("macro_series_history", payload.get("macro_series_history") or [])
+    metadata.setdefault("session_metadata_by_symbol", payload.get("session_metadata_by_symbol") or {})
     return SimpleNamespace(
         bars_by_symbol=payload.get("bars_by_symbol") or {},
         candidates=payload.get("candidates") or [],
+        session_metadata_by_symbol=payload.get("session_metadata_by_symbol") or {},
         metadata=metadata,
     )
 
@@ -70,8 +74,10 @@ def _policy_reuse_payload(*, historical, grouped_candidates: dict[str, list], wa
     return {
         "bars_by_symbol": historical.bars_by_symbol,
         "candidates": list(getattr(historical, "candidates", []) or []),
+        "session_metadata_by_symbol": diagnostics.get("session_metadata_by_symbol") or getattr(historical, "session_metadata_by_symbol", {}) or {},
         "metadata": dict(diagnostics),
         "signal_panel": diagnostics.get("signal_panel_artifact", []),
+        "macro_series_history": diagnostics.get("macro_series_history", []),
         "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates],
         "candidate_counts": {k: len(v) for k, v in grouped_candidates.items()},
         "trading_dates": list(trading_dates),
@@ -130,6 +136,158 @@ def _git_commit_for_path(pathspec: str | None = None) -> str | None:
         return None
 
 
+def _portfolio_paths(date_artifacts: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    rows = list(date_artifacts or [])
+    return {
+        "cash_path": [{"decision_date": row.get("decision_date"), "cash": row.get("cash")} for row in rows],
+        "exposure_path": [{"decision_date": row.get("decision_date"), "exposure": row.get("exposure")} for row in rows],
+        "open_position_count_path": [{"decision_date": row.get("decision_date"), "open_position_count": row.get("open_position_count")} for row in rows],
+    }
+
+
+def _forecast_rows(signal_panel_payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(signal_panel_payload, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for row in signal_panel_payload:
+        if not isinstance(row, dict):
+            continue
+        query = dict(row.get("query") or {})
+        decision_surface = dict(row.get("decision_surface") or {})
+        scorer = dict(row.get("scorer_diagnostics") or {})
+        buy = dict(scorer.get("buy") or {})
+        sell = dict(scorer.get("sell") or {})
+        chosen_side = str(decision_surface.get("chosen_side") or "ABSTAIN")
+        chosen_payload = dict(row.get("chosen_side_payload") or decision_surface.get("chosen_payload") or {})
+        if not chosen_payload:
+            chosen_payload = buy if chosen_side == "BUY" else sell if chosen_side == "SELL" else {}
+        missingness = dict(row.get("missingness") or {})
+        rows.append(
+            {
+                "decision_date": row.get("decision_date"),
+                "symbol": row.get("symbol"),
+                "exchange_code": query.get("exchange_code"),
+                "country_code": query.get("country_code"),
+                "exchange_tz": query.get("exchange_tz"),
+                "session_date_local": query.get("session_date_local"),
+                "session_close_ts_utc": query.get("session_close_ts_utc"),
+                "feature_anchor_ts_utc": query.get("feature_anchor_ts_utc"),
+                "macro_asof_ts_utc": query.get("macro_asof_ts_utc"),
+                "chosen_side_before_deploy": chosen_side,
+                "abstain": bool(decision_surface.get("abstain", False)),
+                "abstain_reasons": json.dumps(decision_surface.get("abstain_reasons") or [], ensure_ascii=False),
+                "forecast_selected": bool(not decision_surface.get("abstain", False) and chosen_side != "ABSTAIN"),
+                "lower_bound": decision_surface.get("chosen_lower_bound"),
+                "interval_width": decision_surface.get("chosen_interval_width"),
+                "expected_net_return": chosen_payload.get("expected_net_return"),
+                "q10": chosen_payload.get("q10_return", chosen_payload.get("q10")),
+                "q50": chosen_payload.get("q50_return", chosen_payload.get("q50")),
+                "q90": chosen_payload.get("q90_return", chosen_payload.get("q90")),
+                "expected_mae": chosen_payload.get("expected_mae"),
+                "expected_mfe": chosen_payload.get("expected_mfe"),
+                "effective_sample_size": chosen_payload.get("effective_sample_size", chosen_payload.get("n_eff")),
+                "uncertainty": chosen_payload.get("uncertainty"),
+                "regime_alignment": chosen_payload.get("regime_alignment"),
+                "buy_expected_net_return": buy.get("expected_net_return"),
+                "buy_q10": buy.get("q10"),
+                "buy_q50": buy.get("q50"),
+                "buy_q90": buy.get("q90"),
+                "buy_expected_mae": buy.get("expected_mae"),
+                "buy_expected_mfe": buy.get("expected_mfe"),
+                "buy_effective_sample_size": buy.get("n_eff"),
+                "buy_uncertainty": buy.get("uncertainty"),
+                "buy_regime_alignment": dict((row.get("ev") or {}).get("buy") or {}).get("regime_alignment"),
+                "buy_abstain_reasons": json.dumps(dict((row.get("ev") or {}).get("buy") or {}).get("abstain_reasons") or [], ensure_ascii=False),
+                "sell_expected_net_return": sell.get("expected_net_return"),
+                "sell_q10": sell.get("q10"),
+                "sell_q50": sell.get("q50"),
+                "sell_q90": sell.get("q90"),
+                "sell_expected_mae": sell.get("expected_mae"),
+                "sell_expected_mfe": sell.get("expected_mfe"),
+                "sell_effective_sample_size": sell.get("n_eff"),
+                "sell_uncertainty": sell.get("uncertainty"),
+                "sell_regime_alignment": dict((row.get("ev") or {}).get("sell") or {}).get("regime_alignment"),
+                "sell_abstain_reasons": json.dumps(dict((row.get("ev") or {}).get("sell") or {}).get("abstain_reasons") or [], ensure_ascii=False),
+                "top_matches_summary": json.dumps((buy.get("top_matches_summary") if chosen_side == "BUY" else sell.get("top_matches_summary")) or [], ensure_ascii=False),
+                "missingness_summary": json.dumps(missingness, ensure_ascii=False),
+                "freshness_summary": json.dumps(query.get("macro_freshness_summary") or {}, ensure_ascii=False),
+            }
+        )
+    return rows
+
+
+def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, signal_panel_payload: Any, progress_callback=None, total_trading_dates: int = 0, completed_trading_dates: int = 0, candidate_rows: int = 0, plans_count: int = 0, fills_count: int = 0) -> dict[str, Any]:
+    rows = _forecast_rows(signal_panel_payload)
+    if not rows:
+        return {"row_count": 0, "csv_path": None, "parquet_path": None}
+    try:
+        import pandas as pd
+    except Exception:
+        return {"row_count": len(rows), "csv_path": None, "parquet_path": None, "write_error": "pandas_unavailable"}
+    run_dir = Path(output_dir) / "research" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = run_dir / "forecast_panel.csv"
+    parquet_path = run_dir / "forecast_panel.parquet"
+    _emit_progress(progress_callback, {
+        "phase": "write_artifacts",
+        "status": "running",
+        "artifact_name": "forecast_panel_prepare",
+        "artifact_index": 2,
+        "artifact_total": 5,
+        "artifact_rows": len(rows),
+        "bytes_written": 0,
+        "candidate_rows": candidate_rows,
+        "plans_count": plans_count,
+        "fills_count": fills_count,
+        "total_trading_dates": total_trading_dates,
+        "completed_trading_dates": completed_trading_dates,
+    })
+    frame = pd.DataFrame(rows)
+    frame.to_csv(csv_path, index=False)
+    _emit_progress(progress_callback, {
+        "phase": "write_artifacts",
+        "status": "running",
+        "artifact_name": "forecast_panel_csv",
+        "artifact_index": 3,
+        "artifact_total": 5,
+        "artifact_rows": len(rows),
+        "artifact_bytes": csv_path.stat().st_size if csv_path.exists() else 0,
+        "bytes_written": csv_path.stat().st_size if csv_path.exists() else 0,
+        "candidate_rows": candidate_rows,
+        "plans_count": plans_count,
+        "fills_count": fills_count,
+        "total_trading_dates": total_trading_dates,
+        "completed_trading_dates": completed_trading_dates,
+    })
+    parquet_format = "parquet"
+    try:
+        frame.to_parquet(parquet_path, index=False)
+    except Exception:
+        parquet_path.write_text(json.dumps({"format": "json_fallback", "rows": rows}, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        parquet_format = "json_fallback"
+    _emit_progress(progress_callback, {
+        "phase": "write_artifacts",
+        "status": "running",
+        "artifact_name": "forecast_panel_parquet",
+        "artifact_index": 4,
+        "artifact_total": 5,
+        "artifact_rows": len(rows),
+        "artifact_bytes": parquet_path.stat().st_size if parquet_path.exists() else 0,
+        "bytes_written": sum(path.stat().st_size for path in [csv_path, parquet_path] if path.exists()),
+        "candidate_rows": candidate_rows,
+        "plans_count": plans_count,
+        "fills_count": fills_count,
+        "total_trading_dates": total_trading_dates,
+        "completed_trading_dates": completed_trading_dates,
+    })
+    return {
+        "row_count": len(rows),
+        "csv_path": str(csv_path),
+        "parquet_path": str(parquet_path),
+        "parquet_format": parquet_format,
+    }
+
+
 def _reproducibility_payload(*, request: RunnerRequest, manifest, raw_diagnostics: dict | None, signal_panel_payload, validation_folds: dict | None) -> dict:
     metadata = dict(request.config.metadata or {})
     diagnostic_flag_keys = sorted(k for k in metadata if k.startswith("diagnostic_") or k in {"validation_summary_only", "diagnostics_lite"})
@@ -141,7 +299,9 @@ def _reproducibility_payload(*, request: RunnerRequest, manifest, raw_diagnostic
                 validation_snapshot_ids.append(snapshot_id)
     runtime_head_commit = getattr(manifest, "code_commit", None) or _git_commit_for_path()
     strategy_logic_commit = _git_commit_for_path("backtest_app") or runtime_head_commit
+    git_provenance = collect_git_provenance()
     return {
+        **git_provenance,
         "git_commit": runtime_head_commit,
         "git_commit_deprecated": True,
         "runtime_head_commit": runtime_head_commit,
@@ -165,13 +325,13 @@ def _reproducibility_payload(*, request: RunnerRequest, manifest, raw_diagnostic
     }
 
 
-def load_historical(request: RunnerRequest, data_path: str | None, data_source: str, scenario_id: str | None, strategy_mode: str):
+def load_historical(request: RunnerRequest, data_path: str | None, data_source: str, scenario_id: str | None, strategy_mode: str, progress_callback=None):
     if data_source == "local-db":
         cfg = LocalBacktestDbConfig.from_env()
         guard_backtest_local_only(cfg.url)
         session_factory = create_backtest_session_factory(cfg)
         loader = LocalPostgresLoader(session_factory, schema=cfg.schema)
-        return loader.load_for_scenario(scenario_id=scenario_id or request.scenario.scenario_id, market=request.scenario.market, start_date=request.scenario.start_date, end_date=request.scenario.end_date, symbols=request.scenario.symbols, strategy_mode=strategy_mode, research_spec=request.config.research_spec, metadata=request.config.metadata)
+        return loader.load_for_scenario(scenario_id=scenario_id or request.scenario.scenario_id, market=request.scenario.market, start_date=request.scenario.start_date, end_date=request.scenario.end_date, symbols=request.scenario.symbols, strategy_mode=strategy_mode, research_spec=request.config.research_spec, metadata=request.config.metadata, progress_callback=progress_callback)
     if not data_path:
         raise ValueError("data_path is required when data_source=json")
     return JsonHistoricalDataLoader().load(data_path)
@@ -187,6 +347,116 @@ def _date_str(value) -> str | None:
 
 def _candidate_decision_date(candidate) -> str | None:
     return _date_str(candidate.reference_date) or _date_str(candidate.anchor_date)
+
+
+def _emit_progress(progress_callback, payload: dict[str, Any]) -> None:
+    if progress_callback:
+        progress_callback(payload)
+
+
+def _support_metadata_observed(raw_diagnostics: dict[str, Any] | None, signal_panel_payload: Any) -> dict[str, Any]:
+    pipeline = dict(((raw_diagnostics or {}).get("pipeline") or {}))
+    ev_config = dict(pipeline.get("ev_config") or {})
+    observed = {
+        "top_k": pipeline.get("top_k"),
+        "kernel_temperature": ev_config.get("kernel_temperature"),
+        "use_kernel_weighting": ev_config.get("use_kernel_weighting"),
+        "min_effective_sample_size": ev_config.get("min_effective_sample_size"),
+        "diagnostic_disable_ess_gate": ev_config.get("diagnostic_disable_ess_gate"),
+    }
+    gate_values = {
+        bool(((row.get("decision_surface") or {}).get("gate_ablation") or {}).get("diagnostic_disable_ess_gate"))
+        for row in list(signal_panel_payload or [])
+        if isinstance(row, dict)
+    }
+    if gate_values:
+        observed["diagnostic_disable_ess_gate_rows"] = sorted(gate_values)
+    return observed
+
+
+def _authoritative_summary_payload(
+    *,
+    request: RunnerRequest,
+    raw_diagnostics: dict[str, Any] | None,
+    signal_panel_payload: Any,
+    selected_symbols: list[dict[str, Any]],
+    plans: list[Any],
+    fills: list[Any],
+    reproducibility: dict[str, Any],
+    forecast_panel_artifact: dict[str, Any],
+    result_path: str | None,
+) -> dict[str, Any]:
+    panel = list(signal_panel_payload or [])
+    abstain: dict[str, int] = {}
+    buy_pass_count = 0
+    sell_pass_count = 0
+    n_eff_histogram: dict[str, int] = {}
+    top1_weight_histogram: dict[str, int] = {}
+    forecast_selected_count = 0
+    forecast_selected_dates: set[str] = set()
+    for row in panel:
+        ds = row.get("decision_surface") or {}
+        chosen_side = str(ds.get("chosen_side") or "ABSTAIN")
+        if not bool(ds.get("abstain", False)) and chosen_side != "ABSTAIN":
+            forecast_selected_count += 1
+            if row.get("decision_date"):
+                forecast_selected_dates.add(str(row.get("decision_date")))
+        for reason in ds.get("abstain_reasons") or []:
+            abstain[str(reason)] = abstain.get(str(reason), 0) + 1
+        buy_reasons = (((row.get("ev") or {}).get("buy") or {}).get("abstain_reasons") or [])
+        sell_reasons = (((row.get("ev") or {}).get("sell") or {}).get("abstain_reasons") or [])
+        if not buy_reasons:
+            buy_pass_count += 1
+        if not sell_reasons:
+            sell_pass_count += 1
+        for side_key in ("buy", "sell"):
+            n_eff = (((row.get("scorer_diagnostics") or {}).get(side_key) or {}).get("n_eff"))
+            if n_eff is not None:
+                bucket = f"{float(n_eff):.1f}"
+                n_eff_histogram[bucket] = n_eff_histogram.get(bucket, 0) + 1
+        for side_key in ("long", "short"):
+            matches = (((row.get("top_matches") or {}).get(side_key)) or [])
+            if matches:
+                weight = float((matches[0] or {}).get("weight", 0.0) or 0.0)
+                bucket = f"{weight:.1f}"
+                top1_weight_histogram[bucket] = top1_weight_histogram.get(bucket, 0) + 1
+    filled = [f for f in fills if str((f.get("fill_status") or "")).upper() in {"FULL", "PARTIAL"}]
+    candidate_dates = sorted({str(item.get("decision_date")) for item in selected_symbols if item.get("decision_date")})
+    return {
+        "scenario_id": request.scenario.scenario_id,
+        "window": {"start_date": request.scenario.start_date, "end_date": request.scenario.end_date},
+        "symbols": list(request.scenario.symbols),
+        "metadata": dict(request.config.metadata or {}),
+        "authoritative": bool(reproducibility.get("authoritative", False)),
+        "branch": reproducibility.get("branch"),
+        "head_commit": reproducibility.get("head_commit"),
+        "dirty_worktree": reproducibility.get("dirty_worktree"),
+        "changed_tracked_files": reproducibility.get("changed_tracked_files", []),
+        "diff_fingerprint": reproducibility.get("diff_fingerprint"),
+        "forecast_selected_count": forecast_selected_count,
+        "forecast_selected_dates": sorted(forecast_selected_dates),
+        "forecast_viable": forecast_selected_count > 0,
+        "candidate_count": len(selected_symbols),
+        "candidate_dates": candidate_dates,
+        "buy_pass_count": buy_pass_count,
+        "sell_pass_count": sell_pass_count,
+        "n_eff_histogram": dict(sorted(n_eff_histogram.items())),
+        "top1_weight_histogram": dict(sorted(top1_weight_histogram.items())),
+        "abstain_reason_histogram": dict(sorted(abstain.items())),
+        "fills_count": len(filled),
+        "trades_count": len(plans),
+        "deploy_viable": len(filled) > 0 and len(plans) > 0,
+        "forecast_panel": dict(forecast_panel_artifact or {}),
+        "result_path": result_path,
+        "support_metadata_observed": _support_metadata_observed(raw_diagnostics, signal_panel_payload),
+    }
+
+
+def _write_authoritative_summary_artifact(*, output_dir: str, payload: dict[str, Any]) -> str:
+    path = Path(output_dir) / "authoritative_summary.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    return str(path)
 
 
 def _candidate_groups(candidates, *, start_date: str, end_date: str):
@@ -343,16 +613,17 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
     if candidate_reuse_payload is not None:
         historical = _history_from_reuse_payload(candidate_reuse_payload)
     else:
-        historical = load_historical(request, data_path, data_source, scenario_id, strategy_mode)
+        historical = load_historical(request, data_path, data_source, scenario_id, strategy_mode, progress_callback=progress_callback)
     historical_metadata = getattr(historical, "metadata", {}) or {}
     if progress_callback:
         macro_history = historical_metadata.get("macro_history_by_date", {}) or {}
+        macro_series_history = historical_metadata.get("macro_series_history", []) or []
         sector_map = historical_metadata.get("sector_map", {}) or {}
         progress_callback({
             "phase": "load_historical",
             "status": "running",
             "loaded_ohlcv_rows": sum(len(bars) for bars in (historical.bars_by_symbol or {}).values()),
-            "loaded_macro_rows": sum(len(row or {}) for row in macro_history.values()),
+            "loaded_macro_rows": len(macro_series_history) or sum(len(row or {}) for row in macro_history.values()),
             "loaded_sector_rows": len(sector_map),
         })
     load_timer(f"symbols={len(request.scenario.symbols)} reuse={candidate_reuse_payload is not None}")
@@ -387,14 +658,16 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
     skipped = execution["skipped"]
     selected_symbols = execution["selected_symbols"]
     portfolio_decisions_all = execution["portfolio_decisions_all"]
+    portfolio_paths = _portfolio_paths(date_artifacts)
     summary = build_summary(scenario_id=request.scenario.scenario_id, plans=plans, fills=fills, bars_by_symbol=historical.bars_by_symbol, date_artifacts=date_artifacts)
-    historical_context = {"bars_by_symbol": historical.bars_by_symbol, "macro_history_by_date": historical_metadata.get("macro_history_by_date", {}), "sector_map": historical_metadata.get("sector_map", {}), "trading_dates": trading_dates}
+    historical_context = {"bars_by_symbol": historical.bars_by_symbol, "macro_history_by_date": historical_metadata.get("macro_history_by_date", {}), "macro_series_history": historical_metadata.get("macro_series_history", []), "sector_map": historical_metadata.get("sector_map", {}), "session_metadata_by_symbol": historical_metadata.get("session_metadata_by_symbol") or getattr(historical, "session_metadata_by_symbol", {}) or {}, "trading_dates": trading_dates}
     historical_metadata["bars_by_symbol"] = historical.bars_by_symbol
     historical_metadata["historical_context"] = historical_context
     manifest = ensure_manifest(request=request, data_source=data_source, historical_metadata=historical_metadata)
     raw_diagnostics = historical_metadata.get("diagnostics", {})
     diagnostics_payload = _diagnostics_lite_view(raw_diagnostics, grouped_candidates=grouped_candidates, warmup_candidates=warmup_candidates, trading_dates=trading_dates, plans=plans, fills=fills) if diagnostics_lite else raw_diagnostics
     signal_panel_payload = historical_metadata.get("signal_panel_artifact", [])
+    forecast_panel_artifact = {"row_count": len(_forecast_rows(signal_panel_payload))}
     if diagnostics_lite:
         signal_panel_payload = {
             "row_count": len(signal_panel_payload),
@@ -408,35 +681,92 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
         "historical_context": historical_context,
         "bars_by_symbol": historical_context["bars_by_symbol"],
         "macro_history_by_date": historical_context["macro_history_by_date"],
+        "macro_series_history": historical_context["macro_series_history"],
         "sector_map": historical_context["sector_map"],
+        "session_metadata_by_symbol": historical_context["session_metadata_by_symbol"],
         "trading_dates": historical_context["trading_dates"],
-        "portfolio": {"selected_symbols": selected_symbols, "decisions": [{"symbol": d.candidate.symbol, "selected": d.selected, "side": d.side.value, "size_multiplier": d.size_multiplier, "requested_budget": d.requested_budget, "expected_horizon_days": d.expected_horizon_days, "kill_reason": d.kill_reason, "diagnostics": d.diagnostics, "decision_date": _candidate_decision_date(d.candidate)} for d in portfolio_decisions_all], "date_artifacts": date_artifacts},
+        "portfolio": {"selected_symbols": selected_symbols, "decisions": [{"symbol": d.candidate.symbol, "selected": d.selected, "side": d.side.value, "size_multiplier": d.size_multiplier, "requested_budget": d.requested_budget, "expected_horizon_days": d.expected_horizon_days, "kill_reason": d.kill_reason, "diagnostics": d.diagnostics, "decision_date": _candidate_decision_date(d.candidate)} for d in portfolio_decisions_all], "date_artifacts": date_artifacts, **portfolio_paths},
         "plans": [p.to_dict() for p in plans],
         "fills": [f.to_dict() for f in fills],
         "diagnostics": diagnostics_payload,
-        "artifacts": {"signal_panel": signal_panel_payload, "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates], "historical_context": historical_context, "candidate_reuse": _policy_reuse_payload(historical=historical, grouped_candidates=grouped_candidates, warmup_candidates=warmup_candidates, trading_dates=trading_dates)},
+        "artifacts": {"signal_panel": signal_panel_payload, "forecast_panel": forecast_panel_artifact, "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates], "historical_context": historical_context, "candidate_reuse": _policy_reuse_payload(historical=historical, grouped_candidates=grouped_candidates, warmup_candidates=warmup_candidates, trading_dates=trading_dates)},
     }
     validation_folds = run_fold_validation(request=request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, runner_fn=run_backtest, mode="walk_forward", max_folds=validation_max_folds, summary_only=validation_summary_only, diagnostics_lite=diagnostics_lite, emit_timing_logs=emit_timing_logs, bootstrap_result=bootstrap_validation_result) if strategy_mode == "research_similarity_v2" and enable_validation else {"mode": "disabled", "folds": [], "aggregate": {}, "rejection_reasons": [], "train_artifacts": [], "test_artifacts": []}
     validation_bootstrap_timer(f"folds={len(validation_folds.get('folds') or [])}")
     reproducibility = _reproducibility_payload(request=request, manifest=manifest, raw_diagnostics=raw_diagnostics, signal_panel_payload=signal_panel_payload, validation_folds=validation_folds)
     sensitivity = [p.__dict__ for p in sensitivity_sweep(plans=plans, fills=fills, fee_grid=[0.0, request.config.fee_bps, request.config.fee_bps + 5.0], slippage_grid=[0.0, request.config.slippage_bps, request.config.slippage_bps + 5.0], total_symbols=len(request.scenario.symbols), bars_by_symbol=historical.bars_by_symbol)]
     quote_policy_sweep = {"ev_threshold": [0.003, quote_policy_cfg.ev_threshold, 0.010], "min_fill_probability": [0.05, quote_policy_cfg.min_fill_probability, 0.20], "uncertainty_caps": [0.08, quote_policy_cfg.uncertainty_cap, 0.16]}
-    result = {"scenario": request.scenario.scenario_id, "strategy_mode": strategy_mode, "manifest": manifest.to_dict(), "historical_context": historical_context, "bars_by_symbol": historical_context["bars_by_symbol"], "macro_history_by_date": historical_context["macro_history_by_date"], "sector_map": historical_context["sector_map"], "trading_dates": historical_context["trading_dates"], "portfolio": {"selected_symbols": selected_symbols, "decisions": [{"symbol": d.candidate.symbol, "selected": d.selected, "side": d.side.value, "size_multiplier": d.size_multiplier, "requested_budget": d.requested_budget, "expected_horizon_days": d.expected_horizon_days, "kill_reason": d.kill_reason, "diagnostics": d.diagnostics, "decision_date": _candidate_decision_date(d.candidate)} for d in portfolio_decisions_all], "date_artifacts": date_artifacts}, "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "summary": summary.__dict__, "diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "artifacts": {"signal_panel": signal_panel_payload, "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates], "historical_context": historical_context, "candidate_reuse": _policy_reuse_payload(historical=historical, grouped_candidates=grouped_candidates, warmup_candidates=warmup_candidates, trading_dates=trading_dates), "reproducibility": reproducibility}, "validation": {"fold_engine": validation_folds, "sensitivity_sweep": sensitivity, "quote_policy_sweep": quote_policy_sweep, "coverage": summary.metadata.get("coverage", 0.0), "no_trade_ratio": summary.metadata.get("no_trade_ratio", 0.0)}, "skipped": skipped}
+    result = {"scenario": request.scenario.scenario_id, "strategy_mode": strategy_mode, "manifest": manifest.to_dict(), "historical_context": historical_context, "bars_by_symbol": historical_context["bars_by_symbol"], "macro_history_by_date": historical_context["macro_history_by_date"], "macro_series_history": historical_context["macro_series_history"], "sector_map": historical_context["sector_map"], "session_metadata_by_symbol": historical_context["session_metadata_by_symbol"], "trading_dates": historical_context["trading_dates"], "portfolio": {"selected_symbols": selected_symbols, "decisions": [{"symbol": d.candidate.symbol, "selected": d.selected, "side": d.side.value, "size_multiplier": d.size_multiplier, "requested_budget": d.requested_budget, "expected_horizon_days": d.expected_horizon_days, "kill_reason": d.kill_reason, "diagnostics": d.diagnostics, "decision_date": _candidate_decision_date(d.candidate)} for d in portfolio_decisions_all], "date_artifacts": date_artifacts, **portfolio_paths}, "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "summary": summary.__dict__, "diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "artifacts": {"signal_panel": signal_panel_payload, "forecast_panel": forecast_panel_artifact, "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates], "historical_context": historical_context, "candidate_reuse": _policy_reuse_payload(historical=historical, grouped_candidates=grouped_candidates, warmup_candidates=warmup_candidates, trading_dates=trading_dates), "reproducibility": reproducibility}, "validation": {"fold_engine": validation_folds, "sensitivity_sweep": sensitivity, "quote_policy_sweep": quote_policy_sweep, "coverage": summary.metadata.get("coverage", 0.0), "no_trade_ratio": summary.metadata.get("no_trade_ratio", 0.0)}, "skipped": skipped, "authoritative": reproducibility.get("authoritative")}
     if sql_db_url:
         snapshot_info = {"data_source": data_source, "strategy_mode": strategy_mode, "historical_metadata": historical_metadata, "date_artifacts": date_artifacts, "reproducibility": reproducibility}
         result["sql_run_id"] = SqlResultStore(sql_db_url, namespace="research").save_run(run_key=manifest.manifest_id(), scenario_id=request.scenario.scenario_id, strategy_id=request.scenario.strategy_id, strategy_mode=strategy_mode, market=request.scenario.market, data_source=data_source, config_version=request.scenario.strategy_version, label_version=str(request.config.metadata.get("label_version", "v1")), vector_version=str(request.config.metadata.get("vector_version", strategy_mode)), initial_capital=request.config.initial_capital, params={"scenario_params": request.scenario.params, "scenario_notes": request.scenario.notes, "config_metadata": request.config.metadata}, summary=summary.__dict__, diagnostics={**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, plans=plans, fills=fills, snapshot_info=snapshot_info, manifest=manifest.to_dict())
     if output_dir and save_json:
-        if progress_callback:
-            progress_callback({"phase": "write_artifacts", "status": "running", "total_trading_dates": len(trading_dates), "completed_trading_dates": len(trading_dates)})
+        authoritative_summary = _authoritative_summary_payload(
+            request=request,
+            raw_diagnostics=raw_diagnostics,
+            signal_panel_payload=signal_panel_payload,
+            selected_symbols=selected_symbols,
+            plans=result["plans"],
+            fills=result["fills"],
+            reproducibility=reproducibility,
+            forecast_panel_artifact=forecast_panel_artifact,
+            result_path=None,
+        )
+        authoritative_summary_path = _write_authoritative_summary_artifact(output_dir=output_dir, payload=authoritative_summary)
+        _emit_progress(progress_callback, {
+            "phase": "write_artifacts",
+            "status": "running",
+            "artifact_name": "authoritative_summary_prewrite",
+            "artifact_index": 1,
+            "artifact_total": 5,
+            "artifact_bytes": Path(authoritative_summary_path).stat().st_size if Path(authoritative_summary_path).exists() else 0,
+            "bytes_written": Path(authoritative_summary_path).stat().st_size if Path(authoritative_summary_path).exists() else 0,
+            "authoritative_summary_path": authoritative_summary_path,
+            "candidate_rows": len(historical.candidates or []),
+            "plans_count": len(plans),
+            "fills_count": len(fills),
+            "total_trading_dates": len(trading_dates),
+            "completed_trading_dates": len(trading_dates),
+        })
         write_timer = _stage_timer(emit_timing_logs, "write_artifacts")
+        forecast_panel_artifact = _write_forecast_panel_artifacts(
+            output_dir=output_dir,
+            run_id=manifest.manifest_id(),
+            signal_panel_payload=signal_panel_payload,
+            progress_callback=progress_callback,
+            total_trading_dates=len(trading_dates),
+            completed_trading_dates=len(trading_dates),
+            candidate_rows=len(historical.candidates or []),
+            plans_count=len(plans),
+            fills_count=len(fills),
+        )
+        result["artifacts"]["forecast_panel"] = forecast_panel_artifact
+        authoritative_summary["forecast_panel"] = forecast_panel_artifact
+        authoritative_summary_path = _write_authoritative_summary_artifact(output_dir=output_dir, payload=authoritative_summary)
         result["result_path"] = JsonResultStore(output_dir, namespace="research").save_run(run_id=manifest.manifest_id(), plans=plans, fills=fills, summary={**summary.__dict__, "diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "strategy_mode": strategy_mode}, diagnostics={"quote_policy_sweep": quote_policy_sweep, "portfolio": result["portfolio"], "signal_diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "reproducibility": reproducibility}, manifest=manifest.to_dict())
+        authoritative_summary["result_path"] = result.get("result_path")
+        authoritative_summary_path = _write_authoritative_summary_artifact(output_dir=output_dir, payload=authoritative_summary)
         write_timer(result.get("result_path") or "")
-        if progress_callback:
-            try:
-                bytes_written = Path(str(result.get("result_path"))).stat().st_size if result.get("result_path") else 0
-            except Exception:
-                bytes_written = 0
-            progress_callback({"phase": "write_artifacts", "status": "running", "total_trading_dates": len(trading_dates), "completed_trading_dates": len(trading_dates), "plans_count": len(plans), "fills_count": len(fills), "candidate_rows": len(historical.candidates or []), "bytes_written": bytes_written, "result_path": result.get("result_path")})
+        try:
+            result_bytes = Path(str(result.get("result_path"))).stat().st_size if result.get("result_path") else 0
+        except Exception:
+            result_bytes = 0
+        _emit_progress(progress_callback, {
+            "phase": "write_artifacts",
+            "status": "running",
+            "artifact_name": "result_json",
+            "artifact_index": 5,
+            "artifact_total": 5,
+            "artifact_bytes": result_bytes,
+            "bytes_written": result_bytes + (Path(authoritative_summary_path).stat().st_size if Path(authoritative_summary_path).exists() else 0),
+            "candidate_rows": len(historical.candidates or []),
+            "plans_count": len(plans),
+            "fills_count": len(fills),
+            "total_trading_dates": len(trading_dates),
+            "completed_trading_dates": len(trading_dates),
+            "result_path": result.get("result_path"),
+            "authoritative_summary_path": authoritative_summary_path,
+        })
     if progress_callback:
         progress_callback({"phase": "complete", "status": "ok", "total_trading_dates": len(trading_dates), "completed_trading_dates": len(trading_dates), "plans_count": len(plans), "fills_count": len(fills), "candidate_rows": len(historical.candidates or []), "result_path": result.get("result_path")})
     total_timer(f"plans={len(plans)} fills={len(fills)}")

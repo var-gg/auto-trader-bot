@@ -71,6 +71,8 @@ def test_generate_similarity_candidates_rolling_uses_next_open_as_current_price(
         idx = next(i for i, b in enumerate(bars) if str(b.timestamp)[:10] == decision_date)
         assert c.current_price == bars[idx + 1].open
         assert execution_date == str(bars[idx + 1].timestamp)[:10]
+        assert hasattr(c.anchor_date, "isoformat")
+        assert hasattr(c.reference_date, "isoformat")
 
 
 def test_generate_similarity_candidates_rolling_surfaces_debug_funnel_and_spec_horizons():

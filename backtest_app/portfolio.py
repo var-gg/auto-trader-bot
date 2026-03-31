@@ -114,7 +114,7 @@ def build_portfolio_decisions(*, candidates: Sequence[SignalCandidate], initial_
         if cand.symbol in state.open_positions:
             kill_reason = "already_open"
         elif policy.no_trade:
-            kill_reason = "quote_policy_no_trade"
+            kill_reason = str(policy.diagnostics.get("kill_reason_hint") or "quote_policy_no_trade")
         elif ev < cfg.min_ev_threshold:
             kill_reason = "below_ev_threshold"
         elif sector_counts.get(sector, 0) >= cfg.max_sector_positions:

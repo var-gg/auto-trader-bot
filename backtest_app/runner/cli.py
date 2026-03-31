@@ -157,7 +157,7 @@ def main() -> int:
         if args.data_source == "local-db" and args.strategy_mode == "legacy_event_window" and "No bt_event_window rows found for scenario_id=" in message:
             _raise_missing_legacy_snapshot(args)
         raise
-    payload = json.dumps(result, ensure_ascii=False, indent=2)
+    payload = json.dumps(result, ensure_ascii=False, indent=2, default=str)
     if request.output_path:
         Path(request.output_path).write_text(payload, encoding="utf-8")
     else:
