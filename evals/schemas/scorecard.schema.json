@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-trader-bot.local/schemas/scorecard.schema.json",
+  "title": "Scorecard",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "lane",
+    "outcome",
+    "tests_run",
+    "artifacts",
+    "next_gate"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lane": {
+      "type": "string",
+      "enum": [
+        "live-cutover",
+        "shadow-replay",
+        "research-discovery",
+        "promotion"
+      ]
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "blocked",
+        "inconclusive"
+      ]
+    },
+    "tests_run": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "path"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "next_gate": {
+      "type": "string",
+      "minLength": 1
+    },
+    "strategy_version": {
+      "type": "string"
+    },
+    "feature_version": {
+      "type": "string"
+    },
+    "decision_engine_version": {
+      "type": "string"
+    },
+    "parameter_hash": {
+      "type": "string"
+    },
+    "seed": {
+      "oneOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        }
+      ]
+    },
+    "replay_anchor_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+-r requirements-live.txt
+-r requirements-backtest.txt
+
+pytest==8.4.2
+pytest-asyncio==1.2.0
+pytest-xdist==3.8.0
+pytest-timeout==2.4.0
+pytest-rerunfailures==16.1
+jsonschema==4.25.1
+deepdiff==8.6.1

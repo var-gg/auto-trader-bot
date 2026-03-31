@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-trader-bot.local/schemas/failure_attribution.schema.json",
+  "title": "Failure Attribution",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "lane",
+    "failure_class",
+    "summary",
+    "evidence_refs",
+    "rerun_policy",
+    "remaining_risk",
+    "next_smallest_step"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lane": {
+      "type": "string",
+      "enum": [
+        "live-cutover",
+        "shadow-replay",
+        "research-discovery",
+        "promotion"
+      ]
+    },
+    "failure_class": {
+      "type": "string",
+      "enum": [
+        "product_regression",
+        "harness_bug",
+        "environment_issue",
+        "evidence_gap",
+        "task_spec_gap"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "rerun_policy": {
+      "type": "string",
+      "enum": [
+        "do_not_rerun_until_code_or_config_changes",
+        "fix_harness_then_rerun",
+        "fix_environment_then_rerun",
+        "collect_evidence_then_rerun",
+        "clarify_task_then_rerun"
+      ]
+    },
+    "remaining_risk": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "next_smallest_step": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

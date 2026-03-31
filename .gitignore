@@ -43,7 +43,6 @@ runs/
 
 # Local/editor/workbench files
 .vscode/
-AGENTS.md
 blog/
 prompt_sample/
 app's features/
