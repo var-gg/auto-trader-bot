@@ -336,7 +336,22 @@ def load_historical(request: RunnerRequest, data_path: str | None, data_source: 
         guard_backtest_local_only(cfg.url)
         session_factory = create_backtest_session_factory(cfg)
         loader = LocalPostgresLoader(session_factory, schema=cfg.schema)
-        return loader.load_for_scenario(scenario_id=scenario_id or request.scenario.scenario_id, market=request.scenario.market, start_date=request.scenario.start_date, end_date=request.scenario.end_date, symbols=request.scenario.symbols, strategy_mode=strategy_mode, research_spec=request.config.research_spec, metadata=request.config.metadata, progress_callback=progress_callback)
+        kwargs = {
+            "scenario_id": scenario_id or request.scenario.scenario_id,
+            "market": request.scenario.market,
+            "start_date": request.scenario.start_date,
+            "end_date": request.scenario.end_date,
+            "symbols": request.scenario.symbols,
+            "strategy_mode": strategy_mode,
+            "research_spec": request.config.research_spec,
+            "metadata": request.config.metadata,
+        }
+        try:
+            return loader.load_for_scenario(**kwargs, progress_callback=progress_callback)
+        except TypeError as exc:
+            if "progress_callback" not in str(exc):
+                raise
+            return loader.load_for_scenario(**kwargs)
     if not data_path:
         raise ValueError("data_path is required when data_source=json")
     return JsonHistoricalDataLoader().load(data_path)
