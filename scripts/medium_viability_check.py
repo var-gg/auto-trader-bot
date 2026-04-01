@@ -55,6 +55,7 @@ MONITOR_INTERVAL_SECONDS = 2.0
 CPU_HIGH_DELTA_SECONDS = 0.5
 PHASE_TIMEOUT_SECONDS = {
     "load_historical": 45 * 60,
+    "candidate_generation": 4 * 60 * 60,
     "candidate_grouping": 4 * 60 * 60,
     "daily_execution": 10 * 60,
     "summary_and_validation": 60 * 60,
@@ -570,7 +571,7 @@ def _monitor_child(run_dir: Path, proc: subprocess.Popen[str]) -> dict[str, Any]
                     last_cpu_total = cpu_total
                     last_metrics = {"cpu_delta": cpu_delta, "rss": int(p.memory_info().rss), "cwd": p.cwd(), "cmdline": p.cmdline()}
                     monitor.update(last_metrics)
-                    if phase in {"load_historical", "candidate_grouping"} and cpu_delta is not None and cpu_delta > 0:
+                    if phase in {"load_historical", "candidate_generation", "candidate_grouping"} and cpu_delta is not None and cpu_delta > 0:
                         monitor["activity"] = "ACTIVE_COMPUTE"
             except Exception:
                 monitor.update(last_metrics)
