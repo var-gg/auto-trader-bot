@@ -38,6 +38,8 @@ def test_generate_similarity_candidates_rolling_builds_panel_without_future_libr
     assert diagnostics["signal_panel_jsonl"]
     assert diagnostics["cache_keys"]["library_cache_keys"]
     assert diagnostics["event_records"]
+    assert diagnostics["prototype_compression_batches"]
+    assert diagnostics["prototype_compression_audit"]["batch_count"] >= 1
     populated_batches = [batch["records"] for batch in diagnostics["event_records"] if batch["records"]]
     assert populated_batches
     first_batch = populated_batches[0]
@@ -102,6 +104,12 @@ def test_generate_similarity_candidates_rolling_surfaces_debug_funnel_and_spec_h
     assert "sell" in row["scorer_diagnostics"]
     assert "fallback_raw_ev" in row["scorer_diagnostics"]["buy"]
     assert "top_matches_summary" in row["scorer_diagnostics"]["buy"]
+    assert "member_top_matches_summary" in row["scorer_diagnostics"]["buy"]
+    assert "top1_weight_share" in row["scorer_diagnostics"]["buy"]
+    assert "consensus_signature" in row["scorer_diagnostics"]["buy"]
+    assert "mixture_ess" in row["scorer_diagnostics"]["buy"]
+    assert "member_mixture_ess" in row["scorer_diagnostics"]["buy"]
+    assert "q50_d2_return" in row["scorer_diagnostics"]["buy"]
     assert isinstance(diagnostics["artifacts"]["excluded_reasons_histogram"], dict)
 
 

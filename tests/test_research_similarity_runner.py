@@ -1,4 +1,5 @@
 import csv
+import json
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -52,7 +53,7 @@ class FakeRollingDateLoader:
                 "MSFT": SymbolSessionMetadata(symbol="MSFT", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
                 "XOM": SymbolSessionMetadata(symbol="XOM", exchange_code="NYQ", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
             },
-            metadata={"diagnostics": {}, "signal_panel_artifact": [{"decision_date": "2026-01-01", "symbol": "AAPL", "query": {"exchange_code": "NMS", "exchange_tz": "America/New_York", "session_date_local": "2026-01-01", "session_close_ts_utc": "2026-01-01T21:00:00+00:00", "feature_anchor_ts_utc": "2026-01-01T21:00:00+00:00", "macro_asof_ts_utc": "2026-01-01T21:00:00+00:00", "macro_freshness_summary": {"vix": {"is_stale_flag": False}}}, "decision_surface": {"chosen_side": "BUY", "abstain": False, "abstain_reasons": [], "chosen_lower_bound": 0.01, "chosen_interval_width": 0.03}, "scorer_diagnostics": {"buy": {"expected_net_return": 0.05, "q10": 0.01, "q50": 0.03, "q90": 0.08, "expected_mae": 0.01, "expected_mfe": 0.04, "n_eff": 3.0, "uncertainty": 0.02, "top_matches_summary": []}, "sell": {"expected_net_return": -0.01, "q10": -0.04, "q50": -0.01, "q90": 0.01, "expected_mae": 0.02, "expected_mfe": 0.01, "n_eff": 2.0, "uncertainty": 0.03, "top_matches_summary": []}}, "ev": {"buy": {"regime_alignment": 1.0, "abstain_reasons": []}, "sell": {"regime_alignment": 0.0, "abstain_reasons": ["low_ev"]}}, "missingness": {"zero_imputed_feature_count": 0}}], "session_metadata_by_symbol": {"AAPL": {"exchange_code": "NMS"}, "MSFT": {"exchange_code": "NMS"}, "XOM": {"exchange_code": "NYQ"}}},
+            metadata={"diagnostics": {"prototype_compression_audit": {"batch_count": 1, "event_record_count_total": 24, "prototype_count_total": 8, "compression_ratio_mean": 3.0, "compression_ratio_max": 3.0, "table_rows": [{"as_of_date": "2026-01-01", "event_record_count": 24, "prototype_count": 8, "compression_ratio": 3.0}]}}, "signal_panel_artifact": [{"decision_date": "2026-01-01", "symbol": "AAPL", "query": {"regime_code": "RISK_ON", "sector_code": "TECH", "exchange_code": "NMS", "exchange_tz": "America/New_York", "session_date_local": "2026-01-01", "session_close_ts_utc": "2026-01-01T21:00:00+00:00", "feature_anchor_ts_utc": "2026-01-01T21:00:00+00:00", "macro_asof_ts_utc": "2026-01-01T21:00:00+00:00", "macro_freshness_summary": {"vix": {"is_stale_flag": False}}}, "decision_surface": {"chosen_side": "BUY", "abstain": False, "abstain_reasons": [], "chosen_lower_bound": 0.01, "chosen_interval_width": 0.03}, "scorer_diagnostics": {"buy": {"expected_net_return": 0.05, "q10": 0.01, "q50": 0.03, "q90": 0.08, "q50_d2_return": 0.02, "q50_d3_return": 0.025, "p_resolved_by_d2": 0.4, "p_resolved_by_d3": 0.7, "expected_mae": 0.01, "expected_mfe": 0.04, "n_eff": 3.0, "uncertainty": 0.02, "prototype_pool_size": 4, "ranked_candidate_count": 6, "positive_weight_candidate_count": 3, "pre_truncation_candidate_count": 5, "top1_weight_share": 0.55, "cumulative_weight_top3": 0.92, "mixture_ess": 3.0, "member_support_sum": 12.0, "consensus_signature": "hash-buy-1|hash-buy-2", "member_candidate_count": 7, "member_pre_truncation_count": 6, "positive_weight_member_count": 4, "member_top1_weight_share": 0.41, "member_cumulative_weight_top3": 0.81, "member_mixture_ess": 2.7, "member_consensus_signature": "AAPL:2025-12-20:BUY|MSFT:2025-12-19:BUY", "top_matches_summary": [{"prototype_id": "buy-1", "representative_hash": "hash-buy-1", "support": 12.0, "similarity": 0.25, "weight_share": 0.55}, {"prototype_id": "buy-2", "representative_hash": "hash-buy-2", "support": 8.0, "similarity": 0.19, "weight_share": 0.37}], "member_top_matches_summary": [{"member_key": "AAPL:2025-12-20:BUY", "support": 5.0, "similarity": 0.28, "weight_share": 0.41}, {"member_key": "MSFT:2025-12-19:BUY", "support": 4.0, "similarity": 0.24, "weight_share": 0.27}]}, "sell": {"expected_net_return": -0.01, "q10": -0.04, "q50": -0.01, "q90": 0.01, "q50_d2_return": -0.01, "q50_d3_return": -0.008, "p_resolved_by_d2": 0.3, "p_resolved_by_d3": 0.5, "expected_mae": 0.02, "expected_mfe": 0.01, "n_eff": 2.0, "uncertainty": 0.03, "prototype_pool_size": 4, "ranked_candidate_count": 6, "positive_weight_candidate_count": 2, "pre_truncation_candidate_count": 5, "top1_weight_share": 0.81, "cumulative_weight_top3": 0.94, "mixture_ess": 2.0, "member_support_sum": 7.0, "consensus_signature": "hash-sell-1", "member_candidate_count": 4, "member_pre_truncation_count": 4, "positive_weight_member_count": 2, "member_top1_weight_share": 0.72, "member_cumulative_weight_top3": 0.93, "member_mixture_ess": 1.8, "member_consensus_signature": "AAPL:2025-12-18:SELL", "top_matches_summary": [{"prototype_id": "sell-1", "representative_hash": "hash-sell-1", "support": 7.0, "similarity": 0.12, "weight_share": 0.81}], "member_top_matches_summary": [{"member_key": "AAPL:2025-12-18:SELL", "support": 3.0, "similarity": 0.12, "weight_share": 0.72}]}}, "ev": {"buy": {"regime_alignment": 1.0, "abstain_reasons": []}, "sell": {"regime_alignment": 0.0, "abstain_reasons": ["low_ev"]}}, "missingness": {"zero_imputed_feature_count": 0}}], "session_metadata_by_symbol": {"AAPL": {"exchange_code": "NMS"}, "MSFT": {"exchange_code": "NMS"}, "XOM": {"exchange_code": "NYQ"}}},
         )
 
 
@@ -109,16 +110,48 @@ def test_run_backtest_persists_forecast_panel_sidecars(monkeypatch, tmp_path):
     assert forecast_panel["row_count"] == 1
     assert Path(str(forecast_panel["csv_path"])).exists()
     assert Path(str(forecast_panel["parquet_path"])).exists()
+    assert Path(str(forecast_panel["pre_optuna_packet_path"])).exists()
+    assert Path(str(forecast_panel["pattern_family_table_path"])).exists()
+    assert Path(str(forecast_panel["policy_family_candidates_path"])).exists()
+    assert Path(str(forecast_panel["prototype_compression_audit_path"])).exists()
+    assert Path(str(forecast_panel["prototype_compression_table_path"])).exists()
     assert (output_dir / "authoritative_summary.json").exists()
     with Path(str(forecast_panel["csv_path"])).open(encoding="utf-8", newline="") as handle:
         row = next(csv.DictReader(handle))
+    packet = json.loads(Path(str(forecast_panel["pre_optuna_packet_path"])).read_text(encoding="utf-8"))
+    compression = json.loads(Path(str(forecast_panel["prototype_compression_audit_path"])).read_text(encoding="utf-8"))
     assert row["chosen_side_before_deploy"] == "BUY"
+    assert row["query_regime_code"] == "RISK_ON"
+    assert row["query_sector_code"] == "TECH"
     assert float(row["q10"]) == 0.01
     assert float(row["q50"]) == 0.03
     assert float(row["q90"]) == 0.08
+    assert float(row["q50_d2_return"]) == 0.02
+    assert float(row["q50_d3_return"]) == 0.025
     assert float(row["effective_sample_size"]) == 3.0
     assert float(row["lower_bound"]) == 0.01
     assert float(row["interval_width"]) == 0.03
+    assert row["consensus_signature"] == "AAPL:2025-12-20:BUY|MSFT:2025-12-19:BUY"
+    assert float(row["top1_weight_share"]) == 0.41
+    assert float(row["mixture_ess"]) == 2.7
+    assert float(row["member_mixture_ess"]) == 2.7
+    assert int(row["member_pre_truncation_count"]) == 6
+    assert row["member_consensus_signature"] == "AAPL:2025-12-20:BUY|MSFT:2025-12-19:BUY"
+    assert row["shape_bucket"] == "wide"
+    assert row["policy_family"] == "echo_or_collapse"
+    assert row["optuna_eligible"] == "False"
+    assert json.loads(row["buy_top_matches_summary"])[0]["prototype_id"] == "buy-1"
+    assert json.loads(row["buy_member_top_matches_summary"])[0]["member_key"] == "AAPL:2025-12-20:BUY"
+    assert json.loads(row["sell_top_matches_summary"])[0]["prototype_id"] == "sell-1"
+    assert int(row["buy_top_match_count"]) == 2
+    assert int(row["sell_top_match_count"]) == 1
+    assert float(row["buy_top_match_support_sum"]) == 20.0
+    assert float(row["sell_top_match_support_sum"]) == 7.0
+    assert float(row["buy_top_match_max_similarity"]) == 0.25
+    assert float(row["sell_top_match_max_similarity"]) == 0.12
+    assert compression["compression_ratio_mean"] == 3.0
+    assert packet["verdict"] == "not_ready_no_repeated_patterns"
+    assert result["artifacts"]["pre_optuna"]["packet"]["verdict"] == "not_ready_no_repeated_patterns"
 
 
 def test_cli_main_serializes_non_json_native_result_payloads(monkeypatch, tmp_path):

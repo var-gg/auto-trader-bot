@@ -12,6 +12,10 @@ def test_event_outcome_record_contains_both_side_payloads():
     assert out.schema_version == "event_outcome_v1"
     assert out.side_payload["BUY"]["first_touch_label"] == "UP_FIRST"
     assert "SELL" in out.side_payload
+    assert "close_return_d2_pct" in out.side_payload["BUY"]
+    assert "close_return_d3_pct" in out.side_payload["BUY"]
+    assert "resolved_by_d2" in out.side_payload["BUY"]
+    assert "resolved_by_d3" in out.side_payload["BUY"]
     assert "raw_path_summary" not in out.side_payload["BUY"]
 
 

@@ -29,6 +29,10 @@ class SideOutcome:
     after_cost_return_pct: float
     mae_pct: float
     mfe_pct: float
+    close_return_d2_pct: float = 0.0
+    close_return_d3_pct: float = 0.0
+    resolved_by_d2: bool = False
+    resolved_by_d3: bool = False
     ambiguous: bool = False
     flat: bool = False
     no_trade: bool = False
@@ -97,6 +101,10 @@ def as_side_payload(value: SideOutcome | None) -> dict:
         "after_cost_return_pct": value.after_cost_return_pct,
         "mae_pct": value.mae_pct,
         "mfe_pct": value.mfe_pct,
+        "close_return_d2_pct": value.close_return_d2_pct,
+        "close_return_d3_pct": value.close_return_d3_pct,
+        "resolved_by_d2": value.resolved_by_d2,
+        "resolved_by_d3": value.resolved_by_d3,
         "ambiguous": value.ambiguous,
         "flat": value.flat,
         "no_trade": value.no_trade,
@@ -179,6 +187,13 @@ def build_event_outcome_record(bars: List[HistoricalBar], config: EventLabelingC
     sell_horizon_return = -gross_return
     sell_after_cost = sell_horizon_return - cost_pct
 
+    def _close_return(day_index: int, *, sign: float) -> float:
+        if not window:
+            return 0.0
+        idx = min(max(day_index - 1, 0), len(window) - 1)
+        close = float(window[idx].close)
+        return _safe_pct(sign * (((close / entry) - 1.0) if entry > 0.0 else 0.0))
+
     def side_label(target_hit_day: Optional[int], stop_hit_day: Optional[int], after_cost_return: float, ambiguous: bool, positive_label: str, negative_label: str) -> tuple[str, Optional[int], bool, bool, bool]:
         if ambiguous and target_hit_day is not None and stop_hit_day is not None and target_hit_day == stop_hit_day:
             return "AMBIGUOUS", target_hit_day, True, False, False
@@ -197,8 +212,40 @@ def build_event_outcome_record(bars: List[HistoricalBar], config: EventLabelingC
     buy_label, buy_days, buy_ambiguous, buy_flat, buy_no_trade = side_label(buy_target_hit_day, buy_stop_hit_day, buy_after_cost, path_ambiguous, "UP_FIRST", "DOWN_FIRST")
     sell_label, sell_days, sell_ambiguous, sell_flat, sell_no_trade = side_label(sell_target_hit_day, sell_stop_hit_day, sell_after_cost, path_ambiguous, "UP_FIRST", "DOWN_FIRST")
 
-    buy = SideOutcome(side="BUY", first_touch_label=buy_label, target_hit_day=buy_target_hit_day, stop_hit_day=buy_stop_hit_day, horizon_return_pct=_safe_pct(gross_return), after_cost_return_pct=_safe_pct(buy_after_cost), mae_pct=_safe_pct(buy_mae), mfe_pct=_safe_pct(buy_mfe), ambiguous=buy_ambiguous, flat=buy_flat, no_trade=buy_no_trade)
-    sell = SideOutcome(side="SELL", first_touch_label=sell_label, target_hit_day=sell_target_hit_day, stop_hit_day=sell_stop_hit_day, horizon_return_pct=_safe_pct(sell_horizon_return), after_cost_return_pct=_safe_pct(sell_after_cost), mae_pct=_safe_pct(sell_mae), mfe_pct=_safe_pct(sell_mfe), ambiguous=sell_ambiguous, flat=sell_flat, no_trade=sell_no_trade)
+    buy = SideOutcome(
+        side="BUY",
+        first_touch_label=buy_label,
+        target_hit_day=buy_target_hit_day,
+        stop_hit_day=buy_stop_hit_day,
+        horizon_return_pct=_safe_pct(gross_return),
+        after_cost_return_pct=_safe_pct(buy_after_cost),
+        mae_pct=_safe_pct(buy_mae),
+        mfe_pct=_safe_pct(buy_mfe),
+        close_return_d2_pct=_close_return(2, sign=1.0),
+        close_return_d3_pct=_close_return(3, sign=1.0),
+        resolved_by_d2=bool((buy_target_hit_day and buy_target_hit_day <= 2) or (buy_stop_hit_day and buy_stop_hit_day <= 2)),
+        resolved_by_d3=bool((buy_target_hit_day and buy_target_hit_day <= 3) or (buy_stop_hit_day and buy_stop_hit_day <= 3)),
+        ambiguous=buy_ambiguous,
+        flat=buy_flat,
+        no_trade=buy_no_trade,
+    )
+    sell = SideOutcome(
+        side="SELL",
+        first_touch_label=sell_label,
+        target_hit_day=sell_target_hit_day,
+        stop_hit_day=sell_stop_hit_day,
+        horizon_return_pct=_safe_pct(sell_horizon_return),
+        after_cost_return_pct=_safe_pct(sell_after_cost),
+        mae_pct=_safe_pct(sell_mae),
+        mfe_pct=_safe_pct(sell_mfe),
+        close_return_d2_pct=_close_return(2, sign=-1.0),
+        close_return_d3_pct=_close_return(3, sign=-1.0),
+        resolved_by_d2=bool((sell_target_hit_day and sell_target_hit_day <= 2) or (sell_stop_hit_day and sell_stop_hit_day <= 2)),
+        resolved_by_d3=bool((sell_target_hit_day and sell_target_hit_day <= 3) or (sell_stop_hit_day and sell_stop_hit_day <= 3)),
+        ambiguous=sell_ambiguous,
+        flat=sell_flat,
+        no_trade=sell_no_trade,
+    )
 
     path_label = "AMBIGUOUS" if path_ambiguous else buy_label
     days_to_hit = buy_days

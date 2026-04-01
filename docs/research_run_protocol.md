@@ -72,6 +72,12 @@ Each run directory should contain:
 - `fold_report.json`
 - `decisions.csv` (or parquet if supported)
 - `trades.csv` (or parquet if supported)
+- `forecast_panel.csv` (or parquet if supported)
+- `pre_optuna_packet.json`
+- `pattern_family_table.csv`
+- `policy_family_candidates.csv`
+- `prototype_compression_audit.json`
+- `prototype_compression_table.csv`
 - `diagnostics.json`
 - `report.md`
 
@@ -202,6 +208,54 @@ Use `leaderboard.csv` to answer, in order:
 1. Did policy changes move coverage / no-trade more than expectancy?
 2. Did portfolio changes move trade count and drawdown more than signal quality?
 3. Only after those: did feature changes materially improve holdout behavior?
+
+## Pre-Optuna gate
+
+Do not use `forecast_selected_count` as the Optuna go/no-go gate.
+
+The Optuna-ready question is:
+
+- does the forecast surface contain at least one **repeated pattern family**
+- and does that family map to an **execution policy family** that is not a member-level collapse echo
+
+The runtime now writes a dedicated packet for this:
+
+- `pre_optuna_packet.json`
+- `pattern_family_table.csv`
+- `policy_family_candidates.csv`
+- `prototype_compression_audit.json`
+- `prototype_compression_table.csv`
+
+Default recurring-family rule:
+
+- same `pattern_key`
+- at least `3` distinct decision dates
+- at least `5` anchor rows
+
+The only valid verdicts are:
+
+- `optuna_ready`
+- `not_ready_single_prototype_collapse`
+- `not_ready_no_repeated_patterns`
+- `not_ready_contract_or_environment`
+
+`optuna_ready` means:
+
+- at least one recurring family exists
+- at least one row is marked `optuna_eligible=true`
+- `next_optuna_target_scope` tells you whether to tune `tight_consensus`, `directional_wide`, or both
+
+`not_ready_single_prototype_collapse` now has a stricter meaning:
+
+- the blocker must still be visible at the member-mixture layer
+- not merely because prototype-level telemetry looked concentrated
+- the compression artifacts should tell you whether the raw event pool was already thin or whether prototype compression over-collapsed it
+
+Interpretation rule:
+
+- `prototype_count` small and `event_record_count` also small: the raw historical pool is thin
+- `prototype_count` small but `event_record_count` large: prototype compression is the suspected blocker
+- member telemetry with `member_pre_truncation_count > 1` and `member_mixture_ess > 1` is the minimum sign that Optuna-adjacent policy work is becoming meaningful
 
 ## Recommended change order
 

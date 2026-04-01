@@ -31,7 +31,7 @@ from shared.domain.models import ExecutionVenue, MarketCode, OutcomeLabel, Side,
 from .artifacts import JsonResearchArtifactStore
 from .labeling import EventLabelingConfig, build_event_outcome_record, label_event_window
 from .models import EventOutcomeRecord, ResearchAnchor
-from .prototype import PrototypeConfig, build_state_prototypes_from_event_memory
+from .prototype import PrototypeConfig, aggregate_prototype_compression_batches, build_prototype_compression_audit, build_state_prototypes_from_event_memory
 from .repository import ExactCosineCandidateIndex, load_prototypes_asof
 from .scoring import CalibrationModel, CandidateScore, EVConfig, ScoringConfig, build_decision_surface, estimate_expected_value, score_candidates_exact
 
@@ -714,24 +714,44 @@ def _topk(scores: List[CandidateScore], k: int) -> List[dict]:
 def _side_diag(ev, surface, side: str) -> dict:
     diagnostics = dict(getattr(ev, "diagnostics", {}) or {})
     utility = dict(diagnostics.get("ev_decomposition") or getattr(ev, "utility", {}) or {})
+    telemetry = dict(diagnostics.get("telemetry") or {})
     interval = dict(diagnostics.get("interval") or {
         "q10": getattr(ev, "q10_return", 0.0),
         "q50": getattr(ev, "q50_return", 0.0),
         "q90": getattr(ev, "q90_return", 0.0),
     })
     top_matches = list(getattr(ev, "top_matches", []) or [])
+    member_top_matches = list(diagnostics.get("member_top_matches") or utility.get("member_top_matches") or [])
     support_counts = [float(((m or {}).get("why") or {}).get("support", 0.0) or 0.0) for m in top_matches]
-    summary = []
+    prototype_summary = []
     for match in top_matches[:3]:
         why = dict((match or {}).get("why") or {})
-        summary.append({
+        prototype_summary.append({
             "prototype_id": match.get("prototype_id"),
+            "representative_hash": match.get("representative_hash"),
             "representative_symbol": match.get("representative_symbol"),
             "weight": match.get("weight"),
+            "weight_share": match.get("weight_share"),
             "similarity": why.get("similarity"),
             "support": why.get("support"),
             "expected_return": match.get("expected_return"),
             "uncertainty": match.get("uncertainty"),
+        })
+    member_summary = []
+    for match in member_top_matches[:3]:
+        member_summary.append({
+            "member_key": match.get("member_key"),
+            "prototype_id": match.get("prototype_id"),
+            "representative_hash": match.get("representative_hash"),
+            "symbol": match.get("symbol"),
+            "event_date": match.get("event_date"),
+            "weight": match.get("weight"),
+            "weight_share": match.get("weight_share"),
+            "similarity": match.get("similarity"),
+            "support": match.get("support"),
+            "expected_return": match.get("expected_return"),
+            "q50_d2_return": match.get("q50_d2_return"),
+            "q50_d3_return": match.get("q50_d3_return"),
         })
     return {
         "side": side,
@@ -742,6 +762,10 @@ def _side_diag(ev, surface, side: str) -> dict:
         "q10": interval.get("q10", 0.0),
         "q50": interval.get("q50", 0.0),
         "q90": interval.get("q90", 0.0),
+        "q50_d2_return": utility.get("q50_d2_return", 0.0),
+        "q50_d3_return": utility.get("q50_d3_return", 0.0),
+        "p_resolved_by_d2": utility.get("p_resolved_by_d2", 0.0),
+        "p_resolved_by_d3": utility.get("p_resolved_by_d3", 0.0),
         "uncertainty": getattr(ev, "uncertainty", 0.0),
         "regime_alignment": getattr(ev, "regime_alignment", 0.0),
         "lower_bound": interval.get("q10", 0.0) - float(getattr(ev, "uncertainty", 0.0) or 0.0),
@@ -753,10 +777,28 @@ def _side_diag(ev, surface, side: str) -> dict:
         "p_flat": utility.get("p_flat", 0.0),
         "p_ambiguous": utility.get("p_ambiguous", 0.0),
         "p_no_trade": utility.get("p_no_trade", 0.0),
-        "top_matches_summary": summary,
+        "prototype_pool_size": telemetry.get("prototype_pool_size", (surface.diagnostics.get("prototype_pool_size") if hasattr(surface, "diagnostics") else None)),
+        "ranked_candidate_count": telemetry.get("ranked_candidate_count", 0),
+        "positive_weight_candidate_count": telemetry.get("positive_weight_candidate_count", 0),
+        "pre_truncation_candidate_count": telemetry.get("pre_truncation_candidate_count", 0),
+        "top1_weight_share": telemetry.get("top1_weight_share", 0.0),
+        "cumulative_weight_top3": telemetry.get("cumulative_weight_top3", 0.0),
+        "mixture_ess": telemetry.get("mixture_ess", getattr(ev, "effective_sample_size", 0.0)),
+        "member_support_sum": telemetry.get("member_support_sum", float(sum(support_counts))),
+        "consensus_signature": telemetry.get("consensus_signature", ""),
+        "member_candidate_count": telemetry.get("member_candidate_count", 0),
+        "member_pre_truncation_count": telemetry.get("member_pre_truncation_count", 0),
+        "positive_weight_member_count": telemetry.get("positive_weight_member_count", 0),
+        "member_top1_weight_share": telemetry.get("member_top1_weight_share", 0.0),
+        "member_cumulative_weight_top3": telemetry.get("member_cumulative_weight_top3", 0.0),
+        "member_mixture_ess": telemetry.get("member_mixture_ess", getattr(ev, "effective_sample_size", 0.0)),
+        "member_consensus_signature": telemetry.get("member_consensus_signature", ""),
+        "top_matches_summary": prototype_summary,
+        "member_top_matches_summary": member_summary,
         "side_stats_summary": {
             "match_count": len(top_matches),
             "prototype_ids": [m.get("prototype_id") for m in top_matches[:3]],
+            "representative_hashes": [m.get("representative_hash") for m in top_matches[:3]],
             "representative_symbols": [m.get("representative_symbol") for m in top_matches[:3]],
             "mean_support": (sum(support_counts) / len(support_counts)) if support_counts else 0.0,
             "max_support": max(support_counts) if support_counts else 0.0,
@@ -777,6 +819,10 @@ def _chosen_side_payload(*, surface, buy_side_diag: dict[str, Any], sell_side_di
         "q10_return": chosen_diag.get("q10"),
         "q50_return": chosen_diag.get("q50"),
         "q90_return": chosen_diag.get("q90"),
+        "q50_d2_return": chosen_diag.get("q50_d2_return"),
+        "q50_d3_return": chosen_diag.get("q50_d3_return"),
+        "p_resolved_by_d2": chosen_diag.get("p_resolved_by_d2"),
+        "p_resolved_by_d3": chosen_diag.get("p_resolved_by_d3"),
         "expected_mae": chosen_diag.get("expected_mae"),
         "expected_mfe": chosen_diag.get("expected_mfe"),
         "effective_sample_size": chosen_diag.get("n_eff"),
@@ -785,6 +831,22 @@ def _chosen_side_payload(*, surface, buy_side_diag: dict[str, Any], sell_side_di
         "fill_probability_proxy": chosen_diag.get("p_target"),
         "lower_bound": decision_rule.get("chosen_lower_bound", chosen_diag.get("lower_bound")),
         "interval_width": decision_rule.get("chosen_interval_width", chosen_diag.get("interval_width")),
+        "prototype_pool_size": chosen_diag.get("prototype_pool_size"),
+        "ranked_candidate_count": chosen_diag.get("ranked_candidate_count"),
+        "positive_weight_candidate_count": chosen_diag.get("positive_weight_candidate_count"),
+        "pre_truncation_candidate_count": chosen_diag.get("pre_truncation_candidate_count"),
+        "top1_weight_share": chosen_diag.get("top1_weight_share"),
+        "cumulative_weight_top3": chosen_diag.get("cumulative_weight_top3"),
+        "mixture_ess": chosen_diag.get("mixture_ess"),
+        "member_support_sum": chosen_diag.get("member_support_sum"),
+        "consensus_signature": chosen_diag.get("consensus_signature"),
+        "member_candidate_count": chosen_diag.get("member_candidate_count"),
+        "member_pre_truncation_count": chosen_diag.get("member_pre_truncation_count"),
+        "positive_weight_member_count": chosen_diag.get("positive_weight_member_count"),
+        "member_top1_weight_share": chosen_diag.get("member_top1_weight_share"),
+        "member_cumulative_weight_top3": chosen_diag.get("member_cumulative_weight_top3"),
+        "member_mixture_ess": chosen_diag.get("member_mixture_ess"),
+        "member_consensus_signature": chosen_diag.get("member_consensus_signature"),
         "abstain_reasons": list(getattr(surface, "abstain_reasons", []) or []),
     }
 
@@ -985,8 +1047,9 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
             },
         ))
     prototypes = build_state_prototypes_from_event_memory(event_records=event_records, as_of_date=decision_date, memory_version=spec.memory_version, spec_hash=spec.spec_hash(), config=PrototypeConfig(dedup_similarity_threshold=0.985, memory_version=spec.memory_version)) if event_records else []
+    compression_audit = build_prototype_compression_audit(event_records=event_records, prototypes=prototypes, as_of_date=decision_date)
     coverage = {"event_record_count": len(event_records), "anchor_count": len(anchor_library), "prototype_count": len(prototypes)}
-    return {"spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "as_of_date": decision_date, "coverage": coverage, "excluded_reasons": excluded_reasons, "event_records": event_records, "anchor_library": anchor_library, "prototypes": prototypes, "scaler": scaler, "transform": transform}
+    return {"spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "as_of_date": decision_date, "coverage": coverage, "excluded_reasons": excluded_reasons, "event_records": event_records, "anchor_library": anchor_library, "prototypes": prototypes, "scaler": scaler, "transform": transform, "compression_audit": compression_audit}
 
 
 def _build_query_panel(*, decision_dates: list[str], spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], scaler=None, transform=None, metadata: dict | None = None, session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None, macro_series_history: List[Dict[str, Any]] | None = None):
@@ -1060,7 +1123,7 @@ def run_test_with_frozen_artifacts(*, train_artifact: dict, artifact_store: Json
         for symbol, q in items.items():
             regime_code = _query_regime_code(q["meta"])
             sector_code = sector_map.get(symbol)
-            surface = build_decision_surface(query_embedding=q["embedding"], prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
+            surface = build_decision_surface(query_embedding=q["embedding"], prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration, query_date=decision_date)
             buy_side_diag = _side_diag(surface.buy, surface, Side.BUY.value)
             sell_side_diag = _side_diag(surface.sell, surface, Side.SELL.value)
             chosen_side_payload = _chosen_side_payload(surface=surface, buy_side_diag=buy_side_diag, sell_side_diag=sell_side_diag)
@@ -1108,6 +1171,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
     total_prototype_count = 0
     all_excluded_reasons: list[dict] = []
     event_record_batches: list[dict] = []
+    compression_batches: list[dict] = []
     progress_every = max(1, min(10, len(decision_dates) or 1))
 
     def _emit_progress(decision_dates_done: int, *, force: bool = False) -> None:
@@ -1132,6 +1196,7 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
         memory = build_event_memory_asof(decision_date=decision_date, spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, market=market, lookback_bars=lookback_bars, metadata=metadata, session_metadata_by_symbol=session_metadata_by_symbol, macro_series_history=macro_series_history)
         query_panel, query_excluded = _build_query_panel(decision_dates=[decision_date], spec=spec, bars_by_symbol=bars_by_symbol, macro_history_by_date=macro_history_by_date, sector_map=sector_map, scaler=memory["scaler"], transform=memory["transform"], metadata=metadata, session_metadata_by_symbol=session_metadata_by_symbol, macro_series_history=macro_series_history)
         event_record_batches.append({"decision_date": decision_date, "records": [{"symbol": r.symbol, "event_date": r.event_date, "outcome_end_date": r.outcome_end_date, "side_outcomes": r.side_outcomes} for r in memory["event_records"]]})
+        compression_batches.append(dict(memory.get("compression_audit") or {"as_of_date": decision_date}))
         all_excluded_reasons.extend([{**r, "decision_date": decision_date} for r in memory["excluded_reasons"] + query_excluded])
         total_prototype_count += len(memory["prototypes"])
         prototype_pool = list(memory["prototypes"])
@@ -1143,9 +1208,9 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
             execution_date = str(execution_bar.timestamp)[:10]
             long_scores = score_candidates_exact(query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex(), side=Side.BUY.value)
             short_scores = score_candidates_exact(query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, config=scoring_cfg, candidate_index=ExactCosineCandidateIndex(), side=Side.SELL.value)
-            long_ev = estimate_expected_value(side=Side.BUY.value, query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
-            short_ev = estimate_expected_value(side=Side.SELL.value, query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
-            surface = build_decision_surface(query_embedding=q["embedding"], prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration)
+            long_ev = estimate_expected_value(side=Side.BUY.value, query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration, query_date=decision_date)
+            short_ev = estimate_expected_value(side=Side.SELL.value, query_embedding=q["embedding"], candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration, query_date=decision_date)
+            surface = build_decision_surface(query_embedding=q["embedding"], prototype_pool=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=ev_cfg, candidate_index=ExactCosineCandidateIndex(), calibration=calibration, query_date=decision_date)
             buy_side_diag = _side_diag(long_ev, surface, "BUY")
             sell_side_diag = _side_diag(short_ev, surface, "SELL")
             chosen_side_payload = _chosen_side_payload(surface=surface, buy_side_diag=buy_side_diag, sell_side_diag=sell_side_diag)
@@ -1261,6 +1326,8 @@ def generate_similarity_candidates_rolling(*, bars_by_symbol: Dict[str, List[His
     diagnostics["signal_panel_jsonl"] = "\n".join(str(row) for row in panel_rows)
     diagnostics["cache_keys"] = {"library_cache_keys": [f"{d}:{spec.spec_hash()}" for d in decision_dates]}
     diagnostics["event_records"] = event_record_batches
+    diagnostics["prototype_compression_batches"] = compression_batches
+    diagnostics["prototype_compression_audit"] = aggregate_prototype_compression_batches(compression_batches)
     diagnostics["throughput"] = {"n_symbols": len(bars_by_symbol), "n_decision_dates": len(decision_dates), "prototype_count": total_prototype_count, "wall_clock_seconds": perf_counter() - t0}
     diagnostics["artifacts"] = {"spec": spec.to_dict(), "spec_hash": spec.spec_hash(), "excluded_reasons": all_excluded_reasons, "excluded_reasons_histogram": dict(Counter(r.get("reason", "unknown") for r in all_excluded_reasons))}
     return out, diagnostics

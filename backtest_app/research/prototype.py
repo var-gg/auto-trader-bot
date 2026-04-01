@@ -63,10 +63,34 @@ def _quantile(values: list[float], q: float) -> float:
     return float(np.quantile(np.asarray(values, dtype=float), q))
 
 
+def _distribution_stats(values: list[float]) -> dict:
+    if not values:
+        return {"count": 0, "min": 0.0, "p50": 0.0, "p90": 0.0, "max": 0.0, "mean": 0.0}
+    ordered = sorted(float(v) for v in values)
+    return {
+        "count": len(ordered),
+        "min": float(ordered[0]),
+        "p50": float(np.quantile(np.asarray(ordered, dtype=float), 0.50)),
+        "p90": float(np.quantile(np.asarray(ordered, dtype=float), 0.90)),
+        "max": float(ordered[-1]),
+        "mean": float(sum(ordered) / len(ordered)),
+    }
+
+
+def _categorical_counts(values: Iterable[str | None]) -> dict[str, int]:
+    counts: Dict[str, int] = {}
+    for value in values:
+        key = str(value or "UNKNOWN")
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
 def _state_side_stats(members: list[dict], cfg: PrototypeConfig, *, as_of_date: str | None = None) -> dict:
     returns = [float(m.get("after_cost_return_pct", 0.0) or 0.0) for m in members]
     maes = [abs(float(m.get("mae_pct", 0.0) or 0.0)) for m in members]
     mfes = [float(m.get("mfe_pct", 0.0) or 0.0) for m in members]
+    d2_returns = [float(m.get("close_return_d2_pct", 0.0) or 0.0) for m in members]
+    d3_returns = [float(m.get("close_return_d3_pct", 0.0) or 0.0) for m in members]
     dates = [_parse_date(m.get("event_date")) for m in members if _parse_date(m.get("event_date")) is not None]
     support_count = len(members)
     dispersion = pstdev(returns) if len(returns) > 1 else 0.0
@@ -83,6 +107,8 @@ def _state_side_stats(members: list[dict], cfg: PrototypeConfig, *, as_of_date: 
     no_trade_count = sum(_count(m, "no_trade_count", 1 if bool(m.get("no_trade")) or str(m.get("first_touch_label") or "").upper() == "NO_TRADE" else 0) for m in members)
     horizon_up_count = sum(_count(m, "horizon_up_count", 1 if str(m.get("first_touch_label") or "").upper() == "HORIZON_UP" else 0) for m in members)
     horizon_down_count = sum(_count(m, "horizon_down_count", 1 if str(m.get("first_touch_label") or "").upper() == "HORIZON_DOWN" else 0) for m in members)
+    resolved_by_d2_count = sum(1 for m in members if bool(m.get("resolved_by_d2")))
+    resolved_by_d3_count = sum(1 for m in members if bool(m.get("resolved_by_d3")))
     total_outcomes = max(target_first_count + stop_first_count + flat_count + ambiguous_count + no_trade_count, support_count, 1)
     return {
         "support_count": support_count,
@@ -95,6 +121,8 @@ def _state_side_stats(members: list[dict], cfg: PrototypeConfig, *, as_of_date: 
         "return_q10_pct": _quantile(returns, 0.10),
         "return_q50_pct": _quantile(returns, 0.50),
         "return_q90_pct": _quantile(returns, 0.90),
+        "return_d2_q50_pct": _quantile(d2_returns, 0.50),
+        "return_d3_q50_pct": _quantile(d3_returns, 0.50),
         "return_dispersion": dispersion,
         "uncertainty": dispersion / max(np.sqrt(support_count), 1.0),
         "freshness_days": float(((_parse_date(as_of_date) or date.today()) - max(dates)).days) if dates else 9999.0,
@@ -110,6 +138,106 @@ def _state_side_stats(members: list[dict], cfg: PrototypeConfig, *, as_of_date: 
         "p_flat": flat_count / total_outcomes,
         "p_ambiguous": ambiguous_count / total_outcomes,
         "p_no_trade": no_trade_count / total_outcomes,
+        "p_resolved_by_d2": resolved_by_d2_count / max(support_count, 1),
+        "p_resolved_by_d3": resolved_by_d3_count / max(support_count, 1),
+    }
+
+
+def build_prototype_compression_audit(
+    *,
+    event_records: Iterable[EventOutcomeRecord],
+    prototypes: Iterable[StatePrototype],
+    as_of_date: str,
+) -> dict:
+    event_rows = list(event_records or [])
+    prototype_rows = list(prototypes or [])
+    cluster_sizes = [int(p.member_count or 0) for p in prototype_rows]
+    event_regime_counts = _categorical_counts((e.diagnostics or {}).get("regime_code") for e in event_rows)
+    prototype_regime_counts = _categorical_counts(p.regime_code for p in prototype_rows)
+    event_sector_counts = _categorical_counts((e.diagnostics or {}).get("sector_code") for e in event_rows)
+    prototype_sector_counts = _categorical_counts(p.sector_code for p in prototype_rows)
+    event_count = len(event_rows)
+    prototype_count = len(prototype_rows)
+    compression_ratio = float(event_count / prototype_count) if prototype_count > 0 else 0.0
+    cluster_stats = _distribution_stats(cluster_sizes)
+    return {
+        "as_of_date": as_of_date,
+        "event_record_count": event_count,
+        "prototype_count": prototype_count,
+        "compression_ratio": compression_ratio,
+        "cluster_size_stats": cluster_stats,
+        "event_regime_counts": event_regime_counts,
+        "prototype_regime_counts": prototype_regime_counts,
+        "event_sector_counts": event_sector_counts,
+        "prototype_sector_counts": prototype_sector_counts,
+        "table_row": {
+            "as_of_date": as_of_date,
+            "event_record_count": event_count,
+            "prototype_count": prototype_count,
+            "compression_ratio": compression_ratio,
+            "cluster_size_min": cluster_stats["min"],
+            "cluster_size_p50": cluster_stats["p50"],
+            "cluster_size_p90": cluster_stats["p90"],
+            "cluster_size_max": cluster_stats["max"],
+            "cluster_size_mean": cluster_stats["mean"],
+            "event_regime_counts": json.dumps(event_regime_counts, ensure_ascii=False, sort_keys=True),
+            "prototype_regime_counts": json.dumps(prototype_regime_counts, ensure_ascii=False, sort_keys=True),
+            "event_sector_counts": json.dumps(event_sector_counts, ensure_ascii=False, sort_keys=True),
+            "prototype_sector_counts": json.dumps(prototype_sector_counts, ensure_ascii=False, sort_keys=True),
+        },
+    }
+
+
+def aggregate_prototype_compression_batches(batches: Iterable[dict] | None) -> dict:
+    rows = [dict(batch) for batch in list(batches or []) if isinstance(batch, dict)]
+    if not rows:
+        return {
+            "batch_count": 0,
+            "event_record_count_total": 0,
+            "prototype_count_total": 0,
+            "compression_ratio_mean": 0.0,
+            "compression_ratio_max": 0.0,
+            "cluster_size_stats": _distribution_stats([]),
+            "event_regime_counts": {},
+            "prototype_regime_counts": {},
+            "event_sector_counts": {},
+            "prototype_sector_counts": {},
+            "table_rows": [],
+        }
+    event_regime_totals: Dict[str, int] = {}
+    prototype_regime_totals: Dict[str, int] = {}
+    event_sector_totals: Dict[str, int] = {}
+    prototype_sector_totals: Dict[str, int] = {}
+    cluster_size_values: list[float] = []
+    for row in rows:
+        cluster_size_values.extend(
+            [
+                float(row.get("cluster_size_stats", {}).get("min", 0.0) or 0.0),
+                float(row.get("cluster_size_stats", {}).get("p50", 0.0) or 0.0),
+                float(row.get("cluster_size_stats", {}).get("p90", 0.0) or 0.0),
+                float(row.get("cluster_size_stats", {}).get("max", 0.0) or 0.0),
+            ]
+        )
+        for source, target in (
+            ("event_regime_counts", event_regime_totals),
+            ("prototype_regime_counts", prototype_regime_totals),
+            ("event_sector_counts", event_sector_totals),
+            ("prototype_sector_counts", prototype_sector_totals),
+        ):
+            for key, value in dict(row.get(source) or {}).items():
+                target[str(key)] = target.get(str(key), 0) + int(value or 0)
+    return {
+        "batch_count": len(rows),
+        "event_record_count_total": sum(int(row.get("event_record_count") or 0) for row in rows),
+        "prototype_count_total": sum(int(row.get("prototype_count") or 0) for row in rows),
+        "compression_ratio_mean": float(sum(float(row.get("compression_ratio") or 0.0) for row in rows) / len(rows)),
+        "compression_ratio_max": max(float(row.get("compression_ratio") or 0.0) for row in rows),
+        "cluster_size_stats": _distribution_stats(cluster_size_values),
+        "event_regime_counts": dict(sorted(event_regime_totals.items(), key=lambda item: (-item[1], item[0]))),
+        "prototype_regime_counts": dict(sorted(prototype_regime_totals.items(), key=lambda item: (-item[1], item[0]))),
+        "event_sector_counts": dict(sorted(event_sector_totals.items(), key=lambda item: (-item[1], item[0]))),
+        "prototype_sector_counts": dict(sorted(prototype_sector_totals.items(), key=lambda item: (-item[1], item[0]))),
+        "table_rows": [dict(row.get("table_row") or {}) for row in rows],
     }
 
 

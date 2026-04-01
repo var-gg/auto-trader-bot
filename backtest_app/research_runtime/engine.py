@@ -17,6 +17,7 @@ from backtest_app.observability.git_provenance import collect_git_provenance
 from backtest_app.portfolio import PortfolioConfig, PortfolioState, build_portfolio_decisions
 from backtest_app.quote_policy import QuotePolicyConfig, compare_policy_ab
 from backtest_app.reporting.summary import build_summary
+from backtest_app.research.pre_optuna import build_pre_optuna_evidence
 from backtest_app.results.store import JsonResultStore, SqlResultStore
 from backtest_app.research_runtime.runner import ensure_manifest
 from backtest_app.simulated_broker.engine import SimulatedBroker
@@ -149,6 +150,71 @@ def _forecast_rows(signal_panel_payload: Any) -> list[dict[str, Any]]:
     if not isinstance(signal_panel_payload, list):
         return []
     rows: list[dict[str, Any]] = []
+
+    def _match_summary_stats(summary_payload: Any) -> dict[str, Any]:
+        matches = [item for item in (summary_payload or []) if isinstance(item, dict)]
+        if not matches:
+            return {
+                "summary_json": json.dumps([], ensure_ascii=False),
+                "count": 0,
+                "support_sum": 0.0,
+                "max_support": 0.0,
+                "max_similarity": 0.0,
+            }
+        supports = [float(item.get("support", 0.0) or 0.0) for item in matches]
+        similarities = [float(item.get("similarity", 0.0) or 0.0) for item in matches]
+        return {
+            "summary_json": json.dumps(matches, ensure_ascii=False),
+            "count": len(matches),
+            "support_sum": float(sum(supports)),
+            "max_support": max(supports),
+            "max_similarity": max(similarities),
+        }
+
+    def _side_columns(prefix: str, payload: dict[str, Any]) -> dict[str, Any]:
+        match_stats = _match_summary_stats(payload.get("top_matches_summary"))
+        member_match_stats = _match_summary_stats(payload.get("member_top_matches_summary"))
+        return {
+            f"{prefix}_expected_net_return": payload.get("expected_net_return"),
+            f"{prefix}_q10": payload.get("q10"),
+            f"{prefix}_q50": payload.get("q50"),
+            f"{prefix}_q90": payload.get("q90"),
+            f"{prefix}_q50_d2_return": payload.get("q50_d2_return"),
+            f"{prefix}_q50_d3_return": payload.get("q50_d3_return"),
+            f"{prefix}_p_resolved_by_d2": payload.get("p_resolved_by_d2"),
+            f"{prefix}_p_resolved_by_d3": payload.get("p_resolved_by_d3"),
+            f"{prefix}_expected_mae": payload.get("expected_mae"),
+            f"{prefix}_expected_mfe": payload.get("expected_mfe"),
+            f"{prefix}_effective_sample_size": payload.get("n_eff"),
+            f"{prefix}_uncertainty": payload.get("uncertainty"),
+            f"{prefix}_prototype_pool_size": payload.get("prototype_pool_size"),
+            f"{prefix}_ranked_candidate_count": payload.get("ranked_candidate_count"),
+            f"{prefix}_positive_weight_candidate_count": payload.get("positive_weight_candidate_count"),
+            f"{prefix}_pre_truncation_candidate_count": payload.get("pre_truncation_candidate_count"),
+            f"{prefix}_top1_weight_share": payload.get("top1_weight_share"),
+            f"{prefix}_cumulative_weight_top3": payload.get("cumulative_weight_top3"),
+            f"{prefix}_mixture_ess": payload.get("mixture_ess"),
+            f"{prefix}_member_support_sum": payload.get("member_support_sum"),
+            f"{prefix}_consensus_signature": payload.get("consensus_signature"),
+            f"{prefix}_member_candidate_count": payload.get("member_candidate_count"),
+            f"{prefix}_member_pre_truncation_count": payload.get("member_pre_truncation_count"),
+            f"{prefix}_positive_weight_member_count": payload.get("positive_weight_member_count"),
+            f"{prefix}_member_top1_weight_share": payload.get("member_top1_weight_share"),
+            f"{prefix}_member_cumulative_weight_top3": payload.get("member_cumulative_weight_top3"),
+            f"{prefix}_member_mixture_ess": payload.get("member_mixture_ess"),
+            f"{prefix}_member_consensus_signature": payload.get("member_consensus_signature"),
+            f"{prefix}_top_matches_summary": match_stats["summary_json"],
+            f"{prefix}_top_match_count": match_stats["count"],
+            f"{prefix}_top_match_support_sum": match_stats["support_sum"],
+            f"{prefix}_top_match_max_support": match_stats["max_support"],
+            f"{prefix}_top_match_max_similarity": match_stats["max_similarity"],
+            f"{prefix}_member_top_matches_summary": member_match_stats["summary_json"],
+            f"{prefix}_member_top_match_count": member_match_stats["count"],
+            f"{prefix}_member_top_match_support_sum": member_match_stats["support_sum"],
+            f"{prefix}_member_top_match_max_support": member_match_stats["max_support"],
+            f"{prefix}_member_top_match_max_similarity": member_match_stats["max_similarity"],
+        }
+
     for row in signal_panel_payload:
         if not isinstance(row, dict):
             continue
@@ -162,12 +228,18 @@ def _forecast_rows(signal_panel_payload: Any) -> list[dict[str, Any]]:
         if not chosen_payload:
             chosen_payload = buy if chosen_side == "BUY" else sell if chosen_side == "SELL" else {}
         missingness = dict(row.get("missingness") or {})
+        chosen_top_matches = buy.get("top_matches_summary") if chosen_side == "BUY" else sell.get("top_matches_summary")
+        chosen_member_top_matches = buy.get("member_top_matches_summary") if chosen_side == "BUY" else sell.get("member_top_matches_summary")
+        chosen_match_stats = _match_summary_stats(chosen_top_matches)
+        chosen_member_match_stats = _match_summary_stats(chosen_member_top_matches)
         rows.append(
             {
                 "decision_date": row.get("decision_date"),
                 "symbol": row.get("symbol"),
                 "exchange_code": query.get("exchange_code"),
                 "country_code": query.get("country_code"),
+                "query_regime_code": query.get("regime_code"),
+                "query_sector_code": query.get("sector_code"),
                 "exchange_tz": query.get("exchange_tz"),
                 "session_date_local": query.get("session_date_local"),
                 "session_close_ts_utc": query.get("session_close_ts_utc"),
@@ -183,32 +255,47 @@ def _forecast_rows(signal_panel_payload: Any) -> list[dict[str, Any]]:
                 "q10": chosen_payload.get("q10_return", chosen_payload.get("q10")),
                 "q50": chosen_payload.get("q50_return", chosen_payload.get("q50")),
                 "q90": chosen_payload.get("q90_return", chosen_payload.get("q90")),
+                "q50_d2_return": chosen_payload.get("q50_d2_return"),
+                "q50_d3_return": chosen_payload.get("q50_d3_return"),
+                "p_resolved_by_d2": chosen_payload.get("p_resolved_by_d2"),
+                "p_resolved_by_d3": chosen_payload.get("p_resolved_by_d3"),
                 "expected_mae": chosen_payload.get("expected_mae"),
                 "expected_mfe": chosen_payload.get("expected_mfe"),
                 "effective_sample_size": chosen_payload.get("effective_sample_size", chosen_payload.get("n_eff")),
                 "uncertainty": chosen_payload.get("uncertainty"),
                 "regime_alignment": chosen_payload.get("regime_alignment"),
-                "buy_expected_net_return": buy.get("expected_net_return"),
-                "buy_q10": buy.get("q10"),
-                "buy_q50": buy.get("q50"),
-                "buy_q90": buy.get("q90"),
-                "buy_expected_mae": buy.get("expected_mae"),
-                "buy_expected_mfe": buy.get("expected_mfe"),
-                "buy_effective_sample_size": buy.get("n_eff"),
-                "buy_uncertainty": buy.get("uncertainty"),
+                "prototype_pool_size": chosen_payload.get("prototype_pool_size"),
+                "ranked_candidate_count": chosen_payload.get("ranked_candidate_count"),
+                "positive_weight_candidate_count": chosen_payload.get("positive_weight_candidate_count"),
+                "pre_truncation_candidate_count": chosen_payload.get("pre_truncation_candidate_count"),
+                "top1_weight_share": chosen_payload.get("top1_weight_share"),
+                "cumulative_weight_top3": chosen_payload.get("cumulative_weight_top3"),
+                "mixture_ess": chosen_payload.get("mixture_ess"),
+                "member_support_sum": chosen_payload.get("member_support_sum"),
+                "consensus_signature": chosen_payload.get("consensus_signature"),
+                "member_candidate_count": chosen_payload.get("member_candidate_count"),
+                "member_pre_truncation_count": chosen_payload.get("member_pre_truncation_count"),
+                "positive_weight_member_count": chosen_payload.get("positive_weight_member_count"),
+                "member_top1_weight_share": chosen_payload.get("member_top1_weight_share"),
+                "member_cumulative_weight_top3": chosen_payload.get("member_cumulative_weight_top3"),
+                "member_mixture_ess": chosen_payload.get("member_mixture_ess"),
+                "member_consensus_signature": chosen_payload.get("member_consensus_signature"),
+                "top_matches_summary": chosen_match_stats["summary_json"],
+                "top_match_count": chosen_match_stats["count"],
+                "top_match_support_sum": chosen_match_stats["support_sum"],
+                "top_match_max_support": chosen_match_stats["max_support"],
+                "top_match_max_similarity": chosen_match_stats["max_similarity"],
+                "member_top_matches_summary": chosen_member_match_stats["summary_json"],
+                "member_top_match_count": chosen_member_match_stats["count"],
+                "member_top_match_support_sum": chosen_member_match_stats["support_sum"],
+                "member_top_match_max_support": chosen_member_match_stats["max_support"],
+                "member_top_match_max_similarity": chosen_member_match_stats["max_similarity"],
+                **_side_columns("buy", buy),
                 "buy_regime_alignment": dict((row.get("ev") or {}).get("buy") or {}).get("regime_alignment"),
                 "buy_abstain_reasons": json.dumps(dict((row.get("ev") or {}).get("buy") or {}).get("abstain_reasons") or [], ensure_ascii=False),
-                "sell_expected_net_return": sell.get("expected_net_return"),
-                "sell_q10": sell.get("q10"),
-                "sell_q50": sell.get("q50"),
-                "sell_q90": sell.get("q90"),
-                "sell_expected_mae": sell.get("expected_mae"),
-                "sell_expected_mfe": sell.get("expected_mfe"),
-                "sell_effective_sample_size": sell.get("n_eff"),
-                "sell_uncertainty": sell.get("uncertainty"),
+                **_side_columns("sell", sell),
                 "sell_regime_alignment": dict((row.get("ev") or {}).get("sell") or {}).get("regime_alignment"),
                 "sell_abstain_reasons": json.dumps(dict((row.get("ev") or {}).get("sell") or {}).get("abstain_reasons") or [], ensure_ascii=False),
-                "top_matches_summary": json.dumps((buy.get("top_matches_summary") if chosen_side == "BUY" else sell.get("top_matches_summary")) or [], ensure_ascii=False),
                 "missingness_summary": json.dumps(missingness, ensure_ascii=False),
                 "freshness_summary": json.dumps(query.get("macro_freshness_summary") or {}, ensure_ascii=False),
             }
@@ -216,16 +303,150 @@ def _forecast_rows(signal_panel_payload: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, signal_panel_payload: Any, progress_callback=None, total_trading_dates: int = 0, completed_trading_dates: int = 0, candidate_rows: int = 0, plans_count: int = 0, fills_count: int = 0) -> dict[str, Any]:
-    rows = _forecast_rows(signal_panel_payload)
-    if not rows:
-        return {"row_count": 0, "csv_path": None, "parquet_path": None}
+def _write_pre_optuna_artifacts(
+    *,
+    run_dir: Path,
+    pre_optuna_analysis: dict[str, Any],
+    progress_callback=None,
+    total_trading_dates: int = 0,
+    completed_trading_dates: int = 0,
+    candidate_rows: int = 0,
+    plans_count: int = 0,
+    fills_count: int = 0,
+) -> dict[str, Any]:
+    packet_path = run_dir / "pre_optuna_packet.json"
+    pattern_path = run_dir / "pattern_family_table.csv"
+    policy_path = run_dir / "policy_family_candidates.csv"
+    packet = dict(pre_optuna_analysis.get("pre_optuna_packet") or {})
+    pattern_rows = list(pre_optuna_analysis.get("pattern_family_table") or [])
+    policy_rows = list(pre_optuna_analysis.get("policy_family_candidates") or [])
+    packet_path.write_text(json.dumps(packet, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     try:
         import pandas as pd
     except Exception:
-        return {"row_count": len(rows), "csv_path": None, "parquet_path": None, "write_error": "pandas_unavailable"}
+        pattern_path.write_text(json.dumps(pattern_rows, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        policy_path.write_text(json.dumps(policy_rows, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        pattern_format = "json_fallback"
+        policy_format = "json_fallback"
+    else:
+        pd.DataFrame(pattern_rows).to_csv(pattern_path, index=False)
+        pd.DataFrame(policy_rows).to_csv(policy_path, index=False)
+        pattern_format = "csv"
+        policy_format = "csv"
+    _emit_progress(progress_callback, {
+        "phase": "write_artifacts",
+        "status": "running",
+        "artifact_name": "pre_optuna_packet",
+        "artifact_index": 6,
+        "artifact_total": 10,
+        "artifact_bytes": packet_path.stat().st_size if packet_path.exists() else 0,
+        "bytes_written": sum(path.stat().st_size for path in [packet_path, pattern_path, policy_path] if path.exists()),
+        "candidate_rows": candidate_rows,
+        "plans_count": plans_count,
+        "fills_count": fills_count,
+        "total_trading_dates": total_trading_dates,
+        "completed_trading_dates": completed_trading_dates,
+    })
+    return {
+        "pre_optuna_packet_path": str(packet_path),
+        "pattern_family_table_path": str(pattern_path),
+        "pattern_family_table_format": pattern_format,
+        "policy_family_candidates_path": str(policy_path),
+        "policy_family_candidates_format": policy_format,
+        "pre_optuna_packet": packet,
+        "pattern_family_count": len(pattern_rows),
+        "policy_family_candidate_count": len(policy_rows),
+    }
+
+
+def _write_prototype_compression_artifacts(
+    *,
+    run_dir: Path,
+    compression_analysis: dict[str, Any] | None,
+    progress_callback=None,
+    total_trading_dates: int = 0,
+    completed_trading_dates: int = 0,
+    candidate_rows: int = 0,
+    plans_count: int = 0,
+    fills_count: int = 0,
+) -> dict[str, Any]:
+    analysis = dict(compression_analysis or {})
+    audit_path = run_dir / "prototype_compression_audit.json"
+    table_path = run_dir / "prototype_compression_table.csv"
+    audit_payload = dict(analysis)
+    table_rows = list(audit_payload.pop("table_rows", []) or [])
+    audit_path.write_text(json.dumps(audit_payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    try:
+        import pandas as pd
+    except Exception:
+        table_path.write_text(json.dumps(table_rows, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        table_format = "json_fallback"
+    else:
+        pd.DataFrame(table_rows).to_csv(table_path, index=False)
+        table_format = "csv"
+    _emit_progress(progress_callback, {
+        "phase": "write_artifacts",
+        "status": "running",
+        "artifact_name": "prototype_compression",
+        "artifact_index": 5,
+        "artifact_total": 10,
+        "artifact_bytes": sum(path.stat().st_size for path in [audit_path, table_path] if path.exists()),
+        "bytes_written": sum(path.stat().st_size for path in [audit_path, table_path] if path.exists()),
+        "candidate_rows": candidate_rows,
+        "plans_count": plans_count,
+        "fills_count": fills_count,
+        "total_trading_dates": total_trading_dates,
+        "completed_trading_dates": completed_trading_dates,
+    })
+    return {
+        "prototype_compression_audit_path": str(audit_path),
+        "prototype_compression_table_path": str(table_path),
+        "prototype_compression_table_format": table_format,
+        "prototype_compression_audit": audit_payload,
+    }
+
+
+def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, forecast_rows: list[dict[str, Any]], pre_optuna_analysis: dict[str, Any] | None = None, compression_analysis: dict[str, Any] | None = None, progress_callback=None, total_trading_dates: int = 0, completed_trading_dates: int = 0, candidate_rows: int = 0, plans_count: int = 0, fills_count: int = 0) -> dict[str, Any]:
+    rows = list(forecast_rows or [])
+    analysis = dict(pre_optuna_analysis or build_pre_optuna_evidence(rows))
     run_dir = Path(output_dir) / "research" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    compression_artifacts = _write_prototype_compression_artifacts(
+        run_dir=run_dir,
+        compression_analysis=compression_analysis,
+        progress_callback=progress_callback,
+        total_trading_dates=total_trading_dates,
+        completed_trading_dates=completed_trading_dates,
+        candidate_rows=candidate_rows,
+        plans_count=plans_count,
+        fills_count=fills_count,
+    )
+    if not rows:
+        pre_optuna_artifacts = _write_pre_optuna_artifacts(
+            run_dir=run_dir,
+            pre_optuna_analysis=analysis,
+            progress_callback=progress_callback,
+            total_trading_dates=total_trading_dates,
+            completed_trading_dates=completed_trading_dates,
+            candidate_rows=candidate_rows,
+            plans_count=plans_count,
+            fills_count=fills_count,
+        )
+        return {"row_count": 0, "csv_path": None, "parquet_path": None, **compression_artifacts, **pre_optuna_artifacts}
+    try:
+        import pandas as pd
+    except Exception:
+        pre_optuna_artifacts = _write_pre_optuna_artifacts(
+            run_dir=run_dir,
+            pre_optuna_analysis=analysis,
+            progress_callback=progress_callback,
+            total_trading_dates=total_trading_dates,
+            completed_trading_dates=completed_trading_dates,
+            candidate_rows=candidate_rows,
+            plans_count=plans_count,
+            fills_count=fills_count,
+        )
+        return {"row_count": len(rows), "csv_path": None, "parquet_path": None, "write_error": "pandas_unavailable", **compression_artifacts, **pre_optuna_artifacts}
     csv_path = run_dir / "forecast_panel.csv"
     parquet_path = run_dir / "forecast_panel.parquet"
     _emit_progress(progress_callback, {
@@ -233,7 +454,7 @@ def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, signal_pane
         "status": "running",
         "artifact_name": "forecast_panel_prepare",
         "artifact_index": 2,
-        "artifact_total": 5,
+        "artifact_total": 10,
         "artifact_rows": len(rows),
         "bytes_written": 0,
         "candidate_rows": candidate_rows,
@@ -249,7 +470,7 @@ def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, signal_pane
         "status": "running",
         "artifact_name": "forecast_panel_csv",
         "artifact_index": 3,
-        "artifact_total": 5,
+        "artifact_total": 10,
         "artifact_rows": len(rows),
         "artifact_bytes": csv_path.stat().st_size if csv_path.exists() else 0,
         "bytes_written": csv_path.stat().st_size if csv_path.exists() else 0,
@@ -270,7 +491,7 @@ def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, signal_pane
         "status": "running",
         "artifact_name": "forecast_panel_parquet",
         "artifact_index": 4,
-        "artifact_total": 5,
+        "artifact_total": 10,
         "artifact_rows": len(rows),
         "artifact_bytes": parquet_path.stat().st_size if parquet_path.exists() else 0,
         "bytes_written": sum(path.stat().st_size for path in [csv_path, parquet_path] if path.exists()),
@@ -280,11 +501,23 @@ def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, signal_pane
         "total_trading_dates": total_trading_dates,
         "completed_trading_dates": completed_trading_dates,
     })
+    pre_optuna_artifacts = _write_pre_optuna_artifacts(
+        run_dir=run_dir,
+        pre_optuna_analysis=analysis,
+        progress_callback=progress_callback,
+        total_trading_dates=total_trading_dates,
+        completed_trading_dates=completed_trading_dates,
+        candidate_rows=candidate_rows,
+        plans_count=plans_count,
+        fills_count=fills_count,
+    )
     return {
         "row_count": len(rows),
         "csv_path": str(csv_path),
         "parquet_path": str(parquet_path),
         "parquet_format": parquet_format,
+        **compression_artifacts,
+        **pre_optuna_artifacts,
     }
 
 
@@ -384,6 +617,7 @@ def _authoritative_summary_payload(
     fills: list[Any],
     reproducibility: dict[str, Any],
     forecast_panel_artifact: dict[str, Any],
+    pre_optuna_packet: dict[str, Any] | None,
     result_path: str | None,
 ) -> dict[str, Any]:
     panel = list(signal_panel_payload or [])
@@ -414,10 +648,15 @@ def _authoritative_summary_payload(
             if n_eff is not None:
                 bucket = f"{float(n_eff):.1f}"
                 n_eff_histogram[bucket] = n_eff_histogram.get(bucket, 0) + 1
-        for side_key in ("long", "short"):
-            matches = (((row.get("top_matches") or {}).get(side_key)) or [])
-            if matches:
-                weight = float((matches[0] or {}).get("weight", 0.0) or 0.0)
+        for side_key in ("buy", "sell"):
+            side_diag = ((row.get("scorer_diagnostics") or {}).get(side_key) or {})
+            top1_weight_share = side_diag.get("top1_weight_share")
+            if top1_weight_share is None:
+                legacy_side_key = "long" if side_key == "buy" else "short"
+                matches = (((row.get("top_matches") or {}).get(legacy_side_key)) or [])
+                top1_weight_share = float((matches[0] or {}).get("weight_share", 0.0) or 0.0) if matches else None
+            if top1_weight_share is not None:
+                weight = float(top1_weight_share or 0.0)
                 bucket = f"{weight:.1f}"
                 top1_weight_histogram[bucket] = top1_weight_histogram.get(bucket, 0) + 1
     filled = [f for f in fills if str((f.get("fill_status") or "")).upper() in {"FULL", "PARTIAL"}]
@@ -446,6 +685,17 @@ def _authoritative_summary_payload(
         "fills_count": len(filled),
         "trades_count": len(plans),
         "deploy_viable": len(filled) > 0 and len(plans) > 0,
+        "pre_optuna_ready": bool((pre_optuna_packet or {}).get("pre_optuna_ready", False)),
+        "pre_optuna_verdict": (pre_optuna_packet or {}).get("verdict"),
+        "pre_optuna_verdict_reason": (pre_optuna_packet or {}).get("verdict_reason"),
+        "recurring_family_count": (pre_optuna_packet or {}).get("recurring_family_count"),
+        "eligible_policy_family_count": (pre_optuna_packet or {}).get("eligible_policy_family_count"),
+        "single_prototype_collapse_share": (pre_optuna_packet or {}).get("single_prototype_collapse_share"),
+        "next_optuna_target_scope": (pre_optuna_packet or {}).get("next_optuna_target_scope"),
+        "top_recurring_families": list((pre_optuna_packet or {}).get("top_recurring_families") or []),
+        "prototype_compression_ratio_mean": (forecast_panel_artifact or {}).get("prototype_compression_audit", {}).get("compression_ratio_mean"),
+        "prototype_compression_ratio_max": (forecast_panel_artifact or {}).get("prototype_compression_audit", {}).get("compression_ratio_max"),
+        "prototype_batch_count": (forecast_panel_artifact or {}).get("prototype_compression_audit", {}).get("batch_count"),
         "forecast_panel": dict(forecast_panel_artifact or {}),
         "result_path": result_path,
         "support_metadata_observed": _support_metadata_observed(raw_diagnostics, signal_panel_payload),
@@ -667,7 +917,20 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
     raw_diagnostics = historical_metadata.get("diagnostics", {})
     diagnostics_payload = _diagnostics_lite_view(raw_diagnostics, grouped_candidates=grouped_candidates, warmup_candidates=warmup_candidates, trading_dates=trading_dates, plans=plans, fills=fills) if diagnostics_lite else raw_diagnostics
     signal_panel_payload = historical_metadata.get("signal_panel_artifact", [])
-    forecast_panel_artifact = {"row_count": len(_forecast_rows(signal_panel_payload))}
+    forecast_rows = _forecast_rows(signal_panel_payload)
+    pre_optuna_analysis = build_pre_optuna_evidence(forecast_rows)
+    pre_optuna_packet = dict(pre_optuna_analysis.get("pre_optuna_packet") or {})
+    forecast_rows = list(pre_optuna_analysis.get("forecast_rows") or forecast_rows)
+    prototype_compression_analysis = dict((raw_diagnostics or {}).get("prototype_compression_audit") or {})
+    forecast_panel_artifact = {
+        "row_count": len(forecast_rows),
+        "pre_optuna_ready": bool(pre_optuna_packet.get("pre_optuna_ready", False)),
+        "pre_optuna_verdict": pre_optuna_packet.get("verdict"),
+        "recurring_family_count": pre_optuna_packet.get("recurring_family_count"),
+        "eligible_policy_family_count": pre_optuna_packet.get("eligible_policy_family_count"),
+        "next_optuna_target_scope": pre_optuna_packet.get("next_optuna_target_scope"),
+        "prototype_compression_audit": prototype_compression_analysis,
+    }
     if diagnostics_lite:
         signal_panel_payload = {
             "row_count": len(signal_panel_payload),
@@ -689,14 +952,14 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
         "plans": [p.to_dict() for p in plans],
         "fills": [f.to_dict() for f in fills],
         "diagnostics": diagnostics_payload,
-        "artifacts": {"signal_panel": signal_panel_payload, "forecast_panel": forecast_panel_artifact, "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates], "historical_context": historical_context, "candidate_reuse": _policy_reuse_payload(historical=historical, grouped_candidates=grouped_candidates, warmup_candidates=warmup_candidates, trading_dates=trading_dates)},
+        "artifacts": {"signal_panel": signal_panel_payload, "forecast_panel": forecast_panel_artifact, "pre_optuna": {"packet": pre_optuna_packet}, "prototype_compression": {"audit": prototype_compression_analysis}, "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates], "historical_context": historical_context, "candidate_reuse": _policy_reuse_payload(historical=historical, grouped_candidates=grouped_candidates, warmup_candidates=warmup_candidates, trading_dates=trading_dates)},
     }
     validation_folds = run_fold_validation(request=request, data_path=data_path, data_source=data_source, scenario_id=scenario_id, strategy_mode=strategy_mode, runner_fn=run_backtest, mode="walk_forward", max_folds=validation_max_folds, summary_only=validation_summary_only, diagnostics_lite=diagnostics_lite, emit_timing_logs=emit_timing_logs, bootstrap_result=bootstrap_validation_result) if strategy_mode == "research_similarity_v2" and enable_validation else {"mode": "disabled", "folds": [], "aggregate": {}, "rejection_reasons": [], "train_artifacts": [], "test_artifacts": []}
     validation_bootstrap_timer(f"folds={len(validation_folds.get('folds') or [])}")
     reproducibility = _reproducibility_payload(request=request, manifest=manifest, raw_diagnostics=raw_diagnostics, signal_panel_payload=signal_panel_payload, validation_folds=validation_folds)
     sensitivity = [p.__dict__ for p in sensitivity_sweep(plans=plans, fills=fills, fee_grid=[0.0, request.config.fee_bps, request.config.fee_bps + 5.0], slippage_grid=[0.0, request.config.slippage_bps, request.config.slippage_bps + 5.0], total_symbols=len(request.scenario.symbols), bars_by_symbol=historical.bars_by_symbol)]
     quote_policy_sweep = {"ev_threshold": [0.003, quote_policy_cfg.ev_threshold, 0.010], "min_fill_probability": [0.05, quote_policy_cfg.min_fill_probability, 0.20], "uncertainty_caps": [0.08, quote_policy_cfg.uncertainty_cap, 0.16]}
-    result = {"scenario": request.scenario.scenario_id, "strategy_mode": strategy_mode, "manifest": manifest.to_dict(), "historical_context": historical_context, "bars_by_symbol": historical_context["bars_by_symbol"], "macro_history_by_date": historical_context["macro_history_by_date"], "macro_series_history": historical_context["macro_series_history"], "sector_map": historical_context["sector_map"], "session_metadata_by_symbol": historical_context["session_metadata_by_symbol"], "trading_dates": historical_context["trading_dates"], "portfolio": {"selected_symbols": selected_symbols, "decisions": [{"symbol": d.candidate.symbol, "selected": d.selected, "side": d.side.value, "size_multiplier": d.size_multiplier, "requested_budget": d.requested_budget, "expected_horizon_days": d.expected_horizon_days, "kill_reason": d.kill_reason, "diagnostics": d.diagnostics, "decision_date": _candidate_decision_date(d.candidate)} for d in portfolio_decisions_all], "date_artifacts": date_artifacts, **portfolio_paths}, "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "summary": summary.__dict__, "diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "artifacts": {"signal_panel": signal_panel_payload, "forecast_panel": forecast_panel_artifact, "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates], "historical_context": historical_context, "candidate_reuse": _policy_reuse_payload(historical=historical, grouped_candidates=grouped_candidates, warmup_candidates=warmup_candidates, trading_dates=trading_dates), "reproducibility": reproducibility}, "validation": {"fold_engine": validation_folds, "sensitivity_sweep": sensitivity, "quote_policy_sweep": quote_policy_sweep, "coverage": summary.metadata.get("coverage", 0.0), "no_trade_ratio": summary.metadata.get("no_trade_ratio", 0.0)}, "skipped": skipped, "authoritative": reproducibility.get("authoritative")}
+    result = {"scenario": request.scenario.scenario_id, "strategy_mode": strategy_mode, "manifest": manifest.to_dict(), "historical_context": historical_context, "bars_by_symbol": historical_context["bars_by_symbol"], "macro_history_by_date": historical_context["macro_history_by_date"], "macro_series_history": historical_context["macro_series_history"], "sector_map": historical_context["sector_map"], "session_metadata_by_symbol": historical_context["session_metadata_by_symbol"], "trading_dates": historical_context["trading_dates"], "portfolio": {"selected_symbols": selected_symbols, "decisions": [{"symbol": d.candidate.symbol, "selected": d.selected, "side": d.side.value, "size_multiplier": d.size_multiplier, "requested_budget": d.requested_budget, "expected_horizon_days": d.expected_horizon_days, "kill_reason": d.kill_reason, "diagnostics": d.diagnostics, "decision_date": _candidate_decision_date(d.candidate)} for d in portfolio_decisions_all], "date_artifacts": date_artifacts, **portfolio_paths}, "plans": [p.to_dict() for p in plans], "fills": [f.to_dict() for f in fills], "summary": summary.__dict__, "diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "artifacts": {"signal_panel": signal_panel_payload, "forecast_panel": forecast_panel_artifact, "pre_optuna": {"packet": pre_optuna_packet}, "prototype_compression": {"audit": prototype_compression_analysis}, "warmup_candidates": [{"symbol": c.symbol, "decision_date": _candidate_decision_date(c)} for c in warmup_candidates], "historical_context": historical_context, "candidate_reuse": _policy_reuse_payload(historical=historical, grouped_candidates=grouped_candidates, warmup_candidates=warmup_candidates, trading_dates=trading_dates), "reproducibility": reproducibility}, "validation": {"fold_engine": validation_folds, "sensitivity_sweep": sensitivity, "quote_policy_sweep": quote_policy_sweep, "coverage": summary.metadata.get("coverage", 0.0), "no_trade_ratio": summary.metadata.get("no_trade_ratio", 0.0)}, "skipped": skipped, "authoritative": reproducibility.get("authoritative")}
     if sql_db_url:
         snapshot_info = {"data_source": data_source, "strategy_mode": strategy_mode, "historical_metadata": historical_metadata, "date_artifacts": date_artifacts, "reproducibility": reproducibility}
         result["sql_run_id"] = SqlResultStore(sql_db_url, namespace="research").save_run(run_key=manifest.manifest_id(), scenario_id=request.scenario.scenario_id, strategy_id=request.scenario.strategy_id, strategy_mode=strategy_mode, market=request.scenario.market, data_source=data_source, config_version=request.scenario.strategy_version, label_version=str(request.config.metadata.get("label_version", "v1")), vector_version=str(request.config.metadata.get("vector_version", strategy_mode)), initial_capital=request.config.initial_capital, params={"scenario_params": request.scenario.params, "scenario_notes": request.scenario.notes, "config_metadata": request.config.metadata}, summary=summary.__dict__, diagnostics={**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, plans=plans, fills=fills, snapshot_info=snapshot_info, manifest=manifest.to_dict())
@@ -710,6 +973,7 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
             fills=result["fills"],
             reproducibility=reproducibility,
             forecast_panel_artifact=forecast_panel_artifact,
+            pre_optuna_packet=pre_optuna_packet,
             result_path=None,
         )
         authoritative_summary_path = _write_authoritative_summary_artifact(output_dir=output_dir, payload=authoritative_summary)
@@ -718,7 +982,7 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
             "status": "running",
             "artifact_name": "authoritative_summary_prewrite",
             "artifact_index": 1,
-            "artifact_total": 5,
+            "artifact_total": 10,
             "artifact_bytes": Path(authoritative_summary_path).stat().st_size if Path(authoritative_summary_path).exists() else 0,
             "bytes_written": Path(authoritative_summary_path).stat().st_size if Path(authoritative_summary_path).exists() else 0,
             "authoritative_summary_path": authoritative_summary_path,
@@ -732,7 +996,9 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
         forecast_panel_artifact = _write_forecast_panel_artifacts(
             output_dir=output_dir,
             run_id=manifest.manifest_id(),
-            signal_panel_payload=signal_panel_payload,
+            forecast_rows=forecast_rows,
+            pre_optuna_analysis=pre_optuna_analysis,
+            compression_analysis=prototype_compression_analysis,
             progress_callback=progress_callback,
             total_trading_dates=len(trading_dates),
             completed_trading_dates=len(trading_dates),
@@ -741,7 +1007,27 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
             fills_count=len(fills),
         )
         result["artifacts"]["forecast_panel"] = forecast_panel_artifact
+        result["artifacts"]["pre_optuna"] = {
+            "packet": dict(forecast_panel_artifact.get("pre_optuna_packet") or pre_optuna_packet),
+            "pre_optuna_packet_path": forecast_panel_artifact.get("pre_optuna_packet_path"),
+            "pattern_family_table_path": forecast_panel_artifact.get("pattern_family_table_path"),
+            "policy_family_candidates_path": forecast_panel_artifact.get("policy_family_candidates_path"),
+        }
+        result["artifacts"]["prototype_compression"] = {
+            "audit": dict(forecast_panel_artifact.get("prototype_compression_audit") or prototype_compression_analysis),
+            "prototype_compression_audit_path": forecast_panel_artifact.get("prototype_compression_audit_path"),
+            "prototype_compression_table_path": forecast_panel_artifact.get("prototype_compression_table_path"),
+        }
         authoritative_summary["forecast_panel"] = forecast_panel_artifact
+        authoritative_summary["pre_optuna_ready"] = bool((forecast_panel_artifact.get("pre_optuna_packet") or {}).get("pre_optuna_ready", False))
+        authoritative_summary["pre_optuna_verdict"] = (forecast_panel_artifact.get("pre_optuna_packet") or {}).get("verdict")
+        authoritative_summary["pre_optuna_verdict_reason"] = (forecast_panel_artifact.get("pre_optuna_packet") or {}).get("verdict_reason")
+        authoritative_summary["recurring_family_count"] = (forecast_panel_artifact.get("pre_optuna_packet") or {}).get("recurring_family_count")
+        authoritative_summary["eligible_policy_family_count"] = (forecast_panel_artifact.get("pre_optuna_packet") or {}).get("eligible_policy_family_count")
+        authoritative_summary["single_prototype_collapse_share"] = (forecast_panel_artifact.get("pre_optuna_packet") or {}).get("single_prototype_collapse_share")
+        authoritative_summary["next_optuna_target_scope"] = (forecast_panel_artifact.get("pre_optuna_packet") or {}).get("next_optuna_target_scope")
+        authoritative_summary["top_recurring_families"] = list((forecast_panel_artifact.get("pre_optuna_packet") or {}).get("top_recurring_families") or [])
+        authoritative_summary["prototype_compression_audit"] = dict(forecast_panel_artifact.get("prototype_compression_audit") or prototype_compression_analysis)
         authoritative_summary_path = _write_authoritative_summary_artifact(output_dir=output_dir, payload=authoritative_summary)
         result["result_path"] = JsonResultStore(output_dir, namespace="research").save_run(run_id=manifest.manifest_id(), plans=plans, fills=fills, summary={**summary.__dict__, "diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "strategy_mode": strategy_mode}, diagnostics={"quote_policy_sweep": quote_policy_sweep, "portfolio": result["portfolio"], "signal_diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "reproducibility": reproducibility}, manifest=manifest.to_dict())
         authoritative_summary["result_path"] = result.get("result_path")
@@ -755,8 +1041,8 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
             "phase": "write_artifacts",
             "status": "running",
             "artifact_name": "result_json",
-            "artifact_index": 5,
-            "artifact_total": 5,
+            "artifact_index": 10,
+            "artifact_total": 10,
             "artifact_bytes": result_bytes,
             "bytes_written": result_bytes + (Path(authoritative_summary_path).stat().st_size if Path(authoritative_summary_path).exists() else 0),
             "candidate_rows": len(historical.candidates or []),
