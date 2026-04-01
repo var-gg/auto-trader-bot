@@ -78,6 +78,8 @@ Each run directory should contain:
 - `policy_family_candidates.csv`
 - `prototype_compression_audit.json`
 - `prototype_compression_table.csv`
+- `optuna_replay_seed.parquet`
+- `optuna_replay_seed_summary.json`
 - `diagnostics.json`
 - `report.md`
 
@@ -244,6 +246,79 @@ The only valid verdicts are:
 - at least one recurring family exists
 - at least one row is marked `optuna_eligible=true`
 - `next_optuna_target_scope` tells you whether to tune `tight_consensus`, `directional_wide`, or both
+
+## Official next step after `optuna_ready`
+
+Once a run is `optuna_ready`, the next official step is **frozen-seed Optuna**, not another heavy discovery rerun.
+
+Required artifacts for this step:
+
+- `optuna_replay_seed.parquet`
+- `optuna_replay_seed_summary.json`
+- `pre_optuna_packet.json`
+- `policy_family_candidates.csv`
+- `source_chunks.json`
+- `coverage_summary.json`
+- `study_cache/manifest.json`
+- `study_cache/fold_001.parquet` ... `fold_003.parquet`
+
+Evidence split:
+
+- `best1` remains the **proof reference run**
+- the official Optuna input is a separate **calibration bundle**
+- the official path now materializes **query features**, **train snapshots**, and **replay bars** before bundle scoring
+- `build-query-feature-cache` writes `bt_result.calibration_query_feature_row` plus replay bars
+- `build-train-snapshots` writes `bt_result.calibration_snapshot_run` and persists JSON-safe train snapshot artifacts
+- `build-calibration-bundle` is replay-only and uses `build-calibration-chunk` workers that read those caches and write `bt_result.calibration_seed_row`
+- the official study reads a compact cache built with `build-study-cache`
+- the official seed profile is `calibration_universe_v1`
+- `proof_subset_v1` remains only for smoke/debug/plumbing checks
+
+Runtime rule:
+
+- Optuna must not rerun rolling similarity, prototype rebuild, member-mixture estimation, or medium authoritative discovery.
+- Trials are only allowed to replay the frozen seed and tune execution policy parameters.
+- Official full-universe studies should read one cached fold at a time rather than materializing the entire bundle as Python row dicts.
+- The official path is `proof run -> build-query-feature-cache -> build-train-snapshots -> build-calibration-bundle(DB replay-only) -> build-study-cache -> frozen_seed_v1 study`.
+- `build-calibration-chunk` must fail fast if it attempts `load_for_scenario(... research_similarity_v2)`, `generate_similarity_candidates_rolling`, or `build_event_memory_asof`.
+
+V1 scope:
+
+- authoritative baseline: `best1`
+- target policy scope: `directional_wide_only`
+- study mode: `frozen_seed_v1`
+- official seed profile: `calibration_universe_v1`
+- official first-study budget: `32 trials`
+- official first-study shape: `3-fold walk-forward`, warm-start required
+- Phase A meaning-preserving runtime keeps `model_version = daily_reuse_v1`
+- Phase B model-changing runtime promotes `snapshot_cadence = monthly`, `model_version = monthly_snapshot_v1`
+
+Calibration bundle rule:
+
+- BUY rows enter the calibration universe when they are `directional_wide`, not member-collapse rows, and have replayable `T+1` path data
+- `optuna_eligible`, `forecast_selected`, and recurring-family flags are kept as metadata, not hard entry gates
+- SELL rows are attached for every symbol that ever entered the BUY calibration universe, starting from that symbol's first BUY date onward
+- this makes Optuna replay full same-day buy competition plus daily holding-wide sell repricing across the whole calibration universe
+- bundle generation is incremental and resumable through `bt_result.calibration_bundle_run`, `bt_result.calibration_chunk_run`, `bt_result.calibration_query_feature_row`, `bt_result.calibration_snapshot_run`, `bt_result.calibration_seed_row`, and `bt_result.calibration_replay_bar`
+- `calibration_chunk_run` phase timing is the source of truth for whether the bottleneck is query feature build, snapshot load, frozen scoring, or DB write
+
+V1 execution comparison is a **policy-family ablation**, not a flat parameter list:
+
+- `single_leg`
+- `ladder_v1`
+
+Interpretation rule:
+
+- first decide whether ladder is structurally better than single-leg on the same frozen seed
+- only if ladder wins consistently should leg geometry be promoted to a deeper follow-up search
+
+Ladder promotion default:
+
+- `ladder_v1` beats `single_leg` in at least 2 of 3 chronological folds
+- median `final_equity` uplift is at least `+1%`
+- max drawdown degradation is no worse than `2%p`
+
+If those thresholds are not met, keep the TOBE V1 execution policy on `single_leg`.
 
 `not_ready_single_prototype_collapse` now has a stricter meaning:
 

@@ -5,6 +5,7 @@
 - Run backtest + research against local PostgreSQL only.
 - Keep schema/bootstrap SQL-first from `db/sql/**/*.sql` only.
 - Standardize local bootstrap on the supported local-db paths.
+- Allow local-only calibration materialization tables for Optuna preparation.
 
 ## Official strategy
 The local database strategy has two official execution paths:
@@ -24,6 +25,35 @@ The local database strategy has two official execution paths:
 - requires a matching pre-materialized `bt_event_window` scenario snapshot and manifest row
 
 This keeps mirror bootstrap simple while making legacy-comparison requirements explicit.
+
+## Research-only calibration materialization
+
+The same local PostgreSQL instance now also hosts **research-only calibration cache** tables under `bt_result`.
+
+These tables are not part of the live path:
+
+- `bt_result.calibration_bundle_run`
+- `bt_result.calibration_chunk_run`
+- `bt_result.calibration_query_feature_row`
+- `bt_result.calibration_snapshot_run`
+- `bt_result.calibration_seed_row`
+- `bt_result.calibration_replay_bar`
+
+Purpose:
+
+- incremental chunk resume
+- coverage accounting
+- persisted query feature cache
+- persisted train snapshot ledger
+- replay-bar materialization for official Optuna studies
+- export of compact parquet study caches
+
+Storage rule:
+
+- raw mirror data remains the source of truth
+- calibration materialization is local-only research storage
+- official research path is `build-query-feature-cache -> build-train-snapshots -> build-calibration-bundle(DB replay-only) -> build-study-cache`
+- Optuna still replays exported fold parquet caches, not live DB queries inside each trial
 
 ## Supported bootstrap path for both A and B
 ### 0) Set env

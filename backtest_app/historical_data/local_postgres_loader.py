@@ -97,6 +97,48 @@ class LocalPostgresLoader:
         self.session_factory = session_factory
         self.schema = schema
 
+    def load_research_context(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        symbols: Iterable[str],
+        research_spec: ResearchExperimentSpec | None = None,
+    ) -> Dict[str, Any]:
+        symbols = [str(symbol) for symbol in symbols if symbol]
+        if not symbols:
+            raise ValueError("symbols required")
+        spec = research_spec or ResearchExperimentSpec()
+        prewarm_days = max(WARMUP_DAYS, spec.feature_window_bars * 2)
+        bars_by_symbol = self._load_bars(
+            start_date=start_date,
+            end_date=end_date,
+            symbols=symbols,
+            warmup_days=prewarm_days,
+        )
+        sector_map = self._load_sector_map(symbols)
+        session_metadata_by_symbol, missing_session_metadata_symbols = self._load_session_metadata(symbols)
+        macro_series_history = self._load_macro_series_history(
+            start_date=start_date,
+            end_date=end_date,
+            prewarm_days=prewarm_days,
+        )
+        macro_history_by_date = _macro_history_by_obs_date(
+            macro_series_history,
+            start_date=start_date,
+            end_date=end_date,
+            prewarm_days=prewarm_days,
+        )
+        return {
+            "bars_by_symbol": bars_by_symbol,
+            "sector_map": sector_map,
+            "session_metadata_by_symbol": session_metadata_by_symbol,
+            "missing_session_metadata_symbols": missing_session_metadata_symbols,
+            "macro_series_history": macro_series_history,
+            "macro_history_by_date": macro_history_by_date,
+            "prewarm_days": prewarm_days,
+        }
+
     def load_for_scenario(self, *, scenario_id: str, market: str, start_date: str, end_date: str, symbols: Iterable[str], strategy_mode: str = "legacy_event_window", research_spec: ResearchExperimentSpec | None = None, train_end: str | None = None, decision_dates: Iterable[str] | None = None, metadata: Dict[str, str] | None = None, progress_callback=None) -> HistoricalSlice:
         symbols = [s for s in symbols if s]
         if not symbols:
@@ -135,6 +177,49 @@ class LocalPostgresLoader:
         enriched = self._enrich_candidates(candidates, features_by_symbol)
         snapshot = MarketSnapshot(as_of=snapshot_ts, market=MarketCode(market), session_label="BACKTEST", is_open=False)
         return HistoricalSlice(market_snapshot=snapshot, bars_by_symbol=bars_by_symbol, candidates=enriched, session_metadata_by_symbol=session_metadata_by_symbol, metadata={"source": "local-db", "scenario_id": scenario_id, "strategy_mode": strategy_mode, "sector_map": sector_map, "session_metadata_by_symbol": {symbol: session_metadata_to_dict(meta) for symbol, meta in session_metadata_by_symbol.items()}, "missing_session_metadata_symbols": missing_session_metadata_symbols})
+
+    def list_tradable_symbols(self, *, market: str | None = None) -> List[str]:
+        sql = text(f"""
+        SELECT DISTINCT t.symbol
+          FROM {self.schema}.bt_mirror_ticker t
+          JOIN {self.schema}.bt_mirror_ohlcv_daily o ON o.symbol = t.symbol
+         WHERE t.symbol IS NOT NULL
+           AND t.symbol <> ''
+           AND (
+                :market = ''
+                OR (:market = 'US' AND COALESCE(t.country, '') <> 'KR' AND COALESCE(t.exchange, '') NOT IN ('KRX', 'KOSPI', 'KOSDAQ', 'KOE'))
+                OR (:market = 'KR' AND (COALESCE(t.country, '') = 'KR' OR COALESCE(t.exchange, '') IN ('KRX', 'KOSPI', 'KOSDAQ', 'KOE')))
+           )
+         ORDER BY t.symbol
+        """)
+        normalized_market = str(market or "").upper()
+        with self.session_factory() as session:
+            rows = [str(row._mapping["symbol"]) for row in session.execute(sql, {"market": normalized_market})]
+        return rows
+
+    def available_date_range(self, *, symbols: Iterable[str] | None = None) -> tuple[str | None, str | None]:
+        symbol_list = [str(symbol) for symbol in (symbols or []) if symbol]
+        if symbol_list:
+            sql = text(f"""
+            SELECT MIN(trade_date) AS min_trade_date, MAX(trade_date) AS max_trade_date
+              FROM {self.schema}.bt_mirror_ohlcv_daily
+             WHERE symbol = ANY(:symbols)
+            """)
+            params = {"symbols": symbol_list}
+        else:
+            sql = text(f"""
+            SELECT MIN(trade_date) AS min_trade_date, MAX(trade_date) AS max_trade_date
+              FROM {self.schema}.bt_mirror_ohlcv_daily
+            """)
+            params = {}
+        with self.session_factory() as session:
+            row = session.execute(sql, params).one()._mapping
+        min_trade_date = row.get("min_trade_date")
+        max_trade_date = row.get("max_trade_date")
+        return (
+            str(min_trade_date) if min_trade_date is not None else None,
+            str(max_trade_date) if max_trade_date is not None else None,
+        )
 
     def _enrich_candidates(self, candidates: List[SignalCandidate], features_by_symbol: Dict[str, Dict[str, float]]) -> List[SignalCandidate]:
         enriched: List[SignalCandidate] = []

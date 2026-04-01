@@ -44,3 +44,23 @@ class JsonResearchArtifactStore:
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def save_train_snapshot(
+        self,
+        *,
+        run_id: str,
+        name: str = "train_snapshot",
+        as_of_date: str,
+        memory_version: str,
+        payload: Mapping[str, Any],
+    ) -> str:
+        envelope = {"as_of_date": as_of_date, "memory_version": memory_version, **dict(payload)}
+        path = self._dir(run_id) / f"{name}.json"
+        path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        return str(path)
+
+    def load_train_snapshot(self, *, run_id: str, name: str = "train_snapshot") -> dict | None:
+        path = self._dir(run_id) / f"{name}.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))

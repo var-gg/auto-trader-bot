@@ -18,6 +18,7 @@ from backtest_app.portfolio import PortfolioConfig, PortfolioState, build_portfo
 from backtest_app.quote_policy import QuotePolicyConfig, compare_policy_ab
 from backtest_app.reporting.summary import build_summary
 from backtest_app.research.pre_optuna import build_pre_optuna_evidence
+from backtest_app.research_runtime.frozen_seed import build_optuna_replay_seed, write_optuna_replay_seed_artifacts
 from backtest_app.results.store import JsonResultStore, SqlResultStore
 from backtest_app.research_runtime.runner import ensure_manifest
 from backtest_app.simulated_broker.engine import SimulatedBroker
@@ -406,11 +407,18 @@ def _write_prototype_compression_artifacts(
     }
 
 
-def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, forecast_rows: list[dict[str, Any]], pre_optuna_analysis: dict[str, Any] | None = None, compression_analysis: dict[str, Any] | None = None, progress_callback=None, total_trading_dates: int = 0, completed_trading_dates: int = 0, candidate_rows: int = 0, plans_count: int = 0, fills_count: int = 0) -> dict[str, Any]:
+def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, forecast_rows: list[dict[str, Any]], pre_optuna_analysis: dict[str, Any] | None = None, compression_analysis: dict[str, Any] | None = None, bars_by_symbol: dict[str, list[Any]] | None = None, run_label: str = "", progress_callback=None, total_trading_dates: int = 0, completed_trading_dates: int = 0, candidate_rows: int = 0, plans_count: int = 0, fills_count: int = 0) -> dict[str, Any]:
     rows = list(forecast_rows or [])
     analysis = dict(pre_optuna_analysis or build_pre_optuna_evidence(rows))
     run_dir = Path(output_dir) / "research" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    replay_seed = build_optuna_replay_seed(
+        forecast_rows=list(analysis.get("forecast_rows") or rows),
+        bars_by_symbol=bars_by_symbol or {},
+        run_label=run_label or run_id,
+        policy_scope=str((analysis.get("pre_optuna_packet") or {}).get("next_optuna_target_scope") or "directional_wide_only"),
+    )
+    replay_seed_artifacts = write_optuna_replay_seed_artifacts(run_dir=run_dir, replay_seed=replay_seed)
     compression_artifacts = _write_prototype_compression_artifacts(
         run_dir=run_dir,
         compression_analysis=compression_analysis,
@@ -432,7 +440,7 @@ def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, forecast_ro
             plans_count=plans_count,
             fills_count=fills_count,
         )
-        return {"row_count": 0, "csv_path": None, "parquet_path": None, **compression_artifacts, **pre_optuna_artifacts}
+        return {"row_count": 0, "csv_path": None, "parquet_path": None, **compression_artifacts, **pre_optuna_artifacts, **replay_seed_artifacts}
     try:
         import pandas as pd
     except Exception:
@@ -446,7 +454,7 @@ def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, forecast_ro
             plans_count=plans_count,
             fills_count=fills_count,
         )
-        return {"row_count": len(rows), "csv_path": None, "parquet_path": None, "write_error": "pandas_unavailable", **compression_artifacts, **pre_optuna_artifacts}
+        return {"row_count": len(rows), "csv_path": None, "parquet_path": None, "write_error": "pandas_unavailable", **compression_artifacts, **pre_optuna_artifacts, **replay_seed_artifacts}
     csv_path = run_dir / "forecast_panel.csv"
     parquet_path = run_dir / "forecast_panel.parquet"
     _emit_progress(progress_callback, {
@@ -518,6 +526,7 @@ def _write_forecast_panel_artifacts(*, output_dir: str, run_id: str, forecast_ro
         "parquet_format": parquet_format,
         **compression_artifacts,
         **pre_optuna_artifacts,
+        **replay_seed_artifacts,
     }
 
 
@@ -999,6 +1008,8 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
             forecast_rows=forecast_rows,
             pre_optuna_analysis=pre_optuna_analysis,
             compression_analysis=prototype_compression_analysis,
+            bars_by_symbol=historical.bars_by_symbol,
+            run_label=request.scenario.scenario_id,
             progress_callback=progress_callback,
             total_trading_dates=len(trading_dates),
             completed_trading_dates=len(trading_dates),
@@ -1018,6 +1029,12 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
             "prototype_compression_audit_path": forecast_panel_artifact.get("prototype_compression_audit_path"),
             "prototype_compression_table_path": forecast_panel_artifact.get("prototype_compression_table_path"),
         }
+        result["artifacts"]["optuna_replay_seed"] = {
+            "summary": dict(forecast_panel_artifact.get("optuna_replay_seed_summary") or {}),
+            "optuna_replay_seed_path": forecast_panel_artifact.get("optuna_replay_seed_path"),
+            "optuna_replay_seed_summary_path": forecast_panel_artifact.get("optuna_replay_seed_summary_path"),
+            "row_count": forecast_panel_artifact.get("optuna_replay_seed_row_count"),
+        }
         authoritative_summary["forecast_panel"] = forecast_panel_artifact
         authoritative_summary["pre_optuna_ready"] = bool((forecast_panel_artifact.get("pre_optuna_packet") or {}).get("pre_optuna_ready", False))
         authoritative_summary["pre_optuna_verdict"] = (forecast_panel_artifact.get("pre_optuna_packet") or {}).get("verdict")
@@ -1028,6 +1045,8 @@ def run_backtest(request: RunnerRequest, data_path: str | None, *, output_dir: s
         authoritative_summary["next_optuna_target_scope"] = (forecast_panel_artifact.get("pre_optuna_packet") or {}).get("next_optuna_target_scope")
         authoritative_summary["top_recurring_families"] = list((forecast_panel_artifact.get("pre_optuna_packet") or {}).get("top_recurring_families") or [])
         authoritative_summary["prototype_compression_audit"] = dict(forecast_panel_artifact.get("prototype_compression_audit") or prototype_compression_analysis)
+        authoritative_summary["optuna_replay_seed_row_count"] = forecast_panel_artifact.get("optuna_replay_seed_row_count")
+        authoritative_summary["optuna_replay_seed_summary"] = dict(forecast_panel_artifact.get("optuna_replay_seed_summary") or {})
         authoritative_summary_path = _write_authoritative_summary_artifact(output_dir=output_dir, payload=authoritative_summary)
         result["result_path"] = JsonResultStore(output_dir, namespace="research").save_run(run_id=manifest.manifest_id(), plans=plans, fills=fills, summary={**summary.__dict__, "diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "strategy_mode": strategy_mode}, diagnostics={"quote_policy_sweep": quote_policy_sweep, "portfolio": result["portfolio"], "signal_diagnostics": {**(diagnostics_payload if isinstance(diagnostics_payload, dict) else {}), "reproducibility": reproducibility}, "reproducibility": reproducibility}, manifest=manifest.to_dict())
         authoritative_summary["result_path"] = result.get("result_path")

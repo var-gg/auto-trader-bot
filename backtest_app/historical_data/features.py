@@ -21,6 +21,20 @@ class FeatureScaler:
     means: Dict[str, float]
     stds: Dict[str, float]
 
+    def to_payload(self) -> Dict[str, Dict[str, float]]:
+        return {
+            "means": {str(key): float(value) for key, value in self.means.items()},
+            "stds": {str(key): float(value) for key, value in self.stds.items()},
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Mapping[str, float]] | None) -> "FeatureScaler":
+        body = dict(payload or {})
+        return cls(
+            means={str(key): float(value) for key, value in dict(body.get("means") or {}).items()},
+            stds={str(key): float(value) for key, value in dict(body.get("stds") or {}).items()},
+        )
+
     def transform(self, features: Mapping[str, float]) -> Dict[str, float]:
         out: Dict[str, float] = {}
         for key, value in features.items():
@@ -35,6 +49,22 @@ class FeatureTransform:
     scaler: FeatureScaler
     feature_keys: List[str]
     version: str = FEATURE_TRANSFORM_VERSION
+
+    def to_payload(self) -> Dict[str, object]:
+        return {
+            "scaler": self.scaler.to_payload(),
+            "feature_keys": [str(key) for key in self.feature_keys],
+            "version": str(self.version),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object] | None) -> "FeatureTransform":
+        body = dict(payload or {})
+        return cls(
+            scaler=FeatureScaler.from_payload(body.get("scaler") if isinstance(body.get("scaler"), Mapping) else {}),
+            feature_keys=[str(key) for key in list(body.get("feature_keys") or [])],
+            version=str(body.get("version") or FEATURE_TRANSFORM_VERSION),
+        )
 
     def transform_raw_features(self, raw_features: Mapping[str, float]) -> Dict[str, float]:
         ordered_raw = {key: float(raw_features.get(key, 0.0) or 0.0) for key in self.feature_keys}
