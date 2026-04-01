@@ -91,34 +91,57 @@ def _consensus_signature_from_matches(matches: list[dict[str, Any]]) -> str:
 
 def _side_metrics(row: dict[str, Any], side: str) -> dict[str, Any]:
     prefix = "buy" if side == "BUY" else "sell"
-    matches = _parse_matches(row.get(f"{prefix}_top_matches_summary") or row.get("top_matches_summary"))
+    member_matches = _parse_matches(row.get(f"{prefix}_member_top_matches_summary"))
+    matches = member_matches or _parse_matches(row.get(f"{prefix}_top_matches_summary") or row.get("top_matches_summary"))
     weight_shares = _normalized_match_shares(matches)
     support_values = [_to_float(match.get("support")) for match in matches]
-    consensus_signature = str(row.get(f"{prefix}_consensus_signature") or "").strip() or _consensus_signature_from_matches(matches)
+    consensus_signature = (
+        str(row.get(f"{prefix}_member_consensus_signature") or "").strip()
+        or str(row.get(f"{prefix}_consensus_signature") or "").strip()
+        or _consensus_signature_from_matches(matches)
+    )
     q10 = _to_float(row.get(f"{prefix}_q10"), _to_float(row.get("q10")))
     q50 = _to_float(row.get(f"{prefix}_q50"), _to_float(row.get("q50")))
     q90 = _to_float(row.get(f"{prefix}_q90"), _to_float(row.get("q90")))
     interval_width = _to_float(row.get(f"{prefix}_interval_width"), max(q90 - q10, 0.0))
     uncertainty = _to_float(row.get(f"{prefix}_uncertainty"), _to_float(row.get("uncertainty")))
-    mixture_ess = _to_float(row.get(f"{prefix}_mixture_ess"), _to_float(row.get(f"{prefix}_effective_sample_size"), _to_float(row.get("effective_sample_size"))))
-    positive_weight_count = _to_int(row.get(f"{prefix}_positive_weight_candidate_count"), len([share for share in weight_shares if share > 0.0]))
-    prototype_pool_size = _to_int(row.get(f"{prefix}_prototype_pool_size"), 0)
+    mixture_ess = _to_float(
+        row.get(f"{prefix}_member_mixture_ess"),
+        _to_float(row.get(f"{prefix}_mixture_ess"), _to_float(row.get(f"{prefix}_effective_sample_size"), _to_float(row.get("effective_sample_size")))),
+    )
     return {
         "q10": q10,
         "q50": q50,
         "q90": q90,
+        "q50_d2_return": _to_float(row.get(f"{prefix}_q50_d2_return")),
+        "q50_d3_return": _to_float(row.get(f"{prefix}_q50_d3_return")),
+        "p_resolved_by_d2": _to_float(row.get(f"{prefix}_p_resolved_by_d2")),
+        "p_resolved_by_d3": _to_float(row.get(f"{prefix}_p_resolved_by_d3")),
         "interval_width": max(interval_width, max(q90 - q10, 0.0)),
         "uncertainty": uncertainty,
         "mixture_ess": mixture_ess,
-        "prototype_pool_size": prototype_pool_size,
-        "ranked_candidate_count": _to_int(row.get(f"{prefix}_ranked_candidate_count"), len(matches)),
-        "positive_weight_candidate_count": positive_weight_count,
-        "pre_truncation_candidate_count": _to_int(row.get(f"{prefix}_pre_truncation_candidate_count"), len(matches)),
-        "top1_weight_share": _to_float(row.get(f"{prefix}_top1_weight_share"), weight_shares[0] if weight_shares else 0.0),
-        "cumulative_weight_top3": _to_float(row.get(f"{prefix}_cumulative_weight_top3"), sum(weight_shares[:3])),
+        "prototype_pool_size": _to_int(row.get(f"{prefix}_prototype_pool_size"), 0),
+        "ranked_candidate_count": _to_int(row.get(f"{prefix}_ranked_candidate_count"), 0),
+        "positive_weight_candidate_count": _to_int(
+            row.get(f"{prefix}_positive_weight_member_count"),
+            _to_int(row.get(f"{prefix}_positive_weight_candidate_count"), len([share for share in weight_shares if share > 0.0])),
+        ),
+        "pre_truncation_candidate_count": _to_int(
+            row.get(f"{prefix}_member_pre_truncation_count"),
+            _to_int(row.get(f"{prefix}_pre_truncation_candidate_count"), len(matches)),
+        ),
+        "top1_weight_share": _to_float(
+            row.get(f"{prefix}_member_top1_weight_share"),
+            _to_float(row.get(f"{prefix}_top1_weight_share"), weight_shares[0] if weight_shares else 0.0),
+        ),
+        "cumulative_weight_top3": _to_float(
+            row.get(f"{prefix}_member_cumulative_weight_top3"),
+            _to_float(row.get(f"{prefix}_cumulative_weight_top3"), sum(weight_shares[:3])),
+        ),
         "member_support_sum": _to_float(row.get(f"{prefix}_member_support_sum"), _to_float(row.get(f"{prefix}_top_match_support_sum"), sum(support_values))),
         "consensus_signature": consensus_signature or "no_consensus",
         "matches": matches,
+        "member_candidate_count": _to_int(row.get(f"{prefix}_member_candidate_count"), len(matches)),
     }
 
 
@@ -175,12 +198,19 @@ def build_pre_optuna_evidence(
             dominant_side = _dominant_side(raw_row)
             metrics = _side_metrics(raw_row, dominant_side)
             regime_code = str(raw_row.get("query_regime_code") or raw_row.get("regime_code") or "UNKNOWN")
-            sector_code = str(raw_row.get("query_sector_code") or raw_row.get("sector_code") or "UNKNOWN")
+            sector_code = str(raw_row.get("sector_code") or raw_row.get("query_sector_code") or "UNKNOWN")
             shape_bucket = _shape_bucket(metrics["q50"], metrics["interval_width"])
-            pattern_key = "|".join([dominant_side, str(metrics["consensus_signature"] or "no_consensus"), regime_code, sector_code, shape_bucket])
-            prototype_pool_observed = int(metrics["prototype_pool_size"] or 0)
+            pattern_key = "|".join(
+                [
+                    dominant_side,
+                    str(metrics["consensus_signature"] or "no_consensus"),
+                    regime_code,
+                    sector_code,
+                    shape_bucket,
+                ]
+            )
             single_prototype_collapse = bool(
-                (prototype_pool_observed > 0 and prototype_pool_observed <= 1)
+                metrics["member_candidate_count"] <= 1
                 or metrics["positive_weight_candidate_count"] <= 1
                 or metrics["top1_weight_share"] >= 0.95
                 or metrics["mixture_ess"] <= 1.05
@@ -192,9 +222,14 @@ def build_pre_optuna_evidence(
                     "dominant_q10": metrics["q10"],
                     "dominant_q50": metrics["q50"],
                     "dominant_q90": metrics["q90"],
+                    "dominant_q50_d2_return": metrics["q50_d2_return"],
+                    "dominant_q50_d3_return": metrics["q50_d3_return"],
+                    "dominant_p_resolved_by_d2": metrics["p_resolved_by_d2"],
+                    "dominant_p_resolved_by_d3": metrics["p_resolved_by_d3"],
                     "dominant_interval_width": metrics["interval_width"],
                     "dominant_uncertainty": metrics["uncertainty"],
                     "prototype_pool_size": metrics["prototype_pool_size"],
+                    "member_candidate_count": metrics["member_candidate_count"],
                     "ranked_candidate_count": metrics["ranked_candidate_count"],
                     "positive_weight_candidate_count": metrics["positive_weight_candidate_count"],
                     "pre_truncation_candidate_count": metrics["pre_truncation_candidate_count"],
@@ -270,6 +305,10 @@ def build_pre_optuna_evidence(
                     "dominant_q10": row.get("dominant_q10"),
                     "dominant_q50": row.get("dominant_q50"),
                     "dominant_q90": row.get("dominant_q90"),
+                    "dominant_q50_d2_return": row.get("dominant_q50_d2_return"),
+                    "dominant_q50_d3_return": row.get("dominant_q50_d3_return"),
+                    "dominant_p_resolved_by_d2": row.get("dominant_p_resolved_by_d2"),
+                    "dominant_p_resolved_by_d3": row.get("dominant_p_resolved_by_d3"),
                     "dominant_interval_width": row.get("dominant_interval_width"),
                     "dominant_uncertainty": row.get("dominant_uncertainty"),
                     "mixture_ess": row.get("mixture_ess"),

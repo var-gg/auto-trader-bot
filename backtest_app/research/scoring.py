@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Iterable, List, Optional
 
 import numpy as np
@@ -29,6 +30,8 @@ class ScoringConfig:
 class EVConfig:
     top_k: int = 5
     kernel_temperature: float = 12.0
+    prototype_retrieval_k: int = 24
+    member_retrieval_k: int = 96
     min_effective_sample_size: float = 1.5
     max_uncertainty: float = 0.08
     min_expected_utility: float = 0.005
@@ -196,6 +199,22 @@ def _weighted_quantile(values: list[float], weights: np.ndarray, q: float) -> fl
     return float(vals[np.searchsorted(cdf, q, side="left")])
 
 
+def _weighted_mean(values: list[float], weights: np.ndarray) -> float:
+    if not values:
+        return 0.0
+    vals = np.asarray(values, dtype=float)
+    return float(np.sum(vals * weights))
+
+
+def _weighted_std(values: list[float], weights: np.ndarray) -> float:
+    if not values:
+        return 0.0
+    vals = np.asarray(values, dtype=float)
+    mean_value = float(np.sum(vals * weights))
+    var = float(np.sum(weights * ((vals - mean_value) ** 2)))
+    return float(np.sqrt(max(var, 0.0)))
+
+
 def _resolve_lower_bound(*, formula: str, q10: float, q25: float, q50: float, q90: float, expected_net_return: float, uncertainty: float) -> float:
     interval_width = float(q90 - q10)
     key = str(formula or "lb_v1").strip().lower()
@@ -206,70 +225,395 @@ def _resolve_lower_bound(*, formula: str, q10: float, q25: float, q50: float, q9
     return float(q10 - uncertainty)
 
 
-def estimate_distribution(*, side: str, query_embedding: list[float], candidates: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> DistributionEstimate:
-    cfg = ev_config or EVConfig()
-    calibration = calibration or CalibrationModel(method="identity")
+def _consensus_signature(rows: list[dict]) -> str:
+    signatures: list[str] = []
+    for row in rows[:3]:
+        candidate = row.get("candidate")
+        representative_hash = getattr(candidate, "representative_hash", None)
+        prototype_id = getattr(candidate, "prototype_id", None)
+        token = str(representative_hash or prototype_id or "").strip()
+        if token:
+            signatures.append(token)
+    return "|".join(signatures)
+
+
+def _member_signature(rows: list[dict]) -> str:
+    tokens: list[str] = []
+    for row in rows[:3]:
+        token = str(row.get("member_key") or "").strip()
+        if token:
+            tokens.append(token)
+    return "|".join(tokens)
+
+
+def _parse_member_ref(ref: str | None) -> tuple[str | None, str | None]:
+    text = str(ref or "").strip()
+    if not text:
+        return None, None
+    if ":" not in text:
+        return text, None
+    symbol, event_date = text.split(":", 1)
+    return symbol or None, event_date or None
+
+
+def _member_embedding(transformed_features: dict | None, expected_dim: int) -> list[float] | None:
+    features = dict(transformed_features or {})
+    if not features:
+        return None
+    values = [float(features[key]) for key in sorted(features.keys())]
+    if expected_dim and len(values) != expected_dim:
+        return None
+    return values
+
+
+def _member_side_stats(side_payload: dict) -> dict:
+    label = str(side_payload.get("first_touch_label") or "").upper()
+    return {
+        "after_cost_return_pct": float(side_payload.get("after_cost_return_pct", 0.0) or 0.0),
+        "mae_pct": abs(float(side_payload.get("mae_pct", 0.0) or 0.0)),
+        "mfe_pct": float(side_payload.get("mfe_pct", 0.0) or 0.0),
+        "close_return_d2_pct": float(side_payload.get("close_return_d2_pct", 0.0) or 0.0),
+        "close_return_d3_pct": float(side_payload.get("close_return_d3_pct", 0.0) or 0.0),
+        "resolved_by_d2": bool(side_payload.get("resolved_by_d2", False)),
+        "resolved_by_d3": bool(side_payload.get("resolved_by_d3", False)),
+        "p_target_first": 1.0 if label == "UP_FIRST" else 0.0,
+        "p_stop_first": 1.0 if label == "DOWN_FIRST" else 0.0,
+        "p_flat": 1.0 if bool(side_payload.get("flat")) or label == "FLAT" else 0.0,
+        "p_ambiguous": 1.0 if bool(side_payload.get("ambiguous")) or label == "AMBIGUOUS" else 0.0,
+        "p_no_trade": 1.0 if bool(side_payload.get("no_trade")) or label == "NO_TRADE" else 0.0,
+        "first_touch_label": label,
+    }
+
+
+def _prototype_candidate_rows(
+    *,
+    side: str,
+    query_embedding: list[float],
+    candidates: Iterable[StatePrototype],
+    regime_code: Optional[str],
+    sector_code: Optional[str],
+    cfg: EVConfig,
+    candidate_index: CandidateIndex | None,
+) -> tuple[list[StatePrototype], list[dict]]:
     ranked = _ranked_candidates(query_embedding=query_embedding, candidates=candidates, candidate_index=candidate_index)
-    rows = []
-    for c in ranked:
-        side_stats = _side_row(c, side)
+    rows: list[dict] = []
+    for candidate in ranked:
+        side_stats = _side_row(candidate, side)
         if not side_stats:
             continue
-        similarity = max(0.0, _cos(query_embedding, c.embedding))
-        regime_alignment = 1.0 if regime_code and c.regime_code == regime_code else 0.0
-        sector_alignment = 1.0 if sector_code and c.sector_code == sector_code else 0.0
-        freshness_score = 1.0 / (1.0 + max(0.0, float(side_stats.get("freshness_days", c.freshness_days or 0.0))) / 30.0)
-        support_score = min(1.0, float(side_stats.get("decayed_support", c.decayed_support or 0.0)) / 5.0)
+        similarity = max(0.0, _cos(query_embedding, candidate.embedding))
+        regime_alignment = 1.0 if regime_code and candidate.regime_code == regime_code else 0.0
+        sector_alignment = 1.0 if sector_code and candidate.sector_code == sector_code else 0.0
+        freshness_score = 1.0 / (1.0 + max(0.0, float(side_stats.get("freshness_days", candidate.freshness_days or 0.0))) / 30.0)
+        support_score = min(1.0, float(side_stats.get("decayed_support", candidate.decayed_support or 0.0)) / 5.0)
         kernel = np.exp(cfg.kernel_temperature * (similarity - 1.0)) if cfg.use_kernel_weighting else similarity
         weight = float(kernel * (0.45 + 0.30 * support_score + 0.25 * freshness_score) * (0.40 + 0.60 * max(regime_alignment, sector_alignment)))
-        p_target = float(side_stats.get("p_target_first", 0.0))
-        p_stop = float(side_stats.get("p_stop_first", 0.0))
-        p_flat = float(side_stats.get("p_flat", 0.0))
-        p_ambiguous = float(side_stats.get("p_ambiguous", 0.0))
-        p_no_trade = float(side_stats.get("p_no_trade", 0.0))
-        exp_ret = (
-            p_target * max(float(side_stats.get("return_q90_pct", side_stats.get("mean_return_pct", 0.0))), 0.0)
-            + p_flat * float(side_stats.get("return_q50_pct", side_stats.get("median_return_pct", 0.0)))
-            + float(side_stats.get("horizon_up_count", 0.0)) / max(float(side_stats.get("support_count", 1.0)), 1.0) * max(float(side_stats.get("mean_return_pct", 0.0)), 0.0)
-            - p_stop * abs(min(float(side_stats.get("return_q10_pct", side_stats.get("mean_return_pct", 0.0))), 0.0))
-            - float(side_stats.get("horizon_down_count", 0.0)) / max(float(side_stats.get("support_count", 1.0)), 1.0) * abs(min(float(side_stats.get("mean_return_pct", 0.0)), 0.0))
-            - 0.50 * p_ambiguous * (abs(float(side_stats.get("mae_mean_pct", 0.0))) + abs(float(side_stats.get("mfe_mean_pct", 0.0))))
-            - 0.75 * p_no_trade * abs(float(side_stats.get("return_q50_pct", side_stats.get("median_return_pct", 0.0))))
+        rows.append(
+            {
+                "candidate": candidate,
+                "similarity": similarity,
+                "prototype_weight": weight,
+                "regime_alignment": regime_alignment,
+                "sector_alignment": sector_alignment,
+                "support_score": support_score,
+                "freshness_score": freshness_score,
+                "side_stats": side_stats,
+            }
         )
-        rows.append({"candidate": c, "similarity": similarity, "weight": weight, "p_target": p_target, "p_stop": p_stop, "p_flat": p_flat, "p_ambiguous": p_ambiguous, "p_no_trade": p_no_trade, "ret": exp_ret, "mae": abs(float(side_stats.get("mae_mean_pct", 0.0))), "mfe": float(side_stats.get("mfe_mean_pct", 0.0)), "uncertainty": float(side_stats.get("uncertainty", 0.0)), "dispersion": float(side_stats.get("return_dispersion", 0.0)), "regime_alignment": regime_alignment, "freshness_score": freshness_score, "support_score": support_score, "side_stats": side_stats})
-    rows.sort(key=lambda x: x["weight"], reverse=True)
-    rows = rows[: cfg.top_k]
-    total_w = sum(r["weight"] for r in rows)
-    if total_w <= 1e-12:
-        return DistributionEstimate(side=side, uncertainty=1.0, utility={"fallback_raw_ev": 0.0}, top_matches=[])
-    weights = np.asarray([r["weight"] / total_w for r in rows], dtype=float)
-    p_target = float(sum(w * r["p_target"] for w, r in zip(weights, rows)))
-    p_stop = float(sum(w * r["p_stop"] for w, r in zip(weights, rows)))
-    p_flat = float(sum(w * r["p_flat"] for w, r in zip(weights, rows)))
-    p_ambiguous = float(sum(w * r["p_ambiguous"] for w, r in zip(weights, rows)))
-    p_no_trade = float(sum(w * r["p_no_trade"] for w, r in zip(weights, rows)))
-    exp_ret = float(sum(w * r["ret"] for w, r in zip(weights, rows)))
-    exp_mae = float(sum(w * r["mae"] for w, r in zip(weights, rows)))
-    exp_mfe = float(sum(w * r["mfe"] for w, r in zip(weights, rows)))
-    uncertainty = float(sum(w * r["uncertainty"] for w, r in zip(weights, rows)))
-    regime_alignment = float(sum(w * r["regime_alignment"] for w, r in zip(weights, rows)))
+    rows.sort(key=lambda row: row["prototype_weight"], reverse=True)
+    return ranked, rows
+
+
+def _expand_member_rows(
+    *,
+    side: str,
+    query_embedding: list[float],
+    query_date: str | None,
+    prototype_rows: list[dict],
+    regime_code: Optional[str],
+    sector_code: Optional[str],
+    cfg: EVConfig,
+) -> tuple[list[dict], int]:
+    raw_member_count = 0
+    deduped: dict[tuple[str, str, str], dict] = {}
+    query_dt = datetime.fromisoformat(query_date).date() if query_date else None
+    expected_dim = len(query_embedding)
+    for prototype_row in prototype_rows:
+        candidate = prototype_row["candidate"]
+        lineage = list((candidate.prototype_membership or {}).get("lineage") or [])
+        for member in lineage:
+            side_payload = dict((member.get("side_outcomes") or {}).get(side) or {})
+            embedding = _member_embedding(dict(member.get("transformed_features") or {}), expected_dim)
+            if not side_payload or embedding is None:
+                continue
+            raw_member_count += 1
+            symbol, event_date = _parse_member_ref(member.get("ref"))
+            if event_date is None:
+                event_date = getattr(candidate, "representative_date", None)
+            if symbol is None:
+                symbol = getattr(candidate, "representative_symbol", None)
+            dedup_key = (str(symbol or "UNKNOWN"), str(event_date or "UNKNOWN"), side)
+            if dedup_key in deduped:
+                continue
+            similarity = max(0.0, _cos(query_embedding, embedding))
+            regime_alignment = 1.0 if regime_code and candidate.regime_code == regime_code else 0.0
+            sector_alignment = 1.0 if sector_code and candidate.sector_code == sector_code else 0.0
+            support_prior = 0.55 + 0.45 * min(1.0, float((prototype_row.get("side_stats") or {}).get("decayed_support", candidate.decayed_support or 0.0)) / 5.0)
+            age_days = float(candidate.freshness_days or 0.0)
+            if query_dt is not None and event_date:
+                try:
+                    age_days = max(0.0, float((query_dt - datetime.fromisoformat(str(event_date)[:10]).date()).days))
+                except ValueError:
+                    age_days = float(candidate.freshness_days or 0.0)
+            freshness_prior = 1.0 / (1.0 + max(age_days, 0.0) / 30.0)
+            context_alignment = 0.40 + 0.60 * max(regime_alignment, sector_alignment)
+            member_kernel = np.exp(cfg.kernel_temperature * (similarity - 1.0)) if cfg.use_kernel_weighting else similarity
+            member_weight = float(member_kernel * support_prior * freshness_prior * context_alignment)
+            deduped[dedup_key] = {
+                "candidate": candidate,
+                "member_key": f"{dedup_key[0]}:{dedup_key[1]}:{side}",
+                "symbol": dedup_key[0],
+                "event_date": dedup_key[1],
+                "similarity": similarity,
+                "member_weight": member_weight,
+                "regime_alignment": regime_alignment,
+                "sector_alignment": sector_alignment,
+                "support_prior": support_prior,
+                "freshness_prior": freshness_prior,
+                "context_alignment": context_alignment,
+                "member_stats": _member_side_stats(side_payload),
+            }
+    rows = list(deduped.values())
+    rows.sort(key=lambda row: row["member_weight"], reverse=True)
+    return rows[: cfg.member_retrieval_k], raw_member_count
+
+
+def estimate_distribution(
+    *,
+    side: str,
+    query_embedding: list[float],
+    candidates: Iterable[StatePrototype],
+    regime_code: Optional[str],
+    sector_code: Optional[str],
+    ev_config: EVConfig | None = None,
+    candidate_index: CandidateIndex | None = None,
+    calibration: CalibrationModel | None = None,
+    query_date: str | None = None,
+) -> DistributionEstimate:
+    cfg = ev_config or EVConfig()
+    calibration = calibration or CalibrationModel(method="identity")
+    ranked, prototype_rows_all = _prototype_candidate_rows(
+        side=side,
+        query_embedding=query_embedding,
+        candidates=candidates,
+        regime_code=regime_code,
+        sector_code=sector_code,
+        cfg=cfg,
+        candidate_index=candidate_index,
+    )
+    prototype_pool_size = len(ranked)
+    prototype_pre_truncation_count = len(prototype_rows_all)
+    prototype_positive_weight_count = sum(1 for row in prototype_rows_all if float(row.get("prototype_weight", 0.0) or 0.0) > 0.0)
+    prototype_rows = prototype_rows_all[: cfg.prototype_retrieval_k]
+    prototype_total_w = sum(float(row.get("prototype_weight", 0.0) or 0.0) for row in prototype_rows)
+    if prototype_total_w > 1e-12:
+        prototype_weights = np.asarray([float(row["prototype_weight"]) / float(prototype_total_w) for row in prototype_rows], dtype=float)
+        prototype_top1_weight_share = float(prototype_weights[0]) if len(prototype_weights) else 0.0
+        prototype_cumulative_top3 = float(np.sum(prototype_weights[:3])) if len(prototype_weights) else 0.0
+        prototype_mixture_ess = float(1.0 / np.sum(prototype_weights ** 2))
+    else:
+        prototype_top1_weight_share = 0.0
+        prototype_cumulative_top3 = 0.0
+        prototype_mixture_ess = 0.0
+    prototype_support_sum = float(
+        sum(float((row.get("side_stats") or {}).get("support_count", 0.0) or 0.0) for row in prototype_rows)
+    )
+    prototype_consensus_signature = _consensus_signature(prototype_rows)
+    top_matches = [
+        {
+            "prototype_id": row["candidate"].prototype_id,
+            "representative_hash": row["candidate"].representative_hash,
+            "weight": row["prototype_weight"],
+            "weight_share": float(prototype_weights[idx]) if prototype_total_w > 1e-12 and idx < len(prototype_weights) else 0.0,
+            "why": {
+                "similarity": row["similarity"],
+                "support": float((row["side_stats"] or {}).get("support_count", 0.0)),
+                "freshness_days": float((row["side_stats"] or {}).get("freshness_days", 0.0)),
+                "target_first_count": (row["side_stats"] or {}).get("target_first_count", 0),
+                "stop_first_count": (row["side_stats"] or {}).get("stop_first_count", 0),
+                "flat_count": (row["side_stats"] or {}).get("flat_count", 0),
+                "ambiguous_count": (row["side_stats"] or {}).get("ambiguous_count", 0),
+                "no_trade_count": (row["side_stats"] or {}).get("no_trade_count", 0),
+            },
+            "representative_symbol": row["candidate"].representative_symbol,
+            "expected_return": (row["side_stats"] or {}).get("mean_return_pct"),
+            "uncertainty": (row["side_stats"] or {}).get("uncertainty"),
+        }
+        for idx, row in enumerate(prototype_rows)
+    ]
+    member_rows, raw_member_count = _expand_member_rows(
+        side=side,
+        query_embedding=query_embedding,
+        query_date=query_date,
+        prototype_rows=prototype_rows,
+        regime_code=regime_code,
+        sector_code=sector_code,
+        cfg=cfg,
+    )
+    member_pre_truncation_count = len(member_rows)
+    positive_weight_member_count = sum(1 for row in member_rows if float(row.get("member_weight", 0.0) or 0.0) > 0.0)
+    total_member_w = sum(float(row.get("member_weight", 0.0) or 0.0) for row in member_rows)
+    if total_member_w <= 1e-12:
+        return DistributionEstimate(
+            side=side,
+            uncertainty=1.0,
+            effective_sample_size=0.0,
+            prototype_pool_size=prototype_pool_size,
+            ranked_candidate_count=len(prototype_rows),
+            positive_weight_candidate_count=prototype_positive_weight_count,
+            pre_truncation_candidate_count=prototype_pre_truncation_count,
+            top1_weight_share=prototype_top1_weight_share,
+            cumulative_weight_top3=prototype_cumulative_top3,
+            mixture_ess=prototype_mixture_ess,
+            member_support_sum=prototype_support_sum,
+            consensus_signature=prototype_consensus_signature,
+            member_candidate_count=raw_member_count,
+            member_pre_truncation_count=member_pre_truncation_count,
+            positive_weight_member_count=positive_weight_member_count,
+            utility={"fallback_raw_ev": 0.0},
+            top_matches=top_matches,
+        )
+    weights = np.asarray([float(row["member_weight"]) / float(total_member_w) for row in member_rows], dtype=float)
+    p_target = _weighted_mean([float(row["member_stats"]["p_target_first"]) for row in member_rows], weights)
+    p_stop = _weighted_mean([float(row["member_stats"]["p_stop_first"]) for row in member_rows], weights)
+    p_flat = _weighted_mean([float(row["member_stats"]["p_flat"]) for row in member_rows], weights)
+    p_ambiguous = _weighted_mean([float(row["member_stats"]["p_ambiguous"]) for row in member_rows], weights)
+    p_no_trade = _weighted_mean([float(row["member_stats"]["p_no_trade"]) for row in member_rows], weights)
+    values = [float(row["member_stats"]["after_cost_return_pct"]) for row in member_rows]
+    exp_ret = _weighted_mean(values, weights)
+    exp_mae = _weighted_mean([float(row["member_stats"]["mae_pct"]) for row in member_rows], weights)
+    exp_mfe = _weighted_mean([float(row["member_stats"]["mfe_pct"]) for row in member_rows], weights)
+    q50_d2 = _weighted_quantile([float(row["member_stats"]["close_return_d2_pct"]) for row in member_rows], weights, 0.50)
+    q50_d3 = _weighted_quantile([float(row["member_stats"]["close_return_d3_pct"]) for row in member_rows], weights, 0.50)
+    p_resolved_by_d2 = _weighted_mean([1.0 if bool(row["member_stats"]["resolved_by_d2"]) else 0.0 for row in member_rows], weights)
+    p_resolved_by_d3 = _weighted_mean([1.0 if bool(row["member_stats"]["resolved_by_d3"]) else 0.0 for row in member_rows], weights)
+    regime_alignment = _weighted_mean([float(row["regime_alignment"]) for row in member_rows], weights)
     n_eff = float(1.0 / np.sum(weights ** 2))
-    values = [float(r["ret"]) for r in rows]
+    dispersion = _weighted_std(values, weights)
+    uncertainty = float(dispersion / max(np.sqrt(n_eff), 1.0))
     q10 = _weighted_quantile(values, weights, 0.10)
     q25 = _weighted_quantile(values, weights, 0.25)
     q50 = _weighted_quantile(values, weights, 0.50)
     q90 = _weighted_quantile(values, weights, 0.90)
     lower_bound = _resolve_lower_bound(formula=cfg.diagnostic_lower_bound_formula, q10=q10, q25=q25, q50=q50, q90=q90, expected_net_return=exp_ret, uncertainty=uncertainty)
     upper_bound = q90 + uncertainty
-    utility = {"expected_net_return": exp_ret, "p_target_first": p_target, "p_stop_first": p_stop, "p_flat": p_flat, "p_ambiguous": p_ambiguous, "p_no_trade": p_no_trade, "mae_penalty": 0.5 * exp_mae, "mfe_credit": 0.25 * exp_mfe, "ambiguous_penalty": 0.5 * p_ambiguous, "no_trade_penalty": 0.75 * p_no_trade, "uncertainty_penalty": uncertainty, "fallback_raw_ev": exp_ret - 0.5 * exp_mae + 0.25 * exp_mfe - 0.5 * p_ambiguous - 0.75 * p_no_trade - uncertainty, "q25_return": q25, "interval_width": float(q90 - q10), "lower_bound_formula": cfg.diagnostic_lower_bound_formula}
-    top_matches = [{"prototype_id": r["candidate"].prototype_id, "representative_hash": r["candidate"].representative_hash, "weight": r["weight"], "why": {"similarity": r["similarity"], "support": float(r["side_stats"].get("support_count", 0.0)), "freshness_days": float(r["side_stats"].get("freshness_days", 0.0)), "target_first_count": r["side_stats"].get("target_first_count", 0), "stop_first_count": r["side_stats"].get("stop_first_count", 0), "flat_count": r["side_stats"].get("flat_count", 0), "ambiguous_count": r["side_stats"].get("ambiguous_count", 0), "no_trade_count": r["side_stats"].get("no_trade_count", 0)}, "representative_symbol": r["candidate"].representative_symbol, "expected_return": r["side_stats"].get("mean_return_pct"), "uncertainty": r["side_stats"].get("uncertainty")} for r in rows]
-    return DistributionEstimate(side=side, p_target_first=calibration.calibrate_prob(p_target), p_stop_first=calibration.calibrate_prob(p_stop), p_flat=max(0.0, min(1.0, p_flat)), expected_net_return=calibration.calibrate_ev(exp_ret), expected_mae=exp_mae, expected_mfe=exp_mfe, q10_return=q10, q50_return=q50, q90_return=q90, effective_sample_size=n_eff, regime_alignment=regime_alignment, uncertainty=uncertainty, lower_bound_return=lower_bound, upper_bound_return=upper_bound, utility=utility, top_matches=top_matches)
+    member_top1_weight_share = float(weights[0]) if len(weights) else 0.0
+    member_cumulative_weight_top3 = float(np.sum(weights[:3])) if len(weights) else 0.0
+    member_mixture_ess = n_eff
+    member_consensus_signature = _member_signature(member_rows)
+    member_top_matches = [
+        {
+            "member_key": row["member_key"],
+            "symbol": row["symbol"],
+            "event_date": row["event_date"],
+            "prototype_id": row["candidate"].prototype_id,
+            "representative_hash": row["candidate"].representative_hash,
+            "weight": row["member_weight"],
+            "weight_share": float(weights[idx]) if idx < len(weights) else 0.0,
+            "similarity": row["similarity"],
+            "after_cost_return_pct": row["member_stats"]["after_cost_return_pct"],
+            "close_return_d2_pct": row["member_stats"]["close_return_d2_pct"],
+            "close_return_d3_pct": row["member_stats"]["close_return_d3_pct"],
+            "resolved_by_d2": row["member_stats"]["resolved_by_d2"],
+            "resolved_by_d3": row["member_stats"]["resolved_by_d3"],
+            "first_touch_label": row["member_stats"]["first_touch_label"],
+        }
+        for idx, row in enumerate(member_rows[: min(len(member_rows), 8)])
+    ]
+    utility = {
+        "expected_net_return": exp_ret,
+        "p_target_first": p_target,
+        "p_stop_first": p_stop,
+        "p_flat": p_flat,
+        "p_ambiguous": p_ambiguous,
+        "p_no_trade": p_no_trade,
+        "mae_penalty": 0.5 * exp_mae,
+        "mfe_credit": 0.25 * exp_mfe,
+        "ambiguous_penalty": 0.5 * p_ambiguous,
+        "no_trade_penalty": 0.75 * p_no_trade,
+        "uncertainty_penalty": uncertainty,
+        "fallback_raw_ev": exp_ret - 0.5 * exp_mae + 0.25 * exp_mfe - 0.5 * p_ambiguous - 0.75 * p_no_trade - uncertainty,
+        "q25_return": q25,
+        "interval_width": float(q90 - q10),
+        "lower_bound_formula": cfg.diagnostic_lower_bound_formula,
+        "q50_d2_return": q50_d2,
+        "q50_d3_return": q50_d3,
+        "p_resolved_by_d2": p_resolved_by_d2,
+        "p_resolved_by_d3": p_resolved_by_d3,
+        "prototype_pool_size": prototype_pool_size,
+        "ranked_candidate_count": len(prototype_rows),
+        "positive_weight_candidate_count": prototype_positive_weight_count,
+        "pre_truncation_candidate_count": prototype_pre_truncation_count,
+        "top1_weight_share": prototype_top1_weight_share,
+        "cumulative_weight_top3": prototype_cumulative_top3,
+        "mixture_ess": prototype_mixture_ess,
+        "member_support_sum": prototype_support_sum,
+        "consensus_signature": prototype_consensus_signature,
+        "member_candidate_count": raw_member_count,
+        "member_pre_truncation_count": member_pre_truncation_count,
+        "positive_weight_member_count": positive_weight_member_count,
+        "member_top1_weight_share": member_top1_weight_share,
+        "member_cumulative_weight_top3": member_cumulative_weight_top3,
+        "member_mixture_ess": member_mixture_ess,
+        "member_consensus_signature": member_consensus_signature,
+        "member_top_matches": member_top_matches,
+    }
+    return DistributionEstimate(
+        side=side,
+        p_target_first=calibration.calibrate_prob(p_target),
+        p_stop_first=calibration.calibrate_prob(p_stop),
+        p_flat=max(0.0, min(1.0, p_flat)),
+        expected_net_return=calibration.calibrate_ev(exp_ret),
+        expected_mae=exp_mae,
+        expected_mfe=exp_mfe,
+        q10_return=q10,
+        q50_return=q50,
+        q90_return=q90,
+        effective_sample_size=n_eff,
+        regime_alignment=regime_alignment,
+        uncertainty=uncertainty,
+        lower_bound_return=lower_bound,
+        upper_bound_return=upper_bound,
+        q50_d2_return=q50_d2,
+        q50_d3_return=q50_d3,
+        p_resolved_by_d2=p_resolved_by_d2,
+        p_resolved_by_d3=p_resolved_by_d3,
+        prototype_pool_size=prototype_pool_size,
+        ranked_candidate_count=len(prototype_rows),
+        positive_weight_candidate_count=prototype_positive_weight_count,
+        pre_truncation_candidate_count=prototype_pre_truncation_count,
+        top1_weight_share=prototype_top1_weight_share,
+        cumulative_weight_top3=prototype_cumulative_top3,
+        mixture_ess=prototype_mixture_ess,
+        member_support_sum=prototype_support_sum,
+        consensus_signature=prototype_consensus_signature,
+        member_candidate_count=raw_member_count,
+        member_pre_truncation_count=member_pre_truncation_count,
+        positive_weight_member_count=positive_weight_member_count,
+        member_top1_weight_share=member_top1_weight_share,
+        member_cumulative_weight_top3=member_cumulative_weight_top3,
+        member_mixture_ess=member_mixture_ess,
+        member_consensus_signature=member_consensus_signature,
+        utility=utility,
+        top_matches=top_matches,
+    )
 
 
-def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> DecisionSurface:
+def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None, query_date: str | None = None) -> DecisionSurface:
     cfg = ev_config or EVConfig()
-    buy = estimate_distribution(side="BUY", query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
-    sell = estimate_distribution(side="SELL", query_embedding=query_embedding, candidates=prototype_pool, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration)
+    prototype_pool_rows = list(prototype_pool) if not isinstance(prototype_pool, list) else prototype_pool
+    buy = estimate_distribution(side="BUY", query_embedding=query_embedding, candidates=prototype_pool_rows, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration, query_date=query_date)
+    sell = estimate_distribution(side="SELL", query_embedding=query_embedding, candidates=prototype_pool_rows, regime_code=regime_code, sector_code=sector_code, ev_config=cfg, candidate_index=candidate_index, calibration=calibration, query_date=query_date)
 
     def _side_reasons(dist: DistributionEstimate) -> tuple[list[str], float]:
         side_reasons = []
@@ -325,11 +669,46 @@ def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iter
 
     abstain = bool(reasons)
     why = better if not abstain else "ABSTAIN"
-    return DecisionSurface(buy=buy, sell=sell, chosen_side="ABSTAIN" if abstain else better, abstain=abstain, abstain_reasons=reasons, diagnostics={"prototype_pool_size": len(list(prototype_pool)) if not isinstance(prototype_pool, list) else len(prototype_pool), "shared_neighbor_pool": True, "buy_summary": buy.utility, "sell_summary": sell.utility, "gate_ablation": {"diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate, "diagnostic_disable_ess_gate": cfg.diagnostic_disable_ess_gate, "diagnostic_lower_bound_formula": cfg.diagnostic_lower_bound_formula, "diagnostic_feasible_side_chooser": cfg.diagnostic_feasible_side_chooser}, "side_gate_eval": {"buy_pass": buy_pass, "sell_pass": sell_pass, "buy_reasons": buy_reasons, "sell_reasons": sell_reasons}, "decision_rule": {"winner": better, "abstain_margin": cfg.abstain_margin, "buy_sell_ev_gap": buy_edge, "sell_buy_ev_gap": sell_edge, "chosen_lower_bound": chosen.lower_bound_return if better in {"BUY", "SELL"} else None, "chosen_interval_width": interval_width, "chosen_effective_sample_size": chosen.effective_sample_size if better in {"BUY", "SELL"} else None, "chosen_uncertainty": chosen.uncertainty if better in {"BUY", "SELL"} else None, "diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate, "diagnostic_disable_ess_gate": cfg.diagnostic_disable_ess_gate, "diagnostic_lower_bound_formula": cfg.diagnostic_lower_bound_formula, "diagnostic_feasible_side_chooser": cfg.diagnostic_feasible_side_chooser, "why": why, "why_summary": f"{why}: p_target={chosen.utility.get('p_target_first', 0.0):.2f}, p_stop={chosen.utility.get('p_stop_first', 0.0):.2f}, p_flat={chosen.utility.get('p_flat', 0.0):.2f}, p_ambiguous={chosen.utility.get('p_ambiguous', 0.0):.2f}, p_no_trade={chosen.utility.get('p_no_trade', 0.0):.2f}"}})
+    return DecisionSurface(
+        buy=buy,
+        sell=sell,
+        chosen_side="ABSTAIN" if abstain else better,
+        abstain=abstain,
+        abstain_reasons=reasons,
+        diagnostics={
+            "prototype_pool_size": len(prototype_pool_rows),
+            "shared_neighbor_pool": True,
+            "buy_summary": buy.utility,
+            "sell_summary": sell.utility,
+            "gate_ablation": {
+                "diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate,
+                "diagnostic_disable_ess_gate": cfg.diagnostic_disable_ess_gate,
+                "diagnostic_lower_bound_formula": cfg.diagnostic_lower_bound_formula,
+                "diagnostic_feasible_side_chooser": cfg.diagnostic_feasible_side_chooser,
+            },
+            "side_gate_eval": {"buy_pass": buy_pass, "sell_pass": sell_pass, "buy_reasons": buy_reasons, "sell_reasons": sell_reasons},
+            "decision_rule": {
+                "winner": better,
+                "abstain_margin": cfg.abstain_margin,
+                "buy_sell_ev_gap": buy_edge,
+                "sell_buy_ev_gap": sell_edge,
+                "chosen_lower_bound": chosen.lower_bound_return if better in {"BUY", "SELL"} else None,
+                "chosen_interval_width": interval_width,
+                "chosen_effective_sample_size": chosen.effective_sample_size if better in {"BUY", "SELL"} else None,
+                "chosen_uncertainty": chosen.uncertainty if better in {"BUY", "SELL"} else None,
+                "diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate,
+                "diagnostic_disable_ess_gate": cfg.diagnostic_disable_ess_gate,
+                "diagnostic_lower_bound_formula": cfg.diagnostic_lower_bound_formula,
+                "diagnostic_feasible_side_chooser": cfg.diagnostic_feasible_side_chooser,
+                "why": why,
+                "why_summary": f"{why}: p_target={chosen.utility.get('p_target_first', 0.0):.2f}, p_stop={chosen.utility.get('p_stop_first', 0.0):.2f}, p_flat={chosen.utility.get('p_flat', 0.0):.2f}, p_ambiguous={chosen.utility.get('p_ambiguous', 0.0):.2f}, p_no_trade={chosen.utility.get('p_no_trade', 0.0):.2f}",
+            },
+        },
+    )
 
 
-def estimate_expected_value(*, side: str, query_embedding: list[float], candidates: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None) -> EVEstimate:
-    dist = estimate_distribution(side=side, query_embedding=query_embedding, candidates=candidates, regime_code=regime_code, sector_code=sector_code, ev_config=ev_config, candidate_index=candidate_index, calibration=calibration)
+def estimate_expected_value(*, side: str, query_embedding: list[float], candidates: Iterable[StatePrototype], regime_code: Optional[str], sector_code: Optional[str], ev_config: EVConfig | None = None, candidate_index: CandidateIndex | None = None, calibration: CalibrationModel | None = None, query_date: str | None = None) -> EVEstimate:
+    dist = estimate_distribution(side=side, query_embedding=query_embedding, candidates=candidates, regime_code=regime_code, sector_code=sector_code, ev_config=ev_config, candidate_index=candidate_index, calibration=calibration, query_date=query_date)
     cfg = ev_config or EVConfig()
     reasons = []
     if dist.utility.get("fallback_raw_ev", 0.0) < cfg.min_expected_utility:
@@ -342,4 +721,46 @@ def estimate_expected_value(*, side: str, query_embedding: list[float], candidat
         reasons.append("regime_mismatch")
     if dist.lower_bound_return <= 0.0:
         reasons.append("lower_bound_non_positive")
-    return EVEstimate(side=side, expected_utility=float(dist.utility.get("fallback_raw_ev", 0.0)), expected_net_return=dist.expected_net_return, p_up_first=dist.p_target_first, p_down_first=dist.p_stop_first, expected_mae=dist.expected_mae, expected_mfe=dist.expected_mfe, uncertainty=dist.uncertainty, dispersion=float(max(dist.q90_return - dist.q10_return, 0.0)), effective_sample_size=dist.effective_sample_size, regime_alignment=dist.regime_alignment, calibrated_ev=dist.expected_net_return, calibrated_win_prob=dist.p_target_first, abstained=bool(reasons), abstain_reasons=reasons, top_matches=dist.top_matches, diagnostics={"ev_decomposition": dist.utility, "raw_ev": dist.utility.get("fallback_raw_ev", 0.0), "decision_surface_compatible": True, "interval": {"q10": dist.q10_return, "q50": dist.q50_return, "q90": dist.q90_return}})
+    return EVEstimate(
+        side=side,
+        expected_utility=float(dist.utility.get("fallback_raw_ev", 0.0)),
+        expected_net_return=dist.expected_net_return,
+        p_up_first=dist.p_target_first,
+        p_down_first=dist.p_stop_first,
+        expected_mae=dist.expected_mae,
+        expected_mfe=dist.expected_mfe,
+        uncertainty=dist.uncertainty,
+        dispersion=float(max(dist.q90_return - dist.q10_return, 0.0)),
+        effective_sample_size=dist.effective_sample_size,
+        regime_alignment=dist.regime_alignment,
+        calibrated_ev=dist.expected_net_return,
+        calibrated_win_prob=dist.p_target_first,
+        abstained=bool(reasons),
+        abstain_reasons=reasons,
+        top_matches=dist.top_matches,
+        diagnostics={
+            "ev_decomposition": dist.utility,
+            "raw_ev": dist.utility.get("fallback_raw_ev", 0.0),
+            "decision_surface_compatible": True,
+            "interval": {"q10": dist.q10_return, "q50": dist.q50_return, "q90": dist.q90_return},
+            "telemetry": {
+                "prototype_pool_size": dist.prototype_pool_size,
+                "ranked_candidate_count": dist.ranked_candidate_count,
+                "positive_weight_candidate_count": dist.positive_weight_candidate_count,
+                "pre_truncation_candidate_count": dist.pre_truncation_candidate_count,
+                "top1_weight_share": dist.top1_weight_share,
+                "cumulative_weight_top3": dist.cumulative_weight_top3,
+                "mixture_ess": dist.mixture_ess,
+                "member_support_sum": dist.member_support_sum,
+                "consensus_signature": dist.consensus_signature,
+                "member_candidate_count": dist.member_candidate_count,
+                "member_pre_truncation_count": dist.member_pre_truncation_count,
+                "positive_weight_member_count": dist.positive_weight_member_count,
+                "member_top1_weight_share": dist.member_top1_weight_share,
+                "member_cumulative_weight_top3": dist.member_cumulative_weight_top3,
+                "member_mixture_ess": dist.member_mixture_ess,
+                "member_consensus_signature": dist.member_consensus_signature,
+            },
+            "member_top_matches": dist.utility.get("member_top_matches", []),
+        },
+    )

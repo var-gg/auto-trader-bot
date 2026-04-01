@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from queue import Empty, SimpleQueue
+from threading import Thread
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -51,6 +53,14 @@ BASELINE_TRADING_DATES = 25
 STALL_SECONDS = 45
 MONITOR_INTERVAL_SECONDS = 2.0
 CPU_HIGH_DELTA_SECONDS = 0.5
+PHASE_TIMEOUT_SECONDS = {
+    "load_historical": 45 * 60,
+    "candidate_grouping": 4 * 60 * 60,
+    "daily_execution": 10 * 60,
+    "summary_and_validation": 60 * 60,
+    "write_artifacts": 20 * 60,
+    "child_finalize": 20 * 60,
+}
 BASE_SPEC = ResearchExperimentSpec(
     feature_window_bars=60,
     lookback_horizons=[5],
@@ -257,6 +267,20 @@ class ProgressRecorder:
         _write_json(self.status_path, payload)
 
 
+def _mark_stall_error(run_dir: Path, stall_reason: str) -> None:
+    status_payload = _read_json(run_dir / "status.json")
+    status_payload.update(
+        {
+            "status": "error",
+            "phase": "stall_detected",
+            "stall_reason": stall_reason,
+            "event_at": datetime.now().isoformat(),
+        }
+    )
+    _write_json(run_dir / "status.json", status_payload)
+    _append_jsonl(run_dir / "progress.jsonl", status_payload)
+
+
 def _sum_dir_bytes(path: Path) -> int:
     total = 0
     if not path.exists():
@@ -302,6 +326,31 @@ def _pick_best_two_allowed(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     filtered = [r for r in rows if _is_allowed_tiny_candidate(r)]
     filtered.sort(key=_rank_key, reverse=True)
     return filtered[:2]
+
+
+def _read_existing_baseline_summary(output_root: Path) -> dict[str, Any] | None:
+    path = output_root / "baseline_summary.json"
+    if not path.exists():
+        return None
+    payload = _read_json(path)
+    if not payload.get("baseline_contract_passed"):
+        return None
+    status = dict(payload.get("status") or {})
+    result_path = Path(str(status.get("result_path") or "")) if status.get("result_path") else None
+    if result_path is None or not result_path.exists():
+        return None
+    return payload
+
+
+def _read_existing_medium_summary(output_root: Path, run_label: str) -> dict[str, Any] | None:
+    path = output_root / run_label / "summary.json"
+    if not path.exists():
+        return None
+    payload = _read_json(path)
+    result_path = Path(str(payload.get("result_path") or "")) if payload.get("result_path") else None
+    if result_path is None or not result_path.exists():
+        return None
+    return payload
 
 
 def _summarize_run(run_label: str, metadata: dict[str, str], result: dict[str, Any], scenario: BacktestScenario) -> dict[str, Any]:
@@ -458,24 +507,59 @@ def _write_contract_bundle(*, run_dir: Path, run_id: str, strategy_mode: str, pr
 def _monitor_child(run_dir: Path, proc: subprocess.Popen[str]) -> dict[str, Any]:
     monitor_path = run_dir / "monitor.json"
     stdout_path = run_dir / "child_stdout.log"
+    manifest = _read_json(run_dir / "manifest.json")
+    created_at = manifest.get("created_at")
     last_stdout_at: str | None = None
     last_cpu_total: float | None = None
     stall_reason: str | None = None
     last_metrics = {"cpu_delta": None, "rss": None, "cwd": None, "cmdline": None}
+    stdout_queue: SimpleQueue[str | None] = SimpleQueue()
+
+    def _stdout_reader() -> None:
+        if not proc.stdout:
+            stdout_queue.put(None)
+            return
+        try:
+            for line in proc.stdout:
+                stdout_queue.put(line)
+        finally:
+            stdout_queue.put(None)
+
+    Thread(target=_stdout_reader, daemon=True).start()
+    stdout_closed = False
     while True:
-        line = proc.stdout.readline() if proc.stdout else ""
-        if line:
+        while True:
+            try:
+                line = stdout_queue.get_nowait()
+            except Empty:
+                break
+            if line is None:
+                stdout_closed = True
+                break
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
             with stdout_path.open("a", encoding="utf-8") as f:
                 f.write(line)
             last_stdout_at = datetime.now().isoformat()
         child_alive = proc.poll() is None
-        progress_status = _read_json(run_dir / "status.json")
-        last_progress_at = progress_status.get("last_progress_at")
-        no_progress = False
-        if last_progress_at:
-            no_progress = (datetime.now() - datetime.fromisoformat(last_progress_at)).total_seconds() >= STALL_SECONDS
-        monitor = {"pid": proc.pid, "child_alive": child_alive, "last_stdout_at": last_stdout_at, "stall_reason": stall_reason}
+        status_payload = _read_json(run_dir / "status.json")
+        phase = str(status_payload.get("phase") or "unknown")
+        last_progress_at = status_payload.get("last_progress_at")
+        progress_anchor = last_progress_at or status_payload.get("event_at") or created_at
+        elapsed_since_progress = None
+        if progress_anchor:
+            elapsed_since_progress = (datetime.now() - datetime.fromisoformat(str(progress_anchor))).total_seconds()
+        phase_budget = PHASE_TIMEOUT_SECONDS.get(phase, STALL_SECONDS)
+        phase_budget_exceeded = elapsed_since_progress is not None and elapsed_since_progress >= phase_budget
+        monitor = {
+            "pid": proc.pid,
+            "child_alive": child_alive,
+            "last_stdout_at": last_stdout_at,
+            "stall_reason": stall_reason,
+            "phase": phase,
+            "phase_budget_seconds": phase_budget,
+            "elapsed_since_progress_seconds": elapsed_since_progress,
+            "phase_budget_exceeded": phase_budget_exceeded,
+        }
         if psutil is not None:
             try:
                 p = psutil.Process(proc.pid)
@@ -486,20 +570,28 @@ def _monitor_child(run_dir: Path, proc: subprocess.Popen[str]) -> dict[str, Any]
                     last_cpu_total = cpu_total
                     last_metrics = {"cpu_delta": cpu_delta, "rss": int(p.memory_info().rss), "cwd": p.cwd(), "cmdline": p.cmdline()}
                     monitor.update(last_metrics)
-                    if no_progress and cpu_delta is not None:
-                        stall_reason = "HOT_LOOP" if cpu_delta >= CPU_HIGH_DELTA_SECONDS else "BLOCKED_IO"
-                        monitor["stall_reason"] = stall_reason
+                    if phase in {"load_historical", "candidate_grouping"} and cpu_delta is not None and cpu_delta > 0:
+                        monitor["activity"] = "ACTIVE_COMPUTE"
             except Exception:
                 monitor.update(last_metrics)
         else:
             monitor.update(last_metrics)
-        status_payload = _read_json(run_dir / "status.json")
         actual_result_path = Path(str(status_payload.get("result_path") or "")) if status_payload.get("result_path") else None
         if not child_alive and (actual_result_path is None or not actual_result_path.exists()):
             stall_reason = "FAILED_NO_ARTIFACT"
             monitor["stall_reason"] = stall_reason
+        elif phase_budget_exceeded:
+            stall_reason = f"PHASE_BUDGET_EXCEEDED:{phase}"
+            monitor["stall_reason"] = stall_reason
         _write_json(monitor_path, monitor)
+        if stall_reason and status_payload.get("status") != "ok":
+            _mark_stall_error(run_dir, stall_reason)
+            if child_alive:
+                proc.kill()
+            break
         if not child_alive:
+            break
+        if stdout_closed and not child_alive:
             break
         time.sleep(MONITOR_INTERVAL_SECONDS)
     return _read_json(monitor_path)
@@ -543,9 +635,9 @@ def _child_run(run_dir: Path) -> int:
             scenario_id=scenario.scenario_id,
             strategy_mode="research_similarity_v2",
             output_dir=str(run_dir),
-            save_json=True,
-            enable_validation=True,
-            validation_max_folds=1,
+            save_json=bool(manifest.get("save_json", True)),
+            enable_validation=bool(manifest.get("enable_validation", False)),
+            validation_max_folds=int(manifest.get("validation_max_folds", 0)),
             progress_callback=_progress,
         )
         result_path = Path(str(result.get("result_path") or expected_path))
@@ -562,42 +654,65 @@ def _child_run(run_dir: Path) -> int:
         return 1
 
 
-def _run_baseline_parent(output_root: Path) -> dict[str, Any]:
-    driver = _ensure_public_committed_driver()
-    window = _resolve_baseline_window(BASELINE_SYMBOLS, BASELINE_TRADING_DATES)
-    preflight = preflight_local_db(BASELINE_SYMBOLS)
-    run_dir = output_root / BASELINE_RUN_LABEL
+def _prepare_child_run(
+    *,
+    output_root: Path,
+    run_label: str,
+    scenario: BacktestScenario,
+    metadata: dict[str, str],
+    preflight: dict[str, Any],
+    driver: dict[str, Any],
+    stage: str,
+    save_json: bool,
+    enable_validation: bool,
+    validation_max_folds: int,
+    extra_window: dict[str, Any] | None = None,
+) -> tuple[Path, Path]:
+    run_dir = output_root / run_label
     if run_dir.exists():
         shutil.rmtree(run_dir)
-    expected_path = _result_path_for_run(run_dir, "medium_viability_contract_baseline")
-    metadata = dict(BASE_METADATA)
-    metadata["diagnostic_run_label"] = BASELINE_RUN_LABEL
+    expected_path = _result_path_for_run(run_dir, scenario.scenario_id)
     manifest = {
-        "run_label": BASELINE_RUN_LABEL,
-        "stage": "baseline-only",
-        "scenario_id": "medium_viability_contract_baseline",
-        "symbols": window.symbols,
-        "window": {"start_date": window.start_date, "end_date": window.end_date, "trading_dates": window.trading_dates, "trading_date_count": len(window.trading_dates)},
-        "db": {"db_url": window.db_url, "schema": window.schema},
+        "run_label": run_label,
+        "stage": stage,
+        "scenario_id": scenario.scenario_id,
+        "symbols": list(scenario.symbols),
+        "window": {"start_date": scenario.start_date, "end_date": scenario.end_date, **(extra_window or {})},
         "preflight": preflight,
         "metadata": metadata,
         "output_dir": str(run_dir.resolve()),
         "result_path_expected": str(expected_path.resolve()),
         "result_path_expected_file": str((run_dir / "result_path_expected").resolve()),
         "driver": driver,
+        "save_json": bool(save_json),
+        "enable_validation": bool(enable_validation),
+        "validation_max_folds": int(validation_max_folds),
         "created_at": datetime.now().isoformat(),
     }
     _write_json(run_dir / "manifest.json", manifest)
-    _write_json(run_dir / "status.json", {"run_label": BASELINE_RUN_LABEL, "status": "starting", "phase": "parent_prepare", "last_progress_at": None, **_initial_counters()})
+    initial = {"run_label": run_label, "status": "starting", "phase": "parent_prepare", "last_progress_at": None, **_initial_counters()}
+    _write_json(run_dir / "status.json", initial)
+    _append_jsonl(run_dir / "progress.jsonl", {"event_at": datetime.now().isoformat(), **initial})
+    _write_json(run_dir / "monitor.json", {"pid": None, "child_alive": False, "stall_reason": None, "event_at": datetime.now().isoformat()})
     (run_dir / "result_path_expected").write_text(str(expected_path.resolve()), encoding="utf-8")
-    proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--child-run", str(run_dir)], cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    return run_dir, expected_path
+
+
+def _run_prepared_child(run_dir: Path) -> dict[str, Any]:
+    proc = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--child-run", str(run_dir)],
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
     monitor = _monitor_child(run_dir, proc)
     exit_code = proc.wait()
     final_status = _read_json(run_dir / "status.json")
     actual_result_path = Path(str(final_status.get("result_path") or "")) if final_status.get("result_path") else None
     success = exit_code == 0 and final_status.get("status") == "ok" and actual_result_path is not None and actual_result_path.exists()
-    summary = {
-        "baseline_contract_passed": success,
+    return {
         "exit_code": exit_code,
         "run_dir": str(run_dir.resolve()),
         "manifest_path": str((run_dir / "manifest.json").resolve()),
@@ -605,28 +720,108 @@ def _run_baseline_parent(output_root: Path) -> dict[str, Any]:
         "monitor_path": str((run_dir / "monitor.json").resolve()),
         "progress_path": str((run_dir / "progress.jsonl").resolve()),
         "result_path_expected_file": str((run_dir / "result_path_expected").resolve()),
-        "result_path_expected": str(expected_path.resolve()),
+        "result_path_expected": str(Path((run_dir / "result_path_expected").read_text(encoding="utf-8").strip()).resolve()),
         "run_card_path": str((run_dir / "run_card.json").resolve()),
         "fold_report_path": str((run_dir / "fold_report.json").resolve()),
         "diagnostics_path": str((run_dir / "diagnostics.json").resolve()),
         "report_path": str((run_dir / "report.md").resolve()),
         "status": final_status,
         "monitor": monitor,
+        "ok": success,
+    }
+
+
+def _run_baseline_parent(output_root: Path, *, driver: dict[str, Any], force_rerun: bool) -> dict[str, Any]:
+    if not force_rerun:
+        existing = _read_existing_baseline_summary(output_root)
+        if existing is not None:
+            return existing
+    window = _resolve_baseline_window(BASELINE_SYMBOLS, BASELINE_TRADING_DATES)
+    preflight = preflight_local_db(BASELINE_SYMBOLS)
+    metadata = dict(BASE_METADATA)
+    metadata["diagnostic_run_label"] = BASELINE_RUN_LABEL
+    scenario = _scenario_from_window("medium_viability_contract_baseline", window.start_date, window.end_date, window.symbols)
+    run_dir, expected_path = _prepare_child_run(
+        output_root=output_root,
+        run_label=BASELINE_RUN_LABEL,
+        scenario=scenario,
+        metadata=metadata,
+        preflight={**preflight, "db_url": window.db_url, "schema": window.schema},
+        driver=driver,
+        stage="baseline-only",
+        save_json=True,
+        enable_validation=True,
+        validation_max_folds=1,
+        extra_window={"trading_dates": window.trading_dates, "trading_date_count": len(window.trading_dates)},
+    )
+    child_summary = _run_prepared_child(run_dir)
+    summary = {
+        "baseline_contract_passed": child_summary["ok"],
+        **child_summary,
     }
     _write_json(output_root / "baseline_summary.json", summary)
     return summary
 
 
-def _run_medium_case(output_root: Path, run_label: str, scenario: BacktestScenario, metadata_overrides: dict[str, str]) -> dict[str, Any]:
-    run_dir = output_root / run_label
-    if run_dir.exists():
-        shutil.rmtree(run_dir)
+def _run_medium_case(
+    output_root: Path,
+    run_label: str,
+    scenario: BacktestScenario,
+    metadata_overrides: dict[str, str],
+    *,
+    preflight: dict[str, Any],
+    driver: dict[str, Any],
+    force_rerun: bool,
+) -> dict[str, Any]:
+    if not force_rerun:
+        existing = _read_existing_medium_summary(output_root, run_label)
+        if existing is not None:
+            return existing
     metadata = dict(BASE_METADATA)
     metadata.update({k: str(v).lower() if isinstance(v, bool) else str(v) for k, v in metadata_overrides.items()})
     metadata["diagnostic_run_label"] = run_label
-    request = RunnerRequest(scenario=scenario, config=BacktestConfig(initial_capital=10000.0, metadata=metadata, research_spec=BASE_SPEC))
-    result = run_backtest(request=request, data_path=None, data_source="local-db", scenario_id=scenario.scenario_id, strategy_mode="research_similarity_v2", output_dir=str(run_dir), enable_validation=False, validation_max_folds=0)
+    run_dir, _ = _prepare_child_run(
+        output_root=output_root,
+        run_label=run_label,
+        scenario=scenario,
+        metadata=metadata,
+        preflight=preflight,
+        driver=driver,
+        stage="medium-run",
+        save_json=True,
+        enable_validation=False,
+        validation_max_folds=0,
+    )
+    child_summary = _run_prepared_child(run_dir)
+    if not child_summary["ok"]:
+        summary = {
+            "run_label": run_label,
+            "scenario_id": scenario.scenario_id,
+            "window": {"start_date": scenario.start_date, "end_date": scenario.end_date},
+            "symbols": list(scenario.symbols),
+            "pre_optuna_ready": False,
+            "pre_optuna_verdict": None,
+            "next_optuna_target_scope": None,
+            "candidate_count": 0,
+            "candidate_dates": [],
+            "buy_pass_count": 0,
+            "sell_pass_count": 0,
+            "n_eff_histogram": {},
+            "top1_weight_histogram": {},
+            "abstain_reason_histogram": {},
+            "fills_count": int((child_summary.get("status") or {}).get("fills_count") or 0),
+            "trades_count": int((child_summary.get("status") or {}).get("plans_count") or 0),
+            "result_path": (child_summary.get("status") or {}).get("result_path"),
+            "metadata": metadata,
+            "child_summary": child_summary,
+            "error": (child_summary.get("status") or {}).get("error") or (child_summary.get("monitor") or {}).get("stall_reason"),
+        }
+        _write_json(run_dir / "summary.json", summary)
+        return summary
+    result_path = Path(str(child_summary["status"].get("result_path")))
+    result = json.loads(result_path.read_text(encoding="utf-8"))
     summary = _summarize_run(run_label, metadata, result, scenario)
+    summary["child_summary"] = child_summary
     _write_json(run_dir / "summary.json", summary)
     return summary
 
@@ -646,7 +841,8 @@ def _main_parent(args: argparse.Namespace) -> int:
     if not output_root.is_absolute():
         raise RuntimeError("--output-root must be an absolute path")
     output_root.mkdir(parents=True, exist_ok=True)
-    baseline_summary = _run_baseline_parent(output_root)
+    driver = _ensure_public_committed_driver()
+    baseline_summary = _run_baseline_parent(output_root, driver=driver, force_rerun=bool(args.force_rerun))
     if not baseline_summary.get("baseline_contract_passed"):
         print(json.dumps({"baseline": baseline_summary, "aborted_after_baseline": True}, ensure_ascii=False, indent=2, default=_json_default))
         return 1
@@ -661,20 +857,30 @@ def _main_parent(args: argparse.Namespace) -> int:
     requested = _resolve_requested_labels(args)
     medium_rows: list[dict[str, Any]] = []
     if "baseline" in requested:
-        medium_rows.append(_run_medium_case(output_root, "best_baseline" if args.alias_baseline else "baseline", discovery, {}))
+        medium_rows.append(
+            _run_medium_case(
+                output_root,
+                "best_baseline" if args.alias_baseline else "baseline",
+                discovery,
+                {},
+                preflight=preflight,
+                driver=driver,
+                force_rerun=bool(args.force_rerun),
+            )
+        )
     best1_meta = {k: v for k, v in (best_two[0].get("metadata") or {}).items() if k in ALLOWED_SUPPORT_KEYS}
     best2_meta = {k: v for k, v in (best_two[1].get("metadata") or {}).items() if k in ALLOWED_SUPPORT_KEYS}
     if "best1" in requested:
-        medium_rows.append(_run_medium_case(output_root, "best1", discovery, best1_meta))
+        medium_rows.append(_run_medium_case(output_root, "best1", discovery, best1_meta, preflight=preflight, driver=driver, force_rerun=bool(args.force_rerun)))
     if "best2" in requested:
-        medium_rows.append(_run_medium_case(output_root, "best2", discovery, best2_meta))
+        medium_rows.append(_run_medium_case(output_root, "best2", discovery, best2_meta, preflight=preflight, driver=driver, force_rerun=bool(args.force_rerun)))
     viable = any(int(r.get("candidate_count", 0)) > 0 and int(r.get("fills_count", 0)) > 0 and int(r.get("trades_count", 0)) > 0 for r in medium_rows)
     verdict = "TOBE v1 viable" if viable else "current TOBE v1 fails"
     holdout_summary = None
     if viable and "holdout" in requested:
         winner = sorted(medium_rows, key=_rank_key, reverse=True)[0]
         winner_meta = {k: v for k, v in (winner.get("metadata") or {}).items() if k in ALLOWED_SUPPORT_KEYS}
-        holdout_summary = _run_medium_case(output_root, "holdout", holdout, winner_meta)
+        holdout_summary = _run_medium_case(output_root, "holdout", holdout, winner_meta, preflight=preflight, driver=driver, force_rerun=bool(args.force_rerun))
     summary_payload = {
         "output_root": str(output_root),
         "tiny_root": str(Path(args.tiny_root).resolve()),
@@ -724,6 +930,7 @@ def main() -> int:
     parser.add_argument("--tiny-root", type=str, default=str(DEFAULT_TINY_ROOT.resolve()))
     parser.add_argument("--run-labels", type=str, default=None, help="Comma-separated subset: baseline,best1,best2,holdout")
     parser.add_argument("--only", type=str, default=None, help="Alias of --run-labels")
+    parser.add_argument("--force-rerun", action="store_true", help="Ignore completed baseline/best1/best2 outputs and rerun from scratch")
     parser.add_argument("--alias-baseline", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.child_run:

@@ -21,6 +21,26 @@ class DistributionEstimate:
     uncertainty: float = 1.0
     lower_bound_return: float = 0.0
     upper_bound_return: float = 0.0
+    q50_d2_return: float = 0.0
+    q50_d3_return: float = 0.0
+    p_resolved_by_d2: float = 0.0
+    p_resolved_by_d3: float = 0.0
+    prototype_pool_size: int = 0
+    ranked_candidate_count: int = 0
+    positive_weight_candidate_count: int = 0
+    pre_truncation_candidate_count: int = 0
+    top1_weight_share: float = 0.0
+    cumulative_weight_top3: float = 0.0
+    mixture_ess: float = 0.0
+    member_support_sum: float = 0.0
+    consensus_signature: str = ""
+    member_candidate_count: int = 0
+    member_pre_truncation_count: int = 0
+    positive_weight_member_count: int = 0
+    member_top1_weight_share: float = 0.0
+    member_cumulative_weight_top3: float = 0.0
+    member_mixture_ess: float = 0.0
+    member_consensus_signature: str = ""
     utility: Dict[str, Any] = field(default_factory=dict)
     top_matches: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -41,6 +61,14 @@ class EventOutcomeRecord:
     event_date: str
     outcome_end_date: Optional[str]
     schema_version: str
+    exchange_code: Optional[str] = None
+    country_code: Optional[str] = None
+    exchange_tz: Optional[str] = None
+    session_date_local: Optional[str] = None
+    session_close_ts_local: Optional[str] = None
+    session_close_ts_utc: Optional[str] = None
+    feature_anchor_ts_utc: Optional[str] = None
+    macro_asof_ts_utc: Optional[str] = None
     path_summary: Dict[str, Any] = field(default_factory=dict)
     side_outcomes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
@@ -69,6 +97,12 @@ class ResearchAnchor:
     sector_code: Optional[str] = None
     liquidity_score: Optional[float] = None
     prototype_id: Optional[str] = None
+    exchange_code: Optional[str] = None
+    country_code: Optional[str] = None
+    exchange_tz: Optional[str] = None
+    session_date_local: Optional[str] = None
+    session_close_ts_utc: Optional[str] = None
+    feature_anchor_ts_utc: Optional[str] = None
     prototype_membership: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -105,6 +139,12 @@ class PrototypeAnchor:
     liquidity_bucket: Optional[str] = None
     regime_bucket: Optional[str] = None
     sector_bucket: Optional[str] = None
+    exchange_code: Optional[str] = None
+    country_code: Optional[str] = None
+    exchange_tz: Optional[str] = None
+    session_date_local: Optional[str] = None
+    session_close_ts_utc: Optional[str] = None
+    feature_anchor_ts_utc: Optional[str] = None
     prototype_membership: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -131,6 +171,12 @@ class StatePrototype:
     support_count: int = 0
     decayed_support: float = 0.0
     freshness_days: Optional[float] = None
+    exchange_code: Optional[str] = None
+    country_code: Optional[str] = None
+    exchange_tz: Optional[str] = None
+    session_date_local: Optional[str] = None
+    session_close_ts_utc: Optional[str] = None
+    feature_anchor_ts_utc: Optional[str] = None
     prototype_membership: Dict[str, Any] = field(default_factory=dict)
     side_stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
