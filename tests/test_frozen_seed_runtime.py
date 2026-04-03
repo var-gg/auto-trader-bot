@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,15 +8,19 @@ import pytest
 
 from backtest_app.configs.models import BacktestConfig, BacktestScenario, OptunaObjectiveConfig, OptunaSearchConfig, ResearchExperimentSpec, RunnerRequest
 from backtest_app.historical_data.features import FeatureScaler, FeatureTransform
-from backtest_app.historical_data.models import HistoricalBar
+from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
+from backtest_app.historical_data.models import HistoricalBar, SymbolSessionMetadata
 from backtest_app.research.artifacts import JsonResearchArtifactStore
+from backtest_app.research.models import StatePrototype
 from backtest_app.research import pipeline as research_pipeline
-from backtest_app.research.pipeline import build_query_embedding
+from backtest_app.research.pipeline import build_query_embedding, build_query_feature_payload_asof
 from backtest_app.research_runtime import calibration_cache
 from backtest_app.research_runtime.calibration_cache import (
     ForbiddenCalibrationBundleCall,
     _forbidden_bundle_calls_guard,
+    _signal_panel_rows_from_cache,
     _load_train_snapshot_payload,
+    _train_snapshot_artifact_is_reusable,
     build_query_feature_cache_rows,
 )
 from backtest_app.research_runtime.frozen_seed import (
@@ -68,6 +73,24 @@ def _bars(symbol: str, closes: list[float], start_day: int = 1) -> list[Historic
             )
         )
     return rows
+
+
+def _dated_bars(symbol: str, rows: list[tuple[str, float]]) -> list[HistoricalBar]:
+    out: list[HistoricalBar] = []
+    for idx, (trade_date, close_px) in enumerate(rows, start=1):
+        open_px = close_px - 0.5
+        out.append(
+            HistoricalBar(
+                symbol=symbol,
+                timestamp=trade_date,
+                open=open_px,
+                high=close_px + 1.0,
+                low=open_px - 1.0,
+                close=close_px,
+                volume=1_000_000.0 + idx,
+            )
+        )
+    return out
 
 
 def _seed_row(*, decision_date: str, execution_date: str, symbol: str, side: str, t1_open: float, d1_high: float, d1_low: float, d1_close: float, optuna_eligible: bool = True, forecast_selected: bool = True) -> dict:
@@ -158,9 +181,10 @@ def test_train_snapshot_payload_roundtrip_is_lossless(tmp_path):
         "as_of_date": "2026-01-10",
         "memory_version": "v1",
         "prototype_snapshot_name": "prototype_snapshot",
+        "prototype_snapshot_format": "prototype_snapshot_v2",
+        "prototype_snapshot_manifest_path": "",
         "event_record_count": 11,
         "prototype_count": 3,
-        "prototypes": [],
         "scaler": FeatureScaler(means={"a": 1.0}, stds={"a": 2.0}).to_payload(),
         "transform": FeatureTransform(
             scaler=FeatureScaler(means={"a": 1.0}, stds={"a": 2.0}),
@@ -188,6 +212,208 @@ def test_train_snapshot_payload_roundtrip_is_lossless(tmp_path):
     assert restored["scaler"].means == {"a": 1.0}
     assert restored["transform"].feature_keys == ["a"]
     assert restored["event_record_count"] == 11
+
+
+def test_train_snapshot_loader_hydrates_prototypes_from_snapshot_manifest(tmp_path):
+    store = JsonResearchArtifactStore(str(tmp_path))
+    prototype_payload = {
+        "spec_hash": "spec-1",
+        "snapshot_id": "snap-001",
+        "prototype_count": 1,
+        "prototypes": [
+            StatePrototype(
+                prototype_id="proto-1",
+                anchor_code="STATE_MEMORY_V1",
+                embedding=[1.0, 0.0],
+                member_count=2,
+                representative_symbol="AAPL",
+                representative_date="2026-01-05",
+                representative_hash="hash-1",
+                shape_vector=[1.0, 0.0],
+                ctx_vector=[],
+                vector_version="v1",
+                feature_version="spec-1",
+                embedding_model="event-memory-state",
+                vector_dim=2,
+                anchor_quality=0.9,
+                regime_code="RISK_ON",
+                sector_code="TECH",
+                liquidity_score=0.8,
+                support_count=2,
+                decayed_support=1.5,
+                freshness_days=1.0,
+                prototype_membership={"member_refs": []},
+                side_stats={"BUY": {"support_count": 2}, "SELL": {"support_count": 2}},
+                metadata={"as_of_date": "2026-01-10"},
+            ),
+        ],
+    }
+    manifest_path = store.save_prototype_snapshot(
+        run_id="bundle_snapshots",
+        as_of_date="2026-01-10",
+        memory_version="v1",
+        payload=prototype_payload,
+    )
+    payload = {
+        "snapshot_id": "snap-001",
+        "as_of_date": "2026-01-10",
+        "memory_version": "v1",
+        "prototype_snapshot_name": "prototype_snapshot",
+        "prototype_snapshot_format": "prototype_snapshot_v2",
+        "prototype_snapshot_manifest_path": manifest_path,
+        "event_record_count": 11,
+        "prototype_count": 1,
+        "scaler": FeatureScaler(means={"a": 1.0}, stds={"a": 2.0}).to_payload(),
+        "transform": FeatureTransform(
+            scaler=FeatureScaler(means={"a": 1.0}, stds={"a": 2.0}),
+            feature_keys=["a"],
+            version="feature_contract_v1",
+        ).to_payload(),
+        "calibration": {"method": "logistic", "slope": 1.0, "intercept": 0.0},
+        "quote_policy_calibration": {"abstain_margin": 0.05},
+        "metadata": {"portfolio_top_n": 3},
+        "session_metadata_by_symbol": {},
+        "macro_series_history": [],
+        "snapshot_ids": {},
+        "artifact_kind": "train_snapshot_v1",
+    }
+    path = store.save_train_snapshot(
+        run_id="bundle_snapshots",
+        name="train_snapshot_20260110",
+        as_of_date="2026-01-10",
+        memory_version="v1",
+        payload=payload,
+    )
+    restored = _load_train_snapshot_payload(path)
+    assert len(restored["prototypes"]) == 1
+    assert restored["prototypes"][0].prototype_id == "proto-1"
+
+
+def test_train_snapshot_artifact_reuse_rejects_legacy_shared_prototype_name(tmp_path):
+    legacy_path = tmp_path / "legacy_train_snapshot.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "train_snapshot_v1",
+                "prototype_snapshot_name": "prototype_snapshot",
+                "prototype_snapshot_manifest_path": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    valid_manifest = tmp_path / "prototype_snapshot_20260110" / "manifest.json"
+    valid_manifest.parent.mkdir(parents=True, exist_ok=True)
+    valid_manifest.write_text("{}", encoding="utf-8")
+    valid_path = tmp_path / "valid_train_snapshot.json"
+    valid_path.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "train_snapshot_v1",
+                "prototype_snapshot_name": "prototype_snapshot_20260110",
+                "prototype_snapshot_manifest_path": str(valid_manifest),
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _train_snapshot_artifact_is_reusable(str(legacy_path)) is False
+    assert _train_snapshot_artifact_is_reusable(str(valid_path)) is True
+
+
+def test_signal_panel_rows_from_cache_loads_snapshot_payloads_lazily_per_snapshot_id(monkeypatch):
+    transform = FeatureTransform(
+        scaler=FeatureScaler(means={"a": 0.0}, stds={"a": 1.0}),
+        feature_keys=["a"],
+        version="feature_contract_v1",
+    )
+    prototype = StatePrototype(
+        prototype_id="proto-1",
+        anchor_code="STATE_MEMORY_V1",
+        embedding=[1.0],
+        member_count=1,
+        representative_symbol="AAPL",
+        representative_date="2026-01-05",
+        representative_hash="hash-1",
+        shape_vector=[1.0],
+        ctx_vector=[],
+        vector_version="v1",
+        feature_version="spec-1",
+        embedding_model="event-memory-state",
+        vector_dim=1,
+        anchor_quality=0.9,
+        regime_code="RISK_ON",
+        sector_code="TECH",
+        liquidity_score=0.8,
+        support_count=1,
+        decayed_support=1.0,
+        freshness_days=1.0,
+        prototype_membership={"member_refs": []},
+        side_stats={"BUY": {"support_count": 1}, "SELL": {"support_count": 1}},
+        metadata={},
+    )
+    loaded_paths: list[str] = []
+
+    def _fake_load(path: str):
+        loaded_paths.append(path)
+        return {
+            "transform": transform,
+            "prototypes": [prototype],
+            "metadata": {},
+            "quote_policy_calibration": {},
+            "calibration": {},
+            "event_record_count": 1,
+        }
+
+    surface = SimpleNamespace(
+        buy=SimpleNamespace(),
+        sell=SimpleNamespace(),
+        chosen_side="BUY",
+        abstain=False,
+        abstain_reasons=[],
+        diagnostics={
+            "decision_rule": {
+                "chosen_lower_bound": 0.01,
+                "chosen_interval_width": 0.02,
+                "chosen_effective_sample_size": 2.0,
+                "chosen_uncertainty": 0.01,
+            }
+        },
+    )
+    monkeypatch.setattr(calibration_cache, "_load_train_snapshot_payload", _fake_load)
+    monkeypatch.setattr(calibration_cache, "build_decision_surface", lambda **kwargs: surface)
+    monkeypatch.setattr(calibration_cache, "_side_diag", lambda *args, **kwargs: {"regime_alignment": 1.0, "abstain_reasons": []})
+    monkeypatch.setattr(calibration_cache, "_chosen_side_payload", lambda **kwargs: {"side": "BUY"})
+
+    panel_rows, telemetry = _signal_panel_rows_from_cache(
+        query_rows=[
+            {
+                "decision_date": "2026-01-10",
+                "symbol": "AAPL",
+                "raw_features_json": json.dumps({"a": 1.0}),
+                "query_meta_json": json.dumps({"regime_code": "RISK_ON", "sector_code": "TECH"}),
+            },
+            {
+                "decision_date": "2026-01-11",
+                "symbol": "MSFT",
+                "raw_features_json": json.dumps({"a": 2.0}),
+                "query_meta_json": json.dumps({"regime_code": "RISK_ON", "sector_code": "TECH"}),
+            },
+            {
+                "decision_date": "2026-02-10",
+                "symbol": "NVDA",
+                "raw_features_json": json.dumps({"a": 3.0}),
+                "query_meta_json": json.dumps({"regime_code": "RISK_ON", "sector_code": "TECH"}),
+            },
+        ],
+        snapshot_rows=[
+            {"id": 1, "snapshot_id": "snap-1", "snapshot_date": "2026-01-05", "artifact_path": "one.json"},
+            {"id": 2, "snapshot_id": "snap-2", "snapshot_date": "2026-02-01", "artifact_path": "two.json"},
+        ],
+    )
+
+    assert len(panel_rows) == 3
+    assert loaded_paths == ["one.json", "two.json"]
+    assert telemetry["prototype_count"] == 3
+    assert telemetry["snapshot_load_ms"] >= 0
 
 
 def test_forbidden_bundle_guard_rejects_rolling_similarity_calls():
@@ -235,10 +461,307 @@ def test_query_feature_cache_rows_match_query_embedding_contract():
         session_metadata_by_symbol={},
         macro_series_history=[],
     )
-    assert json.loads(row["embedding_json"]) == embedding
+    raw_payload = build_query_feature_payload_asof(
+        symbol="AAPL",
+        bars=aapl_bars[idx - spec.feature_window_bars + 1 : idx + 1],
+        bars_by_symbol=bars_by_symbol,
+        macro_history={},
+        sector_map=sector_map,
+        cutoff_date=row["decision_date"],
+        spec=spec,
+        use_macro_level_in_similarity=False,
+        use_dollar_volume_absolute=False,
+        session_metadata_by_symbol={},
+        macro_series_history=[],
+    )
+    assert json.loads(row["embedding_json"]) == []
+    assert json.loads(row["transformed_features_json"]) == {}
     assert json.loads(row["raw_features_json"]) == meta["raw_features"]
+    assert json.loads(row["raw_features_json"]) == raw_payload["meta"]["raw_features"]
     assert row["regime_code"] == meta["regime_code"]
     assert row["execution_date"] == "2026-01-06"
+
+
+def test_query_feature_cache_rows_match_split_subwindows():
+    spec = ResearchExperimentSpec(feature_window_bars=5, lookback_horizons=[1, 3, 5], horizon_days=5)
+    bars_by_symbol = {
+        "AAPL": _bars("AAPL", [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0]),
+        "MSFT": _bars("MSFT", [200.0, 199.0, 201.0, 202.0, 203.0, 204.0, 205.0, 206.0, 207.0, 208.0]),
+    }
+    kwargs = {
+        "symbols": ["AAPL", "MSFT"],
+        "bars_by_symbol": bars_by_symbol,
+        "macro_history_by_date": {},
+        "sector_map": {"AAPL": "TECH", "MSFT": "TECH"},
+        "session_metadata_by_symbol": {},
+        "macro_series_history": [],
+        "spec": spec,
+        "metadata": {},
+    }
+    whole = build_query_feature_cache_rows(start_date="2026-01-05", end_date="2026-01-09", **kwargs)
+    part_1 = build_query_feature_cache_rows(start_date="2026-01-05", end_date="2026-01-07", **kwargs)
+    part_2 = build_query_feature_cache_rows(start_date="2026-01-08", end_date="2026-01-09", **kwargs)
+    merged_query_rows = sorted(part_1["query_rows"] + part_2["query_rows"], key=lambda row: (str(row["decision_date"]), str(row["symbol"])))
+    merged_replay_rows = sorted(
+        part_1["replay_rows"] + part_2["replay_rows"],
+        key=lambda row: (str(row["decision_date"]), str(row["symbol"]), str(row["side"]), int(row["bar_n"])),
+    )
+    assert merged_query_rows == whole["query_rows"]
+    assert merged_replay_rows == whole["replay_rows"]
+
+
+def test_query_feature_cache_rows_proxy_fast_path_matches_legacy():
+    spec = ResearchExperimentSpec(feature_window_bars=5, lookback_horizons=[1, 3, 5], horizon_days=5)
+    bars_by_symbol = {
+        "AAPL": _bars("AAPL", [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0]),
+        "MSFT": _bars("MSFT", [200.0, 199.0, 201.0, 202.0, 203.0, 204.0, 205.0, 206.0, 207.0, 208.0]),
+        "SAP": _bars("SAP", [150.0, 151.0, 152.0, 153.0, 152.0, 154.0, 155.0, 156.0, 157.0, 158.0]),
+    }
+    session_metadata = {
+        "AAPL": SymbolSessionMetadata(symbol="AAPL", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+        "MSFT": SymbolSessionMetadata(symbol="MSFT", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+        "SAP": SymbolSessionMetadata(symbol="SAP", exchange_code="XETR", country_code="DE", exchange_tz="Europe/Berlin", session_close_local_time="17:30"),
+    }
+    kwargs = {
+        "symbols": ["AAPL", "MSFT", "SAP"],
+        "bars_by_symbol": bars_by_symbol,
+        "macro_history_by_date": {},
+        "sector_map": {"AAPL": "TECH", "MSFT": "TECH", "SAP": "TECH"},
+        "session_metadata_by_symbol": session_metadata,
+        "macro_series_history": [],
+        "spec": spec,
+        "metadata": {},
+        "start_date": "2026-01-05",
+        "end_date": "2026-01-09",
+    }
+    fast_rows = build_query_feature_cache_rows(use_proxy_aggregate_cache=True, **kwargs)
+    legacy_rows = build_query_feature_cache_rows(use_proxy_aggregate_cache=False, **kwargs)
+    assert fast_rows["query_rows"] == legacy_rows["query_rows"]
+    assert fast_rows["replay_rows"] == legacy_rows["replay_rows"]
+
+
+def test_build_event_memory_asof_proxy_fast_path_matches_legacy():
+    spec = ResearchExperimentSpec(feature_window_bars=5, lookback_horizons=[1, 3, 5], horizon_days=2)
+    trade_dates = [
+        "2026-01-02",
+        "2026-01-05",
+        "2026-01-06",
+        "2026-01-07",
+        "2026-01-08",
+        "2026-01-09",
+        "2026-01-12",
+        "2026-01-13",
+        "2026-01-14",
+        "2026-01-15",
+    ]
+    bars_by_symbol = {
+        "AAPL": _dated_bars("AAPL", list(zip(trade_dates, [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0]))),
+        "MSFT": _dated_bars("MSFT", list(zip([d for d in trade_dates if d != "2026-01-07"], [200.0, 199.0, 201.0, 203.0, 204.0, 205.0, 206.0, 207.0, 208.0]))),
+        "SAP": _dated_bars("SAP", list(zip(trade_dates, [150.0, 151.0, 152.0, 153.0, 152.5, 154.0, 155.0, 156.0, 157.0, 158.0]))),
+        "JPM": _dated_bars("JPM", list(zip(trade_dates, [90.0, 91.0, 91.5, 92.0, 92.5, 93.0, 94.0, 94.5, 95.0, 95.5]))),
+    }
+    session_metadata = {
+        "AAPL": SymbolSessionMetadata(symbol="AAPL", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+        "MSFT": SymbolSessionMetadata(symbol="MSFT", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+        "SAP": SymbolSessionMetadata(symbol="SAP", exchange_code="XETR", country_code="DE", exchange_tz="Europe/Berlin", session_close_local_time="17:30"),
+        "JPM": SymbolSessionMetadata(symbol="JPM", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+    }
+    kwargs = {
+        "decision_date": "2026-01-16",
+        "spec": spec,
+        "bars_by_symbol": bars_by_symbol,
+        "macro_history_by_date": {},
+        "sector_map": {"AAPL": "TECH", "MSFT": "TECH", "SAP": "TECH", "JPM": "FIN"},
+        "market": "US",
+        "metadata": {},
+        "session_metadata_by_symbol": session_metadata,
+        "macro_series_history": [],
+    }
+    legacy = research_pipeline.build_event_memory_asof(use_proxy_aggregate_cache=False, **kwargs)
+    fast = research_pipeline.build_event_memory_asof(use_proxy_aggregate_cache=True, **kwargs)
+    assert [record.__dict__ for record in fast["event_records"]] == [record.__dict__ for record in legacy["event_records"]]
+    assert [prototype.__dict__ for prototype in fast["prototypes"]] == [prototype.__dict__ for prototype in legacy["prototypes"]]
+    assert fast["excluded_reasons"] == legacy["excluded_reasons"]
+    assert fast["coverage"] == legacy["coverage"]
+    assert fast["compression_audit"] == legacy["compression_audit"]
+    assert fast["transform"].to_payload() == legacy["transform"].to_payload()
+    assert fast["scaler"].to_payload() == legacy["scaler"].to_payload()
+    jpm_records = [record for record in fast["event_records"] if record.symbol == "JPM"]
+    assert jpm_records
+    assert all(bool(record.diagnostics.get("sector_proxy_fallback_to_self")) for record in jpm_records)
+
+
+def test_build_event_memory_asof_event_fast_path_matches_legacy():
+    spec = ResearchExperimentSpec(feature_window_bars=5, lookback_horizons=[1, 3, 5], horizon_days=2)
+    trade_dates = [
+        "2026-01-02",
+        "2026-01-05",
+        "2026-01-06",
+        "2026-01-07",
+        "2026-01-08",
+        "2026-01-09",
+        "2026-01-12",
+        "2026-01-13",
+        "2026-01-14",
+        "2026-01-15",
+    ]
+    bars_by_symbol = {
+        "AAPL": _dated_bars("AAPL", list(zip(trade_dates, [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0]))),
+        "MSFT": _dated_bars("MSFT", list(zip([d for d in trade_dates if d != "2026-01-07"], [200.0, 199.0, 201.0, 203.0, 204.0, 205.0, 206.0, 207.0, 208.0]))),
+        "SAP": _dated_bars("SAP", list(zip(trade_dates, [150.0, 151.0, 152.0, 153.0, 152.5, 154.0, 155.0, 156.0, 157.0, 158.0]))),
+        "JPM": _dated_bars("JPM", list(zip(trade_dates, [90.0, 91.0, 91.5, 92.0, 92.5, 93.0, 94.0, 94.5, 95.0, 95.5]))),
+    }
+    session_metadata = {
+        "AAPL": SymbolSessionMetadata(symbol="AAPL", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+        "MSFT": SymbolSessionMetadata(symbol="MSFT", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+        "SAP": SymbolSessionMetadata(symbol="SAP", exchange_code="XETR", country_code="DE", exchange_tz="Europe/Berlin", session_close_local_time="17:30"),
+        "JPM": SymbolSessionMetadata(symbol="JPM", exchange_code="NMS", country_code="US", exchange_tz="America/New_York", session_close_local_time="16:00"),
+    }
+    kwargs = {
+        "decision_date": "2026-01-16",
+        "spec": spec,
+        "bars_by_symbol": bars_by_symbol,
+        "macro_history_by_date": {},
+        "sector_map": {"AAPL": "TECH", "MSFT": "TECH", "SAP": "TECH", "JPM": "FIN"},
+        "market": "US",
+        "metadata": {},
+        "session_metadata_by_symbol": session_metadata,
+        "macro_series_history": [],
+        "use_proxy_aggregate_cache": True,
+    }
+    legacy = research_pipeline.build_event_memory_asof(use_event_memory_fast_path=False, **kwargs)
+    fast = research_pipeline.build_event_memory_asof(use_event_memory_fast_path=True, **kwargs)
+    assert [record.__dict__ for record in fast["event_records"]] == [record.__dict__ for record in legacy["event_records"]]
+    assert [prototype.__dict__ for prototype in fast["prototypes"]] == [prototype.__dict__ for prototype in legacy["prototypes"]]
+    assert fast["excluded_reasons"] == legacy["excluded_reasons"]
+    assert fast["coverage"] == legacy["coverage"]
+    assert fast["compression_audit"] == legacy["compression_audit"]
+    assert fast["transform"].to_payload() == legacy["transform"].to_payload()
+    assert fast["scaler"].to_payload() == legacy["scaler"].to_payload()
+
+
+def test_build_event_memory_asof_event_checkpoint_resume_matches_full_run(tmp_path):
+    spec = ResearchExperimentSpec(feature_window_bars=5, lookback_horizons=[1, 3, 5], horizon_days=2)
+    prices = [100.0 + (i * 0.1) for i in range(1010)]
+    trade_dates = [(datetime(2026, 1, 1) + timedelta(days=i)).date().isoformat() for i in range(1010)]
+    bars_by_symbol = {"AAPL": _dated_bars("AAPL", list(zip(trade_dates, prices)))}
+    event_input_path = tmp_path / "event_memory_input.pkl"
+    event_checkpoint_path = tmp_path / "event_memory_checkpoint.pkl"
+    progress_events: list[dict] = []
+
+    def _progress(payload: dict) -> None:
+        progress_events.append(dict(payload))
+        if payload.get("phase") == "event_payload_build" and int(payload.get("event_candidate_done") or 0) >= 1000:
+            raise RuntimeError("interrupt-after-event-checkpoint")
+
+    with pytest.raises(RuntimeError, match="interrupt-after-event-checkpoint"):
+        research_pipeline.build_event_memory_asof(
+            decision_date="2028-12-31",
+            spec=spec,
+            bars_by_symbol=bars_by_symbol,
+            macro_history_by_date={},
+            sector_map={"AAPL": "TECH"},
+            market="US",
+            metadata={},
+            use_proxy_aggregate_cache=True,
+            use_event_memory_fast_path=True,
+            event_input_path=str(event_input_path),
+            event_checkpoint_path=str(event_checkpoint_path),
+            progress_callback=_progress,
+        )
+    assert event_input_path.exists()
+    assert event_checkpoint_path.exists()
+    resumed = research_pipeline.build_event_memory_asof(
+        decision_date="2028-12-31",
+        spec=spec,
+        bars_by_symbol=bars_by_symbol,
+        macro_history_by_date={},
+        sector_map={"AAPL": "TECH"},
+        market="US",
+        metadata={},
+        use_proxy_aggregate_cache=True,
+        use_event_memory_fast_path=True,
+        event_input_path=str(event_input_path),
+        event_checkpoint_path=str(event_checkpoint_path),
+        resume_event_memory_from_checkpoint=True,
+    )
+    full = research_pipeline.build_event_memory_asof(
+        decision_date="2028-12-31",
+        spec=spec,
+        bars_by_symbol=bars_by_symbol,
+        macro_history_by_date={},
+        sector_map={"AAPL": "TECH"},
+        market="US",
+        metadata={},
+        use_proxy_aggregate_cache=True,
+        use_event_memory_fast_path=True,
+    )
+    assert [record.__dict__ for record in resumed["event_records"]] == [record.__dict__ for record in full["event_records"]]
+    assert [prototype.__dict__ for prototype in resumed["prototypes"]] == [prototype.__dict__ for prototype in full["prototypes"]]
+    event_payload_events = [event for event in progress_events if event.get("phase") == "event_payload_build"]
+    assert any(int(event.get("event_candidate_done") or 0) > 0 for event in event_payload_events)
+    assert any(str(event.get("current_event_date") or "") for event in event_payload_events)
+
+
+def test_mark_stale_bundle_run_if_dead_marks_failed(monkeypatch):
+    monkeypatch.setattr(calibration_cache, "_utcnow", lambda: datetime(2026, 4, 2, 1, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(
+        calibration_cache,
+        "resolve_bundle_run",
+        lambda **kwargs: {
+            "id": 7,
+            "status": "running",
+            "last_heartbeat_at": "2026-04-02T00:00:00+00:00",
+            "last_pid": 999999,
+        },
+    )
+    captured = {}
+
+    def _mark_failed(**kwargs):
+        captured.update(kwargs)
+        return {"id": kwargs["bundle_run_id"], "status": "failed", "last_error": kwargs["last_error"]}
+
+    monkeypatch.setattr(calibration_cache, "mark_bundle_run_failed", _mark_failed)
+    result = calibration_cache.mark_stale_bundle_run_if_dead(
+        session_factory=object(),
+        bundle_run_id=7,
+        stale_after_seconds=1,
+        pid_alive_fn=lambda pid: False,
+    )
+    assert result["status"] == "failed"
+    assert captured["bundle_run_id"] == 7
+    assert captured["last_error"] == "stale_orchestrator_no_heartbeat"
+
+
+def test_load_research_context_emits_progress_callbacks(monkeypatch):
+    loader = LocalPostgresLoader.__new__(LocalPostgresLoader)
+    loader.session_factory = None
+    loader.schema = "trading"
+    monkeypatch.setattr(
+        loader,
+        "_load_bars",
+        lambda **kwargs: {"AAPL": _bars("AAPL", [100.0, 101.0, 102.0, 103.0, 104.0]), "MSFT": _bars("MSFT", [200.0, 201.0, 202.0, 203.0, 204.0])},
+    )
+    monkeypatch.setattr(loader, "_load_sector_map", lambda symbols: {"AAPL": "TECH", "MSFT": "TECH"})
+    monkeypatch.setattr(loader, "_load_session_metadata", lambda symbols: ({}, []))
+    monkeypatch.setattr(loader, "_load_macro_series_history", lambda **kwargs: [])
+    events: list[str] = []
+    result = loader.load_research_context(
+        start_date="2026-01-01",
+        end_date="2026-01-31",
+        symbols=["AAPL", "MSFT"],
+        research_spec=ResearchExperimentSpec(feature_window_bars=5),
+        progress_callback=lambda stage, details: events.append(stage),
+    )
+    assert "bars_by_symbol" in result
+    assert events == [
+        "load_research_context:start",
+        "load_research_context:bars",
+        "load_research_context:sector_map",
+        "load_research_context:session_metadata",
+        "load_research_context:macro_series",
+        "load_research_context:macro_history",
+    ]
 
 
 def test_preopen_snapshot_roundtrip_supports_ladder_buy_and_sell_legs(tmp_path):
@@ -1042,10 +1565,11 @@ def test_build_query_feature_cache_cli_creates_or_resumes_bundle_and_materialize
             "model_version": "daily_reuse_v1",
         },
     )
-    monkeypatch.setattr(
-        cli,
-        "materialize_query_feature_cache",
-        lambda **kwargs: {
+    monkeypatch.setattr(cli, "mark_stale_bundle_run_if_dead", lambda **kwargs: {"status": "running"})
+    captured: dict[str, int] = {}
+    def _fake_materialize_query_feature_cache(**kwargs):
+        captured["subwindow_days"] = int(kwargs["subwindow_days"])
+        return {
             "status": "ok",
             "bundle_run_id": kwargs["bundle_run_id"],
             "decision_date_count": 12,
@@ -1053,8 +1577,9 @@ def test_build_query_feature_cache_cli_creates_or_resumes_bundle_and_materialize
             "replay_bar_count": 120,
             "load_ms": 10,
             "query_feature_ms": 20,
-        },
-    )
+            "query_chunk_count": 8,
+        }
+    monkeypatch.setattr(cli, "materialize_query_feature_cache", _fake_materialize_query_feature_cache)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -1074,6 +1599,14 @@ def test_build_query_feature_cache_cli_creates_or_resumes_bundle_and_materialize
             "ALL",
             "--results-dir",
             str(tmp_path / "bundle"),
+            "--query-cache-symbol-chunk-size",
+            "10",
+            "--query-cache-date-window-months",
+            "1",
+            "--query-cache-subwindow-days",
+            "7",
+            "--query-cache-worker-count",
+            "4",
             "--output",
             str(output_path),
         ],
@@ -1083,6 +1616,7 @@ def test_build_query_feature_cache_cli_creates_or_resumes_bundle_and_materialize
     assert payload["mode"] == "build-query-feature-cache"
     assert payload["bundle_run_id"] == 21
     assert payload["query_row_count"] == 24
+    assert captured["subwindow_days"] == 7
 
 
 def test_build_train_snapshots_cli_materializes_monthly_snapshot_contract(tmp_path, monkeypatch):
@@ -1160,6 +1694,317 @@ def test_build_train_snapshots_cli_materializes_monthly_snapshot_contract(tmp_pa
     assert payload["bundle_run_id"] == 22
     assert payload["snapshot_count"] == 3
     assert payload["model_version"] == "monthly_snapshot_v1"
+
+
+def test_fit_train_artifacts_reports_snapshot_phase_timings(tmp_path, monkeypatch):
+    store = JsonResearchArtifactStore(str(tmp_path))
+    scaler = FeatureScaler(means={"a": 1.0}, stds={"a": 2.0})
+    transform = FeatureTransform(scaler=scaler, feature_keys=["a"], version="feature_contract_v1")
+
+    def fake_build_event_memory_asof(**kwargs):
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback is not None:
+            progress_callback({"phase": "event_memory", "status": "ok", "event_memory_ms": 111, "raw_event_row_count": 3})
+            progress_callback({"phase": "transform", "status": "ok", "transform_ms": 222, "event_record_count": 1})
+            progress_callback({"phase": "prototype", "status": "ok", "prototype_ms": 333, "event_record_count": 1, "prototype_count": 1})
+        return {
+            "event_records": [SimpleNamespace(event_date="2026-01-01", outcome_end_date="2026-01-03")],
+            "prototypes": [SimpleNamespace(prototype_id="proto-1")],
+            "transform": transform,
+            "phase_timings_ms": {"event_memory": 111, "transform": 222, "prototype": 333},
+        }
+
+    monkeypatch.setattr(research_pipeline, "build_event_memory_asof", fake_build_event_memory_asof)
+    events: list[dict[str, object]] = []
+    artifact = research_pipeline.fit_train_artifacts(
+        run_id="bundle_snapshots",
+        artifact_store=store,
+        train_end="2026-01-05",
+        test_start="2026-01-06",
+        purge=0,
+        embargo=0,
+        spec=ResearchExperimentSpec(),
+        bars_by_symbol={},
+        macro_history_by_date={},
+        sector_map={},
+        market="US",
+        progress_callback=lambda payload: events.append(dict(payload)),
+    )
+    phases = [str(event.get("phase")) for event in events]
+    assert "event_memory" in phases
+    assert "transform" in phases
+    assert "prototype" in phases
+    assert artifact["phase_timings_ms"]["event_memory"] == 111
+    assert artifact["phase_timings_ms"]["transform"] == 222
+    assert artifact["phase_timings_ms"]["prototype"] >= 333
+
+
+def test_fit_train_artifacts_writes_prototype_resume_metadata_when_checkpoint_path_provided(tmp_path, monkeypatch):
+    store = JsonResearchArtifactStore(str(tmp_path))
+    scaler = FeatureScaler(means={"a": 1.0}, stds={"a": 2.0})
+    transform = FeatureTransform(scaler=scaler, feature_keys=["a"], version="feature_contract_v1")
+
+    def fake_build_event_memory_asof(**kwargs):
+        return {
+            "event_records": [SimpleNamespace(event_date="2026-01-01", outcome_end_date="2026-01-03")],
+            "prototypes": [SimpleNamespace(prototype_id="proto-1")],
+            "transform": transform,
+            "phase_timings_ms": {"event_memory": 111, "transform": 222, "prototype": 333},
+            "excluded_reasons": [],
+            "coverage": {"event_record_count": 1, "anchor_count": 1, "prototype_count": 1},
+            "compression_audit": {"ratio": 1.0},
+        }
+
+    monkeypatch.setattr(research_pipeline, "build_event_memory_asof", fake_build_event_memory_asof)
+    checkpoint_path = tmp_path / "prototype_checkpoint.pkl"
+    artifact = research_pipeline.fit_train_artifacts(
+        run_id="bundle_snapshots",
+        artifact_store=store,
+        train_end="2026-01-05",
+        test_start="2026-01-06",
+        purge=0,
+        embargo=0,
+        spec=ResearchExperimentSpec(),
+        bars_by_symbol={},
+        macro_history_by_date={},
+        sector_map={},
+        market="US",
+        prototype_checkpoint_path=str(checkpoint_path),
+    )
+
+    metadata_path = research_pipeline._prototype_resume_metadata_path(str(checkpoint_path))
+    assert metadata_path.exists()
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert payload["as_of_date"] == "2026-01-05"
+    assert artifact["prototype_snapshot_name"] == "prototype_snapshot_20260105"
+
+
+def test_materialize_train_snapshots_records_phase_heartbeat_updates(tmp_path, monkeypatch):
+    class _EmptyResult:
+        def mappings(self):
+            return self
+
+        def first(self):
+            return None
+
+    class _FakeSession:
+        def execute(self, *args, **kwargs):
+            return _EmptyResult()
+
+        def commit(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeLoader:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def load_research_context(self, **kwargs):
+            progress_callback = kwargs.get("progress_callback")
+            if progress_callback is not None:
+                progress_callback("load_research_context:bars", {"bar_row_count": 12})
+            return {
+                "bars_by_symbol": {},
+                "macro_history_by_date": {},
+                "sector_map": {},
+                "session_metadata_by_symbol": {},
+                "macro_series_history": [],
+            }
+
+    monkeypatch.setattr(calibration_cache, "_load_cached_decision_dates", lambda **kwargs: ["2026-01-05"])
+    monkeypatch.setattr(calibration_cache, "LocalPostgresLoader", _FakeLoader)
+    monkeypatch.setattr(calibration_cache, "create_backtest_session_factory", lambda: object())
+    monkeypatch.setattr(calibration_cache, "_snapshot_dates", lambda decision_dates, cadence: ["2026-01-05"])
+    begin_calls: list[dict[str, object]] = []
+    touch_calls: list[dict[str, object]] = []
+    complete_calls: list[dict[str, object]] = []
+    fail_calls: list[dict[str, object]] = []
+    bundle_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(calibration_cache, "begin_snapshot_run", lambda **kwargs: begin_calls.append(dict(kwargs)))
+    monkeypatch.setattr(calibration_cache, "touch_snapshot_run", lambda **kwargs: touch_calls.append(dict(kwargs)))
+    monkeypatch.setattr(calibration_cache, "complete_snapshot_run", lambda **kwargs: complete_calls.append(dict(kwargs)))
+    monkeypatch.setattr(calibration_cache, "fail_snapshot_run", lambda **kwargs: fail_calls.append(dict(kwargs)))
+    monkeypatch.setattr(
+        calibration_cache,
+        "touch_bundle_run",
+        lambda **kwargs: bundle_calls.append(dict(kwargs)) or {"bundle_run_id": kwargs["bundle_run_id"]},
+    )
+    fit_calls: list[dict[str, object]] = []
+
+    scaler = FeatureScaler(means={"a": 1.0}, stds={"a": 2.0})
+    transform = FeatureTransform(scaler=scaler, feature_keys=["a"], version="feature_contract_v1")
+
+    def fake_fit_train_artifacts(**kwargs):
+        fit_calls.append(dict(kwargs))
+        progress_callback = kwargs.get("progress_callback")
+        progress_callback({"phase": "event_memory", "status": "ok", "event_memory_ms": 111})
+        progress_callback({"phase": "transform", "status": "ok", "transform_ms": 222, "event_record_count": 7})
+        progress_callback({"phase": "prototype", "status": "ok", "prototype_ms": 333, "event_record_count": 7, "prototype_count": 5})
+        return {
+            "run_id": "bundle_snapshots",
+            "snapshot_id": "snap-001",
+            "spec_hash": "spec-hash",
+            "as_of_date": "2026-01-05",
+            "train_end": "2026-01-05",
+            "test_start": "2026-01-05",
+            "purge": 0,
+            "embargo": 0,
+            "memory_version": "v1",
+            "prototype_snapshot_name": "prototype_snapshot",
+            "max_train_date": "2026-01-04",
+            "max_outcome_end_date": "2026-01-04",
+            "event_record_count": 7,
+            "prototype_count": 5,
+            "prototypes": [],
+            "scaler": scaler,
+            "transform": transform,
+            "calibration": {"method": "logistic", "slope": 1.0, "intercept": 0.0},
+            "quote_policy_calibration": {"abstain_margin": 0.05},
+            "metadata": {},
+            "session_metadata_by_symbol": {},
+            "macro_series_history": [],
+            "snapshot_ids": {"prototype_snapshot_id": "snap-001"},
+            "phase_timings_ms": {"event_memory": 111, "transform": 222, "prototype": 333},
+        }
+
+    monkeypatch.setattr(calibration_cache, "fit_train_artifacts", fake_fit_train_artifacts)
+    result = calibration_cache.materialize_train_snapshots(
+        write_session_factory=lambda: _FakeSession(),
+        bundle_run_id=31,
+        bundle_key="bundle-key",
+        market="US",
+        start_date="2026-01-01",
+        end_date="2026-01-31",
+        symbols=["AAPL", "MSFT"],
+        research_spec=ResearchExperimentSpec(),
+        metadata={},
+        output_dir=str(tmp_path / "snapshots"),
+        snapshot_cadence="monthly",
+        model_version="monthly_snapshot_v1",
+    )
+    assert result["created_snapshot_count"] == 1
+    assert begin_calls[0]["snapshot_id"].startswith("bundle-key__snapshots:2026-01-05")
+    assert str(begin_calls[0]["checkpoint_path"]).endswith("prototype_checkpoint.pkl")
+    assert str(begin_calls[0]["event_checkpoint_path"]).endswith("event_memory_checkpoint.pkl")
+    assert fit_calls[0]["prototype_input_path"] is None
+    phases = [str(call.get("current_phase")) for call in touch_calls]
+    assert "event_memory" in phases
+    assert "transform" in phases
+    assert "prototype" in phases
+    assert "artifact_write" in phases
+    event_memory_calls = [call for call in touch_calls if str(call.get("current_phase")) == "event_memory"]
+    assert event_memory_calls
+    assert complete_calls[0]["event_memory_ms"] == 111
+    assert complete_calls[0]["transform_ms"] == 222
+    assert complete_calls[0]["prototype_ms"] == 333
+    assert complete_calls[0]["event_candidate_total"] == 7
+    assert complete_calls[0]["event_candidate_done"] == 7
+    assert complete_calls[0]["prototype_rows_total"] == 7
+    assert complete_calls[0]["prototype_rows_done"] == 7
+    assert complete_calls[0]["cluster_count"] == 5
+    assert complete_calls[0]["artifact_write_ms"] >= 0
+    assert not fail_calls
+    assert bundle_calls
+
+
+def test_materialize_train_snapshots_stops_when_eta_gate_exceeded(tmp_path, monkeypatch):
+    class _EmptyResult:
+        def mappings(self):
+            return self
+
+        def first(self):
+            return None
+
+    class _FakeSession:
+        def execute(self, *args, **kwargs):
+            return _EmptyResult()
+
+        def commit(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeLoader:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def load_research_context(self, **kwargs):
+            return {
+                "bars_by_symbol": {},
+                "macro_history_by_date": {},
+                "sector_map": {},
+                "session_metadata_by_symbol": {},
+                "macro_series_history": [],
+            }
+
+    monkeypatch.setattr(calibration_cache, "_load_cached_decision_dates", lambda **kwargs: ["2026-01-05", "2026-02-05", "2026-03-05"])
+    monkeypatch.setattr(calibration_cache, "LocalPostgresLoader", _FakeLoader)
+    monkeypatch.setattr(calibration_cache, "create_backtest_session_factory", lambda: object())
+    monkeypatch.setattr(calibration_cache, "_snapshot_dates", lambda decision_dates, cadence: ["2026-01-05", "2026-02-05", "2026-03-05"])
+    monkeypatch.setattr(calibration_cache, "begin_snapshot_run", lambda **kwargs: None)
+    monkeypatch.setattr(calibration_cache, "touch_snapshot_run", lambda **kwargs: None)
+    monkeypatch.setattr(calibration_cache, "complete_snapshot_run", lambda **kwargs: None)
+    monkeypatch.setattr(calibration_cache, "fail_snapshot_run", lambda **kwargs: None)
+    monkeypatch.setattr(calibration_cache, "_clear_snapshot_checkpoint_files", lambda **kwargs: None)
+    monkeypatch.setattr(calibration_cache, "mark_bundle_run_failed", lambda **kwargs: {"id": kwargs["bundle_run_id"], "status": "failed", "last_error": kwargs["last_error"]})
+    monkeypatch.setattr(calibration_cache, "touch_bundle_run", lambda **kwargs: {"bundle_run_id": kwargs["bundle_run_id"]})
+
+    scaler = FeatureScaler(means={"a": 1.0}, stds={"a": 2.0})
+    transform = FeatureTransform(scaler=scaler, feature_keys=["a"], version="feature_contract_v1")
+
+    def fake_fit_train_artifacts(**kwargs):
+        return {
+            "run_id": "bundle_snapshots",
+            "snapshot_id": "snap-001",
+            "spec_hash": "spec-hash",
+            "as_of_date": kwargs["train_end"],
+            "train_end": kwargs["train_end"],
+            "test_start": kwargs["test_start"],
+            "purge": 0,
+            "embargo": 0,
+            "memory_version": "v1",
+            "prototype_snapshot_name": "prototype_snapshot",
+            "max_train_date": "2026-01-04",
+            "max_outcome_end_date": "2026-01-04",
+            "event_record_count": 20000,
+            "prototype_count": 18000,
+            "prototypes": [],
+            "scaler": scaler,
+            "transform": transform,
+            "calibration": {"method": "logistic", "slope": 1.0, "intercept": 0.0},
+            "quote_policy_calibration": {"abstain_margin": 0.05},
+            "metadata": {},
+            "session_metadata_by_symbol": {},
+            "macro_series_history": [],
+            "snapshot_ids": {"prototype_snapshot_id": "snap-001"},
+            "phase_timings_ms": {"event_memory": 10_000, "transform": 1_000, "prototype": 20_000_000},
+        }
+
+    monkeypatch.setattr(calibration_cache, "fit_train_artifacts", fake_fit_train_artifacts)
+    with pytest.raises(RuntimeError, match="eta_gate_exceeded_after_event_memory_fast_path"):
+        calibration_cache.materialize_train_snapshots(
+            write_session_factory=lambda: _FakeSession(),
+            bundle_run_id=31,
+            bundle_key="bundle-key",
+            market="US",
+            start_date="2026-01-01",
+            end_date="2026-03-31",
+            symbols=["AAPL", "MSFT"],
+            research_spec=ResearchExperimentSpec(),
+            metadata={},
+            output_dir=str(tmp_path / "snapshots"),
+            snapshot_cadence="monthly",
+            model_version="monthly_snapshot_v1",
+        )
 
 
 def test_build_study_cache_preserves_filtered_coverage_and_supports_cache_eval(tmp_path):

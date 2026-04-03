@@ -104,31 +104,59 @@ class LocalPostgresLoader:
         end_date: str,
         symbols: Iterable[str],
         research_spec: ResearchExperimentSpec | None = None,
+        progress_callback=None,
     ) -> Dict[str, Any]:
         symbols = [str(symbol) for symbol in symbols if symbol]
         if not symbols:
             raise ValueError("symbols required")
         spec = research_spec or ResearchExperimentSpec()
         prewarm_days = max(WARMUP_DAYS, spec.feature_window_bars * 2)
+        if progress_callback is not None:
+            progress_callback("load_research_context:start", {"symbol_count": len(symbols), "prewarm_days": prewarm_days})
         bars_by_symbol = self._load_bars(
             start_date=start_date,
             end_date=end_date,
             symbols=symbols,
             warmup_days=prewarm_days,
         )
+        if progress_callback is not None:
+            progress_callback(
+                "load_research_context:bars",
+                {"bar_row_count": sum(len(rows) for rows in bars_by_symbol.values())},
+            )
         sector_map = self._load_sector_map(symbols)
+        if progress_callback is not None:
+            progress_callback("load_research_context:sector_map", {"sector_symbol_count": len(sector_map)})
         session_metadata_by_symbol, missing_session_metadata_symbols = self._load_session_metadata(symbols)
+        if progress_callback is not None:
+            progress_callback(
+                "load_research_context:session_metadata",
+                {
+                    "session_symbol_count": len(session_metadata_by_symbol),
+                    "missing_session_symbol_count": len(missing_session_metadata_symbols),
+                },
+            )
         macro_series_history = self._load_macro_series_history(
             start_date=start_date,
             end_date=end_date,
             prewarm_days=prewarm_days,
         )
+        if progress_callback is not None:
+            progress_callback(
+                "load_research_context:macro_series",
+                {"macro_series_row_count": len(macro_series_history)},
+            )
         macro_history_by_date = _macro_history_by_obs_date(
             macro_series_history,
             start_date=start_date,
             end_date=end_date,
             prewarm_days=prewarm_days,
         )
+        if progress_callback is not None:
+            progress_callback(
+                "load_research_context:macro_history",
+                {"macro_history_date_count": len(macro_history_by_date)},
+            )
         return {
             "bars_by_symbol": bars_by_symbol,
             "sector_map": sector_map,

@@ -1,5 +1,9 @@
+import json
+from pathlib import Path
+
 import pytest
 
+from backtest_app.research import prototype as prototype_module
 from backtest_app.research.artifacts import JsonResearchArtifactStore
 from backtest_app.research.models import EventOutcomeRecord, ResearchAnchor
 from backtest_app.research.prototype import PrototypeConfig, build_anchor_prototypes, build_prototype_snapshot_from_event_memory, build_state_prototypes_from_event_memory
@@ -56,10 +60,134 @@ def test_build_prototype_snapshot_from_event_memory_is_deterministic_and_keeps_l
     assert snap1["prototypes"][0]["side_stats"]["BUY"]["support_count"] == 2
     assert snap1["prototypes"][0]["side_stats"]["SELL"]["support_count"] == 2
     store = JsonResearchArtifactStore(str(tmp_path))
-    store.save_prototype_snapshot(run_id="r1", as_of_date="2026-01-10", memory_version="memory_asof_v1", payload=snap1)
+    manifest_path = store.save_prototype_snapshot(run_id="r1", as_of_date="2026-01-10", memory_version="memory_asof_v1", payload=snap1)
+    assert Path(manifest_path).exists()
+    assert (Path(manifest_path).parent / "parts").exists()
     loaded = load_prototypes_asof(artifact_store=store, run_id="r1", as_of_date="2026-01-10", memory_version="memory_asof_v1")
     assert loaded
     assert loaded[0].prototype_id == snap1["prototypes"][0]["prototype_id"]
+
+
+def test_build_state_prototypes_fast_path_matches_legacy_exactly():
+    events = [
+        _event("AAPL", "2026-01-01", "2026-01-05", embedding=[1.0, 0.0], buy_ret=0.04, sell_ret=-0.04),
+        _event("MSFT", "2026-01-02", "2026-01-06", embedding=[0.99, 0.01], buy_ret=0.02, sell_ret=-0.02),
+        _event("NVDA", "2026-01-03", "2026-01-07", embedding=[0.1, 0.9], buy_ret=0.03, sell_ret=-0.03),
+    ]
+    legacy = prototype_module._build_state_prototypes_from_event_memory_legacy(
+        event_records=events,
+        as_of_date="2026-01-10",
+        memory_version="memory_asof_v1",
+        spec_hash="spec-1",
+    )
+    fast = build_state_prototypes_from_event_memory(
+        event_records=events,
+        as_of_date="2026-01-10",
+        memory_version="memory_asof_v1",
+        spec_hash="spec-1",
+    )
+    assert [item.__dict__ for item in fast] == [item.__dict__ for item in legacy]
+
+
+def test_build_state_prototypes_checkpoint_resume_matches_full_run(tmp_path):
+    events = [
+        _event(f"SYM{i:04d}", f"2026-01-{(i % 20) + 1:02d}", "2026-02-01", embedding=[1.0, 0.0], buy_ret=0.01, sell_ret=-0.01)
+        for i in range(1001)
+    ]
+    checkpoint_path = tmp_path / "prototype_checkpoint.pkl"
+    interrupted = False
+    history: list[dict] = []
+
+    def _progress(payload: dict) -> None:
+        history.append(dict(payload))
+        if payload.get("phase") == "prototype_cluster" and int(payload.get("prototype_rows_done") or 0) >= 1000:
+            raise RuntimeError("interrupt-after-checkpoint")
+
+    with pytest.raises(RuntimeError, match="interrupt-after-checkpoint"):
+        build_state_prototypes_from_event_memory(
+            event_records=events,
+            as_of_date="2026-02-10",
+            memory_version="memory_asof_v1",
+            spec_hash="spec-1",
+            checkpoint_path=str(checkpoint_path),
+            progress_callback=_progress,
+        )
+    interrupted = True
+    assert interrupted is True
+    assert checkpoint_path.exists()
+    assert checkpoint_path.with_name("prototype_rows").exists()
+    assert checkpoint_path.with_name("prototype_norms.npy").exists()
+    assert checkpoint_path.with_name("prototype_representatives.npy").exists()
+    resumed = build_state_prototypes_from_event_memory(
+        event_records=events,
+        as_of_date="2026-02-10",
+        memory_version="memory_asof_v1",
+        spec_hash="spec-1",
+        checkpoint_path=str(checkpoint_path),
+        resume_from_checkpoint=True,
+    )
+    full = build_state_prototypes_from_event_memory(
+        event_records=events,
+        as_of_date="2026-02-10",
+        memory_version="memory_asof_v1",
+        spec_hash="spec-1",
+    )
+    assert [item.__dict__ for item in resumed] == [item.__dict__ for item in full]
+
+
+def test_load_prototype_snapshot_keeps_legacy_json_compatibility(tmp_path):
+    run_dir = tmp_path / "r1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    legacy_payload = {
+        "as_of_date": "2026-01-10",
+        "memory_version": "memory_asof_v1",
+        "spec_hash": "spec-1",
+        "snapshot_id": "snap-1",
+        "prototype_count": 1,
+        "prototypes": [
+            build_state_prototypes_from_event_memory(
+                event_records=[_event("AAPL", "2026-01-01", "2026-01-05")],
+                as_of_date="2026-01-10",
+                memory_version="memory_asof_v1",
+                spec_hash="spec-1",
+            )[0].__dict__
+        ],
+    }
+    (run_dir / "prototype_snapshot.json").write_text(json.dumps(legacy_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    store = JsonResearchArtifactStore(str(tmp_path))
+    loaded = load_prototypes_asof(artifact_store=store, run_id="r1", as_of_date="2026-01-10", memory_version="memory_asof_v1")
+    assert len(loaded) == 1
+    assert loaded[0].prototype_id == legacy_payload["prototypes"][0]["prototype_id"]
+
+
+def test_build_state_prototypes_emits_running_counters_and_matches_block_sizes(tmp_path):
+    events = [
+        _event("AAPL", "2026-01-01", "2026-01-05", embedding=[1.0, 0.0]),
+        _event("MSFT", "2026-01-02", "2026-01-06", embedding=[0.99, 0.01]),
+        _event("NVDA", "2026-01-03", "2026-01-07", embedding=[0.98, 0.02]),
+    ]
+    progress_events: list[dict] = []
+    block_one = build_state_prototypes_from_event_memory(
+        event_records=events,
+        as_of_date="2026-01-10",
+        memory_version="memory_asof_v1",
+        spec_hash="spec-1",
+        checkpoint_path=str(tmp_path / "prototype_checkpoint.pkl"),
+        comparison_block_size=1,
+        progress_callback=lambda payload: progress_events.append(dict(payload)),
+    )
+    block_many = build_state_prototypes_from_event_memory(
+        event_records=events,
+        as_of_date="2026-01-10",
+        memory_version="memory_asof_v1",
+        spec_hash="spec-1",
+        comparison_block_size=256,
+    )
+    assert [item.__dict__ for item in block_one] == [item.__dict__ for item in block_many]
+    prototype_cluster = [event for event in progress_events if event.get("phase") == "prototype_cluster"]
+    assert prototype_cluster
+    assert any(int(event.get("prototype_rows_done") or 0) > 0 for event in prototype_cluster)
+    assert any(int(event.get("cluster_count") or 0) > 0 for event in prototype_cluster)
 
 
 @pytest.mark.parametrize(

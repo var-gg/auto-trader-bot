@@ -22,6 +22,7 @@ from backtest_app.research_runtime.calibration_cache import (
     derive_chunk_timeouts,
     export_materialized_bundle_artifacts,
     list_chunk_runs,
+    mark_stale_bundle_run_if_dead,
     materialize_query_feature_cache,
     materialize_train_snapshots,
     materialize_calibration_chunk,
@@ -442,6 +443,11 @@ def _run_build_query_feature_cache_mode(args) -> dict:
     if args.strategy_mode != "research_similarity_v2":
         raise SystemExit("build-query-feature-cache currently supports --strategy-mode research_similarity_v2 only")
     context = _resolve_calibration_bundle_context(args)
+    mark_stale_bundle_run_if_dead(
+        session_factory=context["write_session_factory"],
+        bundle_run_id=int(context["bundle_run"]["bundle_run_id"]),
+        stale_after_seconds=120,
+    )
     request = context["request"]
     result = materialize_query_feature_cache(
         write_session_factory=context["write_session_factory"],
@@ -452,6 +458,11 @@ def _run_build_query_feature_cache_mode(args) -> dict:
         symbols=context["symbols"],
         research_spec=request.config.research_spec,
         metadata=request.config.metadata,
+        symbol_chunk_size=int(getattr(args, "query_cache_symbol_chunk_size", 10) or 10),
+        date_window_months=int(getattr(args, "query_cache_date_window_months", 1) or 1),
+        subwindow_days=int(getattr(args, "query_cache_subwindow_days", 0) or 0),
+        worker_count=int(getattr(args, "query_cache_worker_count", 4) or 4),
+        progress_path=str(getattr(args, "query_cache_progress_path", "") or (context["output_root"] / "query_cache_progress.json")),
     )
     return {
         "mode": "build-query-feature-cache",
@@ -934,6 +945,11 @@ def main() -> int:
     parser.add_argument("--proof-reference-run", default="")
     parser.add_argument("--snapshot-cadence", choices=["daily", "monthly"], default="daily")
     parser.add_argument("--model-version", default="")
+    parser.add_argument("--query-cache-symbol-chunk-size", type=int, default=10)
+    parser.add_argument("--query-cache-date-window-months", type=int, default=1)
+    parser.add_argument("--query-cache-subwindow-days", type=int, default=0)
+    parser.add_argument("--query-cache-worker-count", type=int, default=4)
+    parser.add_argument("--query-cache-progress-path", default="")
     args = parser.parse_args()
     _validate_args(args)
     output_path = args.output or None

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 import json
 import math
+import os
 import time
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from unittest.mock import patch
@@ -15,18 +19,20 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from backtest_app.configs.models import ResearchExperimentSpec
 from backtest_app.db.local_session import create_backtest_session_factory
+from backtest_app.db.local_write_session import create_backtest_write_session_factory
 from backtest_app.historical_data.features import FeatureScaler, FeatureTransform
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
 from backtest_app.historical_data.models import HistoricalBar
 from backtest_app.research.artifacts import JsonResearchArtifactStore
 from backtest_app.research.models import StatePrototype
 from backtest_app.research.pipeline import (
+    ProxySeriesResult,
     _chosen_side_payload,
     _ev_config_from_metadata,
     _side_diag,
+    build_query_feature_payload_asof,
     build_decision_surface,
     build_event_memory_asof,
-    build_query_embedding,
     fit_train_artifacts,
     generate_similarity_candidates_rolling,
 )
@@ -44,6 +50,7 @@ from backtest_app.research_runtime.frozen_seed import (
 BUNDLE_STATUSES = {"pending", "running", "ok", "partial", "failed"}
 CHUNK_STATUSES = {"pending", "running", "reused", "ok", "failed"}
 SNAPSHOT_STATUSES = {"pending", "running", "ok", "failed"}
+QUERY_CHUNK_STATUSES = {"pending", "running", "reused", "ok", "failed"}
 DAILY_REUSE_MODEL_VERSION = "daily_reuse_v1"
 MONTHLY_SNAPSHOT_MODEL_VERSION = "monthly_snapshot_v1"
 DEFAULT_MODEL_VERSION_BY_CADENCE = {
@@ -64,6 +71,24 @@ def _utcnow() -> datetime:
 
 def _utcnow_iso() -> str:
     return _utcnow().isoformat()
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _calendar_date(text_value: str) -> datetime.date:
+    return datetime.fromisoformat(str(text_value)[:10]).date()
+
+
+def _date_iso(value: datetime.date) -> str:
+    return value.isoformat()
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -125,6 +150,304 @@ def _decision_date(bar: HistoricalBar) -> str:
     return str(bar.timestamp)[:10]
 
 
+def _session_exchange_code(
+    symbol: str,
+    session_metadata_by_symbol: Mapping[str, Any] | None,
+) -> str | None:
+    if not session_metadata_by_symbol:
+        return None
+    payload = session_metadata_by_symbol.get(symbol)
+    if payload is None:
+        return None
+    if hasattr(payload, "exchange_code"):
+        value = getattr(payload, "exchange_code", None)
+    elif isinstance(payload, Mapping):
+        value = payload.get("exchange_code")
+    else:
+        value = None
+    text = str(value or "").strip()
+    return text or None
+
+
+def _aggregate_scope_key(exchange_code: str | None) -> str:
+    return str(exchange_code or "__ALL__")
+
+
+def _aggregate_add(
+    aggregate_by_date: dict[str, dict[str, Any]],
+    trade_date: str,
+    symbol: str,
+    bar: HistoricalBar,
+) -> None:
+    bucket = aggregate_by_date.setdefault(
+        trade_date,
+        {
+            "count": 0,
+            "open_sum": 0.0,
+            "high_sum": 0.0,
+            "low_sum": 0.0,
+            "close_sum": 0.0,
+            "volume_sum": 0.0,
+            "symbols": [],
+        },
+    )
+    bucket["count"] += 1
+    bucket["open_sum"] += float(bar.open)
+    bucket["high_sum"] += float(bar.high)
+    bucket["low_sum"] += float(bar.low)
+    bucket["close_sum"] += float(bar.close)
+    bucket["volume_sum"] += float(bar.volume or 0.0)
+    bucket["symbols"].append(str(symbol))
+
+
+def _proxy_bar_from_bucket(
+    *,
+    proxy_symbol: str,
+    trade_date: str,
+    bucket: Mapping[str, Any],
+    subtract_bar: HistoricalBar | None = None,
+) -> tuple[HistoricalBar | None, int]:
+    count = int(bucket.get("count") or 0)
+    open_sum = _to_float(bucket.get("open_sum"))
+    high_sum = _to_float(bucket.get("high_sum"))
+    low_sum = _to_float(bucket.get("low_sum"))
+    close_sum = _to_float(bucket.get("close_sum"))
+    volume_sum = _to_float(bucket.get("volume_sum"))
+    if subtract_bar is not None:
+        count -= 1
+        open_sum -= float(subtract_bar.open)
+        high_sum -= float(subtract_bar.high)
+        low_sum -= float(subtract_bar.low)
+        close_sum -= float(subtract_bar.close)
+        volume_sum -= float(subtract_bar.volume or 0.0)
+    if count <= 0:
+        return None, 0
+    return (
+        HistoricalBar(
+            symbol=proxy_symbol,
+            timestamp=trade_date,
+            open=open_sum / count,
+            high=high_sum / count,
+            low=low_sum / count,
+            close=close_sum / count,
+            volume=volume_sum / count,
+        ),
+        count,
+    )
+
+
+def _active_scope_count(first_dates: Sequence[str], cutoff_date: str | None, fallback_count: int) -> int:
+    if not first_dates:
+        return int(fallback_count)
+    if not cutoff_date:
+        return len(first_dates)
+    active = bisect_right(list(first_dates), str(cutoff_date))
+    return active if active > 0 else int(fallback_count)
+
+
+def _build_query_proxy_aggregate_cache(
+    *,
+    symbols: Sequence[str],
+    bars_by_symbol: Mapping[str, Sequence[HistoricalBar]],
+    sector_map: Mapping[str, str],
+    session_metadata_by_symbol: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    symbol_bar_by_date: dict[str, dict[str, HistoricalBar]] = {}
+    symbol_first_date: dict[str, str] = {}
+    market_scope_symbols: dict[str, list[str]] = defaultdict(list)
+    sector_scope_symbols: dict[tuple[str, str], list[str]] = defaultdict(list)
+    market_aggregate_by_scope: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    sector_aggregate_by_scope: dict[tuple[str, str], dict[str, dict[str, Any]]] = defaultdict(dict)
+
+    for raw_symbol in [str(item) for item in symbols if item]:
+        exchange_scope = _aggregate_scope_key(_session_exchange_code(raw_symbol, session_metadata_by_symbol))
+        market_scope_symbols[exchange_scope].append(raw_symbol)
+        sector_code = str(sector_map.get(raw_symbol) or "").strip()
+        if sector_code:
+            sector_scope_symbols[(sector_code, exchange_scope)].append(raw_symbol)
+        bars = list(bars_by_symbol.get(raw_symbol) or [])
+        date_map: dict[str, HistoricalBar] = {}
+        first_trade_date: str | None = None
+        for bar in bars:
+            trade_date = _decision_date(bar)
+            date_map[trade_date] = bar
+            if first_trade_date is None or trade_date < first_trade_date:
+                first_trade_date = trade_date
+            _aggregate_add(market_aggregate_by_scope[exchange_scope], trade_date, raw_symbol, bar)
+            if sector_code:
+                _aggregate_add(sector_aggregate_by_scope[(sector_code, exchange_scope)], trade_date, raw_symbol, bar)
+        symbol_bar_by_date[raw_symbol] = date_map
+        if first_trade_date is not None:
+            symbol_first_date[raw_symbol] = first_trade_date
+
+    for aggregate_by_scope in list(market_aggregate_by_scope.values()) + list(sector_aggregate_by_scope.values()):
+        for bucket in aggregate_by_scope.values():
+            bucket["symbols"] = sorted(str(symbol) for symbol in list(bucket.get("symbols") or []))
+
+    return {
+        "symbol_bar_by_date": symbol_bar_by_date,
+        "symbol_first_date": symbol_first_date,
+        "market_scope_symbols": {key: sorted(values) for key, values in market_scope_symbols.items()},
+        "sector_scope_symbols": {key: sorted(values) for key, values in sector_scope_symbols.items()},
+        "market_aggregate_by_scope": dict(market_aggregate_by_scope),
+        "sector_aggregate_by_scope": dict(sector_aggregate_by_scope),
+        "market_dates_by_scope": {key: sorted(value.keys()) for key, value in market_aggregate_by_scope.items()},
+        "sector_dates_by_scope": {key: sorted(value.keys()) for key, value in sector_aggregate_by_scope.items()},
+        "market_first_dates_by_scope": {
+            key: sorted(symbol_first_date[symbol] for symbol in values if symbol in symbol_first_date)
+            for key, values in market_scope_symbols.items()
+        },
+        "sector_first_dates_by_scope": {
+            key: sorted(symbol_first_date[symbol] for symbol in values if symbol in symbol_first_date)
+            for key, values in sector_scope_symbols.items()
+        },
+    }
+
+
+def _build_cached_market_proxy(
+    *,
+    symbol: str,
+    query_window: Sequence[HistoricalBar],
+    cutoff_date: str,
+    proxy_cache: Mapping[str, Any],
+    session_metadata_by_symbol: Mapping[str, Any] | None,
+) -> Any:
+    query_window_dates = [str(bar.timestamp)[:10] for bar in query_window]
+    scope_key = _aggregate_scope_key(_session_exchange_code(symbol, session_metadata_by_symbol))
+    aggregate_by_date = dict((proxy_cache.get("market_aggregate_by_scope") or {}).get(scope_key) or {})
+    scope_dates = list((proxy_cache.get("market_dates_by_scope") or {}).get(scope_key) or [])
+    scope_symbols = list((proxy_cache.get("market_scope_symbols") or {}).get(scope_key) or [])
+    first_dates = list((proxy_cache.get("market_first_dates_by_scope") or {}).get(scope_key) or [])
+    if not aggregate_by_date:
+        return ProxySeriesResult(
+            bars=[],
+            peer_count_by_date={},
+            contributing_symbols_by_date={},
+            fallback_to_self=False,
+            proxy_mode="session_aware_same_exchange" if session_metadata_by_symbol else "date_aligned",
+            same_exchange_peer_count=max(0, len(scope_symbols)),
+            cross_exchange_proxy_used=False,
+        )
+    cutoff_index = bisect_right(scope_dates, str(cutoff_date))
+    selected_dates = scope_dates[:cutoff_index][-21:]
+    bars = []
+    for trade_date in selected_dates:
+        proxy_bar, _count = _proxy_bar_from_bucket(
+            proxy_symbol="MKT",
+            trade_date=trade_date,
+            bucket=aggregate_by_date[trade_date],
+        )
+        if proxy_bar is not None:
+            bars.append(proxy_bar)
+    peer_count_by_date = {}
+    contributing_symbols_by_date = {}
+    for trade_date in query_window_dates:
+        bucket = aggregate_by_date.get(trade_date)
+        if not bucket:
+            continue
+        peer_count_by_date[trade_date] = int(bucket.get("count") or 0)
+        contributing_symbols_by_date[trade_date] = list(bucket.get("symbols") or [])
+    return ProxySeriesResult(
+        bars=bars,
+        peer_count_by_date=peer_count_by_date,
+        contributing_symbols_by_date=contributing_symbols_by_date,
+        fallback_to_self=False,
+        proxy_mode="session_aware_same_exchange" if session_metadata_by_symbol else "date_aligned",
+        same_exchange_peer_count=_active_scope_count(first_dates, cutoff_date, len(scope_symbols)),
+        cross_exchange_proxy_used=False,
+    )
+
+
+def _build_cached_sector_proxy(
+    *,
+    symbol: str,
+    query_window: Sequence[HistoricalBar],
+    cutoff_date: str,
+    sector_map: Mapping[str, str],
+    proxy_cache: Mapping[str, Any],
+    session_metadata_by_symbol: Mapping[str, Any] | None,
+) -> Any:
+    query_window_dates = [str(bar.timestamp)[:10] for bar in query_window]
+    exchange_scope = _aggregate_scope_key(_session_exchange_code(symbol, session_metadata_by_symbol))
+    sector_code = str(sector_map.get(symbol) or "").strip()
+    symbol_bar_by_date = dict((proxy_cache.get("symbol_bar_by_date") or {}).get(symbol) or {})
+    symbol_history_dates = sorted(symbol_bar_by_date.keys())
+    if not sector_code:
+        fallback_bars = [
+            symbol_bar_by_date[trade_date]
+            for trade_date in symbol_history_dates[: bisect_right(symbol_history_dates, str(cutoff_date))][-21:]
+            if trade_date in symbol_bar_by_date
+        ]
+        return ProxySeriesResult(
+            bars=fallback_bars,
+            peer_count_by_date={trade_date: 1 for trade_date in query_window_dates if trade_date in symbol_bar_by_date},
+            contributing_symbols_by_date={trade_date: [symbol] for trade_date in query_window_dates if trade_date in symbol_bar_by_date},
+            fallback_to_self=True,
+            proxy_mode="session_aware_same_exchange" if session_metadata_by_symbol else "date_aligned",
+            same_exchange_peer_count=1 if fallback_bars else 0,
+            cross_exchange_proxy_used=False,
+        )
+    scope_key = (sector_code, exchange_scope)
+    scope_symbols = [peer for peer in list((proxy_cache.get("sector_scope_symbols") or {}).get(scope_key) or []) if peer != symbol]
+    aggregate_by_date = dict((proxy_cache.get("sector_aggregate_by_scope") or {}).get(scope_key) or {})
+    scope_dates = list((proxy_cache.get("sector_dates_by_scope") or {}).get(scope_key) or [])
+    first_dates = sorted(
+        str((proxy_cache.get("symbol_first_date") or {}).get(peer))
+        for peer in scope_symbols
+        if (proxy_cache.get("symbol_first_date") or {}).get(peer)
+    )
+    if not scope_symbols:
+        fallback_bars = [
+            symbol_bar_by_date[trade_date]
+            for trade_date in symbol_history_dates[: bisect_right(symbol_history_dates, str(cutoff_date))][-21:]
+            if trade_date in symbol_bar_by_date
+        ]
+        return ProxySeriesResult(
+            bars=fallback_bars,
+            peer_count_by_date={trade_date: 1 for trade_date in query_window_dates if trade_date in symbol_bar_by_date},
+            contributing_symbols_by_date={trade_date: [symbol] for trade_date in query_window_dates if trade_date in symbol_bar_by_date},
+            fallback_to_self=True,
+            proxy_mode="session_aware_same_exchange" if session_metadata_by_symbol else "date_aligned",
+            same_exchange_peer_count=1 if fallback_bars else 0,
+            cross_exchange_proxy_used=False,
+        )
+    cutoff_index = bisect_right(scope_dates, str(cutoff_date))
+    bars = []
+    for trade_date in reversed(scope_dates[:cutoff_index]):
+        proxy_bar, peer_count = _proxy_bar_from_bucket(
+            proxy_symbol=f"SECTOR:{sector_code}",
+            trade_date=trade_date,
+            bucket=aggregate_by_date[trade_date],
+            subtract_bar=symbol_bar_by_date.get(trade_date),
+        )
+        if proxy_bar is None or peer_count <= 0:
+            continue
+        bars.append(proxy_bar)
+        if len(bars) >= 21:
+            break
+    bars.reverse()
+    peer_count_by_date = {}
+    contributing_symbols_by_date = {}
+    for trade_date in query_window_dates:
+        bucket = aggregate_by_date.get(trade_date)
+        if not bucket:
+            continue
+        peer_count = int(bucket.get("count") or 0) - (1 if trade_date in symbol_bar_by_date else 0)
+        if peer_count <= 0:
+            continue
+        peer_count_by_date[trade_date] = peer_count
+        contributing_symbols_by_date[trade_date] = [peer for peer in list(bucket.get("symbols") or []) if peer != symbol]
+    return ProxySeriesResult(
+        bars=bars,
+        peer_count_by_date=peer_count_by_date,
+        contributing_symbols_by_date=contributing_symbols_by_date,
+        fallback_to_self=False,
+        proxy_mode="session_aware_same_exchange" if session_metadata_by_symbol else "date_aligned",
+        same_exchange_peer_count=_active_scope_count(first_dates, cutoff_date, len(scope_symbols)),
+        cross_exchange_proxy_used=False,
+    )
+
+
 def _json_safe_snapshot_payload(train_artifact: Mapping[str, Any]) -> dict[str, Any]:
     scaler = train_artifact.get("scaler")
     transform = train_artifact.get("transform")
@@ -147,31 +470,68 @@ def _json_safe_snapshot_payload(train_artifact: Mapping[str, Any]) -> dict[str, 
         "embargo": _to_int(train_artifact.get("embargo")),
         "memory_version": str(train_artifact.get("memory_version") or ""),
         "prototype_snapshot_name": str(train_artifact.get("prototype_snapshot_name") or "prototype_snapshot"),
+        "prototype_snapshot_format": str(train_artifact.get("prototype_snapshot_format") or "prototype_snapshot_v2"),
+        "prototype_snapshot_manifest_path": str(train_artifact.get("prototype_snapshot_manifest_path") or ""),
         "max_train_date": train_artifact.get("max_train_date"),
         "max_outcome_end_date": train_artifact.get("max_outcome_end_date"),
         "event_record_count": _to_int(train_artifact.get("event_record_count")),
         "prototype_count": _to_int(train_artifact.get("prototype_count"), len(list(train_artifact.get("prototypes") or []))),
-        "prototypes": list(train_artifact.get("prototypes") or []),
         "scaler": scaler_payload,
         "transform": transform_payload,
         "calibration": dict(train_artifact.get("calibration") or {}),
         "quote_policy_calibration": dict(train_artifact.get("quote_policy_calibration") or {}),
         "metadata": dict(train_artifact.get("metadata") or {}),
         "session_metadata_by_symbol": dict(train_artifact.get("session_metadata_by_symbol") or {}),
-        "macro_series_history": list(train_artifact.get("macro_series_history") or []),
         "snapshot_ids": dict(train_artifact.get("snapshot_ids") or {}),
         "artifact_kind": "train_snapshot_v1",
     }
 
 
 def _load_train_snapshot_payload(path: str) -> dict[str, Any]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    with Path(path).open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    prototypes: list[StatePrototype] = []
+    if payload.get("prototypes"):
+        prototypes = [StatePrototype(**prototype) for prototype in list(payload.get("prototypes") or [])]
+    else:
+        train_snapshot_path = Path(path)
+        run_id = train_snapshot_path.parent.name
+        artifact_store = JsonResearchArtifactStore(str(train_snapshot_path.parent.parent))
+        prototype_snapshot = artifact_store.load_prototype_snapshot(
+            run_id=run_id,
+            name=str(payload.get("prototype_snapshot_name") or "prototype_snapshot"),
+        ) or {}
+        prototypes = [StatePrototype(**prototype) for prototype in list(prototype_snapshot.get("prototypes") or [])]
     return {
         **payload,
         "scaler": FeatureScaler.from_payload(payload.get("scaler") if isinstance(payload.get("scaler"), Mapping) else {}),
         "transform": FeatureTransform.from_payload(payload.get("transform") if isinstance(payload.get("transform"), Mapping) else {}),
-        "prototypes": [StatePrototype(**prototype) for prototype in list(payload.get("prototypes") or [])],
+        "prototypes": prototypes,
     }
+
+
+def _train_snapshot_artifact_is_reusable(path: str) -> bool:
+    artifact_path = Path(str(path or ""))
+    if not artifact_path.exists():
+        return False
+    try:
+        with artifact_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return False
+    if str(payload.get("artifact_kind") or "train_snapshot_v1") != "train_snapshot_v1":
+        return False
+    prototype_manifest_path = str(payload.get("prototype_snapshot_manifest_path") or "").strip()
+    prototype_snapshot_name = str(payload.get("prototype_snapshot_name") or "").strip()
+    if prototype_manifest_path and Path(prototype_manifest_path).exists():
+        return True
+    if payload.get("prototypes"):
+        return True
+    # Legacy snapshots that all pointed at the shared "prototype_snapshot" name
+    # are not safe to reuse because later snapshots overwrite the same artifact.
+    if prototype_snapshot_name == "prototype_snapshot":
+        return False
+    return False
 
 
 def _eligible_query_rows_for_symbol(
@@ -187,6 +547,7 @@ def _eligible_query_rows_for_symbol(
     start_date: str,
     end_date: str,
     metadata: Mapping[str, Any] | None,
+    proxy_cache: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     query_rows: list[dict[str, Any]] = []
     replay_rows: list[dict[str, Any]] = []
@@ -201,21 +562,40 @@ def _eligible_query_rows_for_symbol(
         if decision_date < start_date or decision_date > end_date:
             continue
         query_window = list(bars[idx - spec.feature_window_bars + 1 : idx + 1])
-        embedding, meta = build_query_embedding(
+        market_proxy_override = None
+        sector_proxy_override = None
+        if proxy_cache:
+            market_proxy_override = _build_cached_market_proxy(
+                symbol=symbol,
+                query_window=query_window,
+                cutoff_date=decision_date,
+                proxy_cache=proxy_cache,
+                session_metadata_by_symbol=session_metadata_by_symbol,
+            )
+            sector_proxy_override = _build_cached_sector_proxy(
+                symbol=symbol,
+                query_window=query_window,
+                cutoff_date=decision_date,
+                sector_map=sector_map,
+                proxy_cache=proxy_cache,
+                session_metadata_by_symbol=session_metadata_by_symbol,
+            )
+        payload = build_query_feature_payload_asof(
             symbol=symbol,
             bars=query_window,
-            bars_by_symbol={key: list(value) for key, value in bars_by_symbol.items()},
-            macro_history={str(key): dict(value) for key, value in macro_history_by_date.items()},
-            sector_map=dict(sector_map),
+            bars_by_symbol=bars_by_symbol,
+            macro_history=macro_history_by_date,
+            sector_map=sector_map,
             cutoff_date=decision_date,
             spec=spec,
-            scaler=None,
-            transform=None,
             use_macro_level_in_similarity=use_macro_level_in_similarity,
             use_dollar_volume_absolute=use_dollar_volume_absolute,
-            session_metadata_by_symbol=dict(session_metadata_by_symbol or {}),
-            macro_series_history=[dict(row) for row in list(macro_series_history or [])],
+            session_metadata_by_symbol=session_metadata_by_symbol,
+            macro_series_history=macro_series_history,
+            market_proxy_override=market_proxy_override,
+            sector_proxy_override=sector_proxy_override,
         )
+        meta = dict(payload.get("meta") or {})
         execution_bar = bars[idx + 1]
         query_rows.append(
             {
@@ -228,8 +608,8 @@ def _eligible_query_rows_for_symbol(
                 "feature_anchor_ts_utc": meta.get("feature_anchor_ts_utc"),
                 "macro_asof_ts_utc": meta.get("macro_asof_ts_utc"),
                 "raw_features_json": _json_dumps(dict(meta.get("raw_features") or {})),
-                "transformed_features_json": _json_dumps(dict(meta.get("transformed_features") or {})),
-                "embedding_json": _json_dumps(list(embedding or [])),
+                "transformed_features_json": _json_dumps({}),
+                "embedding_json": _json_dumps([]),
                 "query_meta_json": _json_dumps({**dict(meta), "sector_code": str(sector_map.get(symbol) or "UNKNOWN")}),
             }
         )
@@ -264,10 +644,21 @@ def build_query_feature_cache_rows(
     start_date: str,
     end_date: str,
     metadata: Mapping[str, Any] | None = None,
+    use_proxy_aggregate_cache: bool = True,
 ) -> dict[str, Any]:
     query_rows: list[dict[str, Any]] = []
     replay_rows: list[dict[str, Any]] = []
     decision_dates: set[str] = set()
+    proxy_cache = (
+        _build_query_proxy_aggregate_cache(
+            symbols=list(dict.fromkeys([str(item) for item in list(bars_by_symbol.keys()) + list(symbols) if item])),
+            bars_by_symbol=bars_by_symbol,
+            sector_map=sector_map,
+            session_metadata_by_symbol=session_metadata_by_symbol,
+        )
+        if use_proxy_aggregate_cache
+        else None
+    )
     for symbol in [str(item) for item in symbols if item]:
         rows_for_symbol, replay_for_symbol = _eligible_query_rows_for_symbol(
             symbol=symbol,
@@ -281,6 +672,7 @@ def build_query_feature_cache_rows(
             start_date=start_date,
             end_date=end_date,
             metadata=metadata,
+            proxy_cache=proxy_cache,
         )
         query_rows.extend(rows_for_symbol)
         replay_rows.extend(replay_for_symbol)
@@ -293,6 +685,137 @@ def build_query_feature_cache_rows(
         "decision_date_count": len(decision_dates),
         "query_row_count": len(query_rows),
     }
+
+
+def _month_windows(*, start_date: str, end_date: str, window_months: int) -> list[tuple[str, str]]:
+    start_day = _calendar_date(start_date)
+    end_day = _calendar_date(end_date)
+    cursor = start_day.replace(day=1)
+    windows: list[tuple[str, str]] = []
+    step_months = max(1, int(window_months or 1))
+    while cursor <= end_day:
+        year = cursor.year
+        month = cursor.month + step_months
+        while month > 12:
+            month -= 12
+            year += 1
+        next_cursor = cursor.replace(year=year, month=month, day=1)
+        window_start = max(start_day, cursor)
+        window_end = min(end_day, next_cursor - timedelta(days=1))
+        windows.append((_date_iso(window_start), _date_iso(window_end)))
+        cursor = next_cursor
+    return windows
+
+
+def _date_subwindows(*, start_date: str, end_date: str, window_days: int) -> list[tuple[str, str]]:
+    start_day = _calendar_date(start_date)
+    end_day = _calendar_date(end_date)
+    step_days = max(1, int(window_days or 1))
+    cursor = start_day
+    windows: list[tuple[str, str]] = []
+    while cursor <= end_day:
+        window_end = min(end_day, cursor + timedelta(days=step_days - 1))
+        windows.append((_date_iso(cursor), _date_iso(window_end)))
+        cursor = window_end + timedelta(days=1)
+    return windows
+
+
+def _query_chunk_rows(
+    *,
+    bundle_run_id: int,
+    chunk_id: int,
+    status: str,
+    window_start: str,
+    window_end: str,
+    symbols: Sequence[str],
+    started_at: bool = False,
+    finished: bool = False,
+    elapsed_ms: int | None = None,
+    load_ms: int | None = None,
+    feature_build_ms: int | None = None,
+    db_write_ms: int | None = None,
+    decision_date_count: int | None = None,
+    query_row_count: int | None = None,
+    replay_bar_count: int | None = None,
+    last_error: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    statements = [
+        "status = :status",
+        "window_start = CAST(:window_start AS date)",
+        "window_end = CAST(:window_end AS date)",
+        "symbols_json = :symbols_json",
+        "symbol_count = :symbol_count",
+        "last_heartbeat_at = NOW()",
+    ]
+    params: dict[str, Any] = {
+        "bundle_run_id": bundle_run_id,
+        "chunk_id": chunk_id,
+        "status": status,
+        "window_start": window_start,
+        "window_end": window_end,
+        "symbols_json": _json_dumps([str(symbol) for symbol in symbols]),
+        "symbol_count": len(list(symbols)),
+    }
+    if started_at:
+        statements.append("started_at = NOW()")
+        statements.append("finished_at = NULL")
+    if finished:
+        statements.append("finished_at = NOW()")
+    if elapsed_ms is not None:
+        statements.append("elapsed_ms = :elapsed_ms")
+        params["elapsed_ms"] = int(elapsed_ms)
+    if load_ms is not None:
+        statements.append("load_ms = :load_ms")
+        params["load_ms"] = int(load_ms)
+    if feature_build_ms is not None:
+        statements.append("feature_build_ms = :feature_build_ms")
+        params["feature_build_ms"] = int(feature_build_ms)
+    if db_write_ms is not None:
+        statements.append("db_write_ms = :db_write_ms")
+        params["db_write_ms"] = int(db_write_ms)
+    if decision_date_count is not None:
+        statements.append("decision_date_count = :decision_date_count")
+        params["decision_date_count"] = int(decision_date_count)
+    if query_row_count is not None:
+        statements.append("query_row_count = :query_row_count")
+        params["query_row_count"] = int(query_row_count)
+    if replay_bar_count is not None:
+        statements.append("replay_bar_count = :replay_bar_count")
+        params["replay_bar_count"] = int(replay_bar_count)
+    if last_error is not None:
+        statements.append("last_error = :last_error")
+        params["last_error"] = str(last_error)
+    sql = f"""
+        INSERT INTO bt_result.calibration_query_chunk_run(
+            bundle_run_id, chunk_id, window_start, window_end, status, symbols_json, symbol_count,
+            started_at, last_heartbeat_at
+        )
+        VALUES (
+            :bundle_run_id, :chunk_id, CAST(:window_start AS date), CAST(:window_end AS date), :status, :symbols_json, :symbol_count,
+            NOW(), NOW()
+        )
+        ON CONFLICT (bundle_run_id, chunk_id) DO UPDATE
+            SET {", ".join(statements)}
+    """
+    return sql, params
+
+
+def _query_chunk_range(
+    *,
+    bundle_start: str,
+    bundle_end: str,
+    window_start: str,
+    window_end: str,
+    lookback_days: int,
+    forward_days: int,
+) -> tuple[str, str]:
+    start_day = _calendar_date(bundle_start)
+    end_day = _calendar_date(bundle_end)
+    window_start_day = _calendar_date(window_start)
+    window_end_day = _calendar_date(window_end)
+    load_start = max(start_day, window_start_day - timedelta(days=max(0, int(lookback_days))))
+    load_end = min(end_day, window_end_day + timedelta(days=max(0, int(forward_days))))
+    return _date_iso(load_start), _date_iso(load_end)
 
 
 def _decision_dates_from_query_rows(query_rows: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -370,14 +893,11 @@ def _snapshot_metadata_rows(*, session_factory: sessionmaker[Session], bundle_ru
     return [dict(row) for row in rows]
 
 
-def _load_snapshot_cache(snapshot_rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
-    loaded: dict[str, dict[str, Any]] = {}
-    for row in snapshot_rows:
-        artifact_path = str(row.get("artifact_path") or "")
-        if not artifact_path:
-            continue
-        loaded[str(row.get("snapshot_id") or "")] = _load_train_snapshot_payload(artifact_path)
-    return loaded
+def _load_snapshot_payload_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    artifact_path = str(row.get("artifact_path") or "")
+    if not artifact_path:
+        return {}
+    return _load_train_snapshot_payload(artifact_path)
 
 
 def _select_snapshot_row(snapshot_rows: Sequence[Mapping[str, Any]], decision_date: str) -> dict[str, Any] | None:
@@ -392,7 +912,6 @@ def _signal_panel_rows_from_cache(
     *,
     query_rows: Sequence[Mapping[str, Any]],
     snapshot_rows: Sequence[Mapping[str, Any]],
-    snapshot_cache: Mapping[str, Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     by_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in query_rows:
@@ -400,12 +919,20 @@ def _signal_panel_rows_from_cache(
     panel_rows: list[dict[str, Any]] = []
     raw_event_row_count = 0
     prototype_count = 0
+    snapshot_load_ms = 0
+    loaded_snapshot_id = ""
+    loaded_snapshot_payload: dict[str, Any] = {}
     for decision_date in sorted(by_date):
         snapshot_row = _select_snapshot_row(snapshot_rows, decision_date)
         if not snapshot_row:
             continue
         snapshot_id = str(snapshot_row.get("snapshot_id") or "")
-        snapshot_payload = dict(snapshot_cache.get(snapshot_id) or {})
+        if snapshot_id != loaded_snapshot_id:
+            snapshot_load_started = time.perf_counter()
+            loaded_snapshot_payload = _load_snapshot_payload_for_row(snapshot_row)
+            snapshot_load_ms += int((time.perf_counter() - snapshot_load_started) * 1000)
+            loaded_snapshot_id = snapshot_id if loaded_snapshot_payload else ""
+        snapshot_payload = dict(loaded_snapshot_payload or {})
         if not snapshot_payload:
             continue
         transform = snapshot_payload.get("transform")
@@ -500,6 +1027,7 @@ def _signal_panel_rows_from_cache(
     return panel_rows, {
         "raw_event_row_count": raw_event_row_count,
         "prototype_count": prototype_count,
+        "snapshot_load_ms": snapshot_load_ms,
     }
 
 
@@ -539,11 +1067,9 @@ def build_calibration_seed_payloads_from_cache(
     scenario_id: str,
     policy_scope: str,
 ) -> dict[str, Any]:
-    snapshot_cache = _load_snapshot_cache(snapshot_rows)
     panel_rows, telemetry = _signal_panel_rows_from_cache(
         query_rows=query_rows,
         snapshot_rows=snapshot_rows,
-        snapshot_cache=snapshot_cache,
     )
     forecast_rows = research_engine._forecast_rows(panel_rows)
     forecast_rows = _augment_forecast_rows_with_replay_path(
@@ -667,13 +1193,17 @@ def create_or_resume_bundle_run(
                     """
                     UPDATE bt_result.calibration_bundle_run
                        SET status = 'running',
-                           started_at = COALESCE(started_at, NOW()),
-                           finished_at = NULL,
-                           worker_count = :worker_count,
-                           chunk_size = :chunk_size,
-                           universe_symbol_count = :universe_symbol_count,
-                           snapshot_cadence = :snapshot_cadence,
-                           model_version = :model_version
+                            started_at = COALESCE(started_at, NOW()),
+                            finished_at = NULL,
+                            worker_count = :worker_count,
+                            chunk_size = :chunk_size,
+                            universe_symbol_count = :universe_symbol_count,
+                            snapshot_cadence = :snapshot_cadence,
+                            model_version = :model_version,
+                            current_step = NULL,
+                            last_heartbeat_at = NOW(),
+                            last_pid = NULL,
+                            last_error = NULL
                      WHERE id = :bundle_run_id
                     """
                 ),
@@ -694,12 +1224,14 @@ def create_or_resume_bundle_run(
                 INSERT INTO bt_result.calibration_bundle_run(
                     bundle_key, market, strategy_mode, policy_scope, seed_profile,
                     proof_reference_run, status, start_date, end_date, chunk_size,
-                    worker_count, universe_symbol_count, snapshot_cadence, model_version, started_at
+                    worker_count, universe_symbol_count, snapshot_cadence, model_version, started_at,
+                    current_step, last_heartbeat_at
                 )
                 VALUES (
                     :bundle_key, :market, :strategy_mode, :policy_scope, :seed_profile,
                     :proof_reference_run, 'running', :start_date, :end_date, :chunk_size,
-                    :worker_count, :universe_symbol_count, :snapshot_cadence, :model_version, NOW()
+                    :worker_count, :universe_symbol_count, :snapshot_cadence, :model_version, NOW(),
+                    NULL, NOW()
                 )
                 RETURNING id
                 """
@@ -751,6 +1283,112 @@ def resolve_bundle_run(
         return dict(row)
 
 
+def touch_bundle_run(
+    *,
+    session_factory: sessionmaker[Session],
+    bundle_run_id: int,
+    current_step: str = "",
+    pid: int = 0,
+    status: str = "",
+    last_error: str | None = None,
+) -> dict[str, Any]:
+    update_parts = [
+        "last_heartbeat_at = NOW()",
+        "last_pid = :pid",
+    ]
+    params: dict[str, Any] = {
+        "bundle_run_id": bundle_run_id,
+        "pid": int(pid or 0) or None,
+    }
+    if current_step:
+        update_parts.append("current_step = :current_step")
+        params["current_step"] = str(current_step)
+    if status:
+        update_parts.append("status = :status")
+        params["status"] = str(status)
+    if last_error is not None:
+        update_parts.append("last_error = :last_error")
+        params["last_error"] = str(last_error)
+    with session_factory() as session:
+        session.execute(
+            text(
+                f"""
+                UPDATE bt_result.calibration_bundle_run
+                   SET {", ".join(update_parts)}
+                 WHERE id = :bundle_run_id
+                """
+            ),
+            params,
+        )
+        session.commit()
+    return resolve_bundle_run(session_factory=session_factory, bundle_run_id=bundle_run_id)
+
+
+def mark_bundle_run_failed(
+    *,
+    session_factory: sessionmaker[Session],
+    bundle_run_id: int,
+    last_error: str,
+) -> dict[str, Any]:
+    with session_factory() as session:
+        session.execute(
+            text(
+                """
+                UPDATE bt_result.calibration_bundle_run
+                   SET status = 'failed',
+                       finished_at = NOW(),
+                       last_error = :last_error,
+                       last_heartbeat_at = NOW()
+                 WHERE id = :bundle_run_id
+                """
+            ),
+            {
+                "bundle_run_id": bundle_run_id,
+                "last_error": str(last_error),
+            },
+        )
+        session.commit()
+    return resolve_bundle_run(session_factory=session_factory, bundle_run_id=bundle_run_id)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if int(pid or 0) <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        return False
+    except Exception:
+        return False
+    return True
+
+
+def mark_stale_bundle_run_if_dead(
+    *,
+    session_factory: sessionmaker[Session],
+    bundle_run_id: int,
+    stale_after_seconds: int = 120,
+    pid_alive_fn=None,
+) -> dict[str, Any]:
+    bundle = resolve_bundle_run(session_factory=session_factory, bundle_run_id=bundle_run_id)
+    if str(bundle.get("status") or "") != "running":
+        return bundle
+    heartbeat_at = _parse_iso_datetime(bundle.get("last_heartbeat_at"))
+    if heartbeat_at is None:
+        return bundle
+    if (_utcnow() - heartbeat_at).total_seconds() < max(1, int(stale_after_seconds)):
+        return bundle
+    pid = _to_int(bundle.get("last_pid"))
+    alive = pid_alive_fn(pid) if pid_alive_fn is not None else _pid_is_alive(pid)
+    if alive:
+        return bundle
+    return mark_bundle_run_failed(
+        session_factory=session_factory,
+        bundle_run_id=bundle_run_id,
+        last_error="stale_orchestrator_no_heartbeat",
+    )
+
+
 def list_chunk_runs(*, session_factory: sessionmaker[Session], bundle_run_id: int) -> list[dict[str, Any]]:
     with session_factory() as session:
         rows = session.execute(
@@ -767,8 +1405,491 @@ def list_chunk_runs(*, session_factory: sessionmaker[Session], bundle_run_id: in
     return [dict(row) for row in rows]
 
 
+def list_query_chunk_runs(*, session_factory: sessionmaker[Session], bundle_run_id: int) -> list[dict[str, Any]]:
+    with session_factory() as session:
+        rows = session.execute(
+            text(
+                """
+                SELECT *
+                  FROM bt_result.calibration_query_chunk_run
+                 WHERE bundle_run_id = :bundle_run_id
+                 ORDER BY chunk_id
+                """
+            ),
+            {"bundle_run_id": bundle_run_id},
+        ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 def list_snapshot_runs(*, session_factory: sessionmaker[Session], bundle_run_id: int) -> list[dict[str, Any]]:
-    return _snapshot_metadata_rows(session_factory=session_factory, bundle_run_id=bundle_run_id)
+    with session_factory() as session:
+        rows = session.execute(
+            text(
+                """
+                SELECT *
+                  FROM bt_result.calibration_snapshot_run
+                 WHERE bundle_run_id = :bundle_run_id
+                 ORDER BY snapshot_date, id
+                """
+            ),
+            {"bundle_run_id": bundle_run_id},
+        ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _snapshot_checkpoint_paths(*, output_dir: str, run_id: str, snapshot_date: str) -> dict[str, str]:
+    checkpoint_root = Path(output_dir) / run_id / "prototype_checkpoints" / snapshot_date.replace("-", "")
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    return {
+        "root": str(checkpoint_root),
+        "input_path": str(checkpoint_root / "prototype_input.pkl"),
+        "checkpoint_path": str(checkpoint_root / "prototype_checkpoint.pkl"),
+        "prototype_input_path": str(checkpoint_root / "prototype_input.pkl"),
+        "prototype_checkpoint_path": str(checkpoint_root / "prototype_checkpoint.pkl"),
+        "prototype_resume_meta_path": str(checkpoint_root / "prototype_resume_metadata.json"),
+        "prototype_rows_dir": str(checkpoint_root / "prototype_rows"),
+        "prototype_norms_path": str(checkpoint_root / "prototype_norms.npy"),
+        "prototype_representatives_path": str(checkpoint_root / "prototype_representatives.npy"),
+        "event_input_path": str(checkpoint_root / "event_memory_input.pkl"),
+        "event_checkpoint_path": str(checkpoint_root / "event_memory_checkpoint.pkl"),
+        "event_batch_dir": str(checkpoint_root / "event_memory_batches"),
+    }
+
+
+def _clear_snapshot_checkpoint_files(*, checkpoint_paths: Mapping[str, Any]) -> None:
+    for key in (
+        "input_path",
+        "checkpoint_path",
+        "prototype_input_path",
+        "prototype_checkpoint_path",
+        "prototype_resume_meta_path",
+        "prototype_norms_path",
+        "prototype_representatives_path",
+        "event_input_path",
+        "event_checkpoint_path",
+    ):
+        raw_path = str(checkpoint_paths.get(key) or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path)
+        if path.exists():
+            path.unlink()
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        if tmp_path.exists():
+            tmp_path.unlink()
+    root = Path(str(checkpoint_paths.get("root") or ""))
+    prototype_rows_dir = Path(str(checkpoint_paths.get("prototype_rows_dir") or ""))
+    event_batch_dir = Path(str(checkpoint_paths.get("event_batch_dir") or ""))
+    if str(checkpoint_paths.get("prototype_rows_dir") or "").strip() and prototype_rows_dir.exists():
+        for child in prototype_rows_dir.glob("*"):
+            if child.is_file():
+                child.unlink()
+        try:
+            prototype_rows_dir.rmdir()
+        except OSError:
+            pass
+    if str(checkpoint_paths.get("event_batch_dir") or "").strip() and event_batch_dir.exists():
+        for child in event_batch_dir.glob("*"):
+            if child.is_file():
+                child.unlink()
+        try:
+            event_batch_dir.rmdir()
+        except OSError:
+            pass
+    if root.exists():
+        try:
+            root.rmdir()
+        except OSError:
+            pass
+
+
+def _estimate_remaining_snapshot_eta_seconds(
+    *,
+    remaining_snapshot_count: int,
+    created_snapshot_seconds: float,
+    created_event_candidate_rows: int,
+    recent_snapshot_rows: Sequence[dict[str, Any]],
+) -> int:
+    if remaining_snapshot_count <= 0:
+        return 0
+    recent_seconds = [
+        max(
+            1.0,
+            (
+                _to_float(row.get("event_memory_ms"))
+                + _to_float(row.get("transform_ms"))
+                + _to_float(row.get("prototype_ms"))
+                + _to_float(row.get("artifact_write_ms"))
+            )
+            / 1000.0,
+        )
+        for row in recent_snapshot_rows
+    ]
+    recent_rows = [
+        max(
+            0,
+            _to_int(
+                row.get("event_candidate_total")
+                or row.get("prototype_rows_total")
+                or row.get("event_record_count")
+            ),
+        )
+        for row in recent_snapshot_rows
+    ]
+    avg_snapshot_seconds = float(sum(recent_seconds) / len(recent_seconds)) if recent_seconds else float(created_snapshot_seconds)
+    avg_event_candidate_rows = float(sum(recent_rows) / len(recent_rows)) if recent_rows else float(created_event_candidate_rows)
+    baseline_seconds = max(float(created_snapshot_seconds), avg_snapshot_seconds)
+    eta_from_snapshot_seconds = baseline_seconds * remaining_snapshot_count
+    if created_snapshot_seconds > 0 and created_event_candidate_rows > 0:
+        rows_per_second = created_event_candidate_rows / created_snapshot_seconds
+        eta_from_rows_seconds = (max(avg_event_candidate_rows, float(created_event_candidate_rows)) * remaining_snapshot_count) / max(rows_per_second, 1e-9)
+    else:
+        eta_from_rows_seconds = eta_from_snapshot_seconds
+    return int(max(eta_from_snapshot_seconds, eta_from_rows_seconds))
+
+
+def begin_snapshot_run(
+    *,
+    session_factory: sessionmaker[Session],
+    bundle_run_id: int,
+    snapshot_id: str,
+    snapshot_date: str,
+    train_start: str,
+    train_end: str,
+    spec_hash: str,
+    memory_version: str,
+    model_version: str,
+    snapshot_cadence: str,
+    current_phase: str = "event_memory",
+    checkpoint_path: str = "",
+    event_checkpoint_path: str = "",
+) -> None:
+    with session_factory() as session:
+        session.execute(
+            text(
+                """
+                INSERT INTO bt_result.calibration_snapshot_run(
+                    bundle_run_id, snapshot_id, snapshot_date, train_start, train_end, spec_hash,
+                    memory_version, model_version, snapshot_cadence, status, current_phase,
+                    started_at, last_heartbeat_at, checkpoint_path, event_checkpoint_path
+                )
+                VALUES (
+                    :bundle_run_id, :snapshot_id, CAST(:snapshot_date AS date), CAST(:train_start AS date), CAST(:train_end AS date), :spec_hash,
+                    :memory_version, :model_version, :snapshot_cadence, 'running', :current_phase,
+                    NOW(), NOW(), NULLIF(:checkpoint_path, ''), NULLIF(:event_checkpoint_path, '')
+                )
+                ON CONFLICT (bundle_run_id, snapshot_id) DO UPDATE
+                    SET status = 'running',
+                        current_phase = :current_phase,
+                        started_at = NOW(),
+                        finished_at = NULL,
+                        last_error = NULL,
+                        artifact_path = NULL,
+                        last_heartbeat_at = NOW(),
+                        current_symbol = NULL,
+                        symbols_done = 0,
+                        symbols_total = 0,
+                        raw_event_row_count = 0,
+                        pending_record_count = 0,
+                        event_candidate_total = 0,
+                        event_candidate_done = 0,
+                        current_event_date = NULL,
+                        event_checkpoint_path = NULLIF(:event_checkpoint_path, ''),
+                        last_event_checkpoint_at = NULL,
+                        prototype_rows_total = 0,
+                        prototype_rows_done = 0,
+                        cluster_count = 0,
+                        checkpoint_path = NULLIF(:checkpoint_path, ''),
+                        last_checkpoint_at = NULL,
+                        event_record_count = 0,
+                        prototype_count = 0,
+                        event_memory_ms = 0,
+                        transform_ms = 0,
+                        prototype_ms = 0,
+                        artifact_write_ms = 0,
+                        artifact_rows_total = 0,
+                        artifact_rows_done = 0,
+                        artifact_part_count = 0,
+                        artifact_bytes_written = 0
+                """
+            ),
+            {
+                "bundle_run_id": bundle_run_id,
+                "snapshot_id": snapshot_id,
+                "snapshot_date": snapshot_date,
+                "train_start": train_start,
+                "train_end": train_end,
+                "spec_hash": spec_hash,
+                "memory_version": memory_version,
+                "model_version": model_version,
+                "snapshot_cadence": snapshot_cadence,
+                "current_phase": str(current_phase or "event_memory"),
+                "checkpoint_path": str(checkpoint_path or ""),
+                "event_checkpoint_path": str(event_checkpoint_path or ""),
+            },
+        )
+        session.commit()
+
+
+def touch_snapshot_run(
+    *,
+    session_factory: sessionmaker[Session],
+    bundle_run_id: int,
+    snapshot_id: str,
+    current_phase: str = "",
+    status: str = "",
+    event_record_count: int | None = None,
+    prototype_count: int | None = None,
+    event_memory_ms: int | None = None,
+    transform_ms: int | None = None,
+    prototype_ms: int | None = None,
+    artifact_write_ms: int | None = None,
+    artifact_rows_total: int | None = None,
+    artifact_rows_done: int | None = None,
+    artifact_part_count: int | None = None,
+    artifact_bytes_written: int | None = None,
+    current_symbol: str | None = None,
+    current_event_date: str | None = None,
+    symbols_done: int | None = None,
+    symbols_total: int | None = None,
+    raw_event_row_count: int | None = None,
+    pending_record_count: int | None = None,
+    event_candidate_total: int | None = None,
+    event_candidate_done: int | None = None,
+    last_event_checkpoint_at: str | None = None,
+    event_checkpoint_path: str | None = None,
+    prototype_rows_total: int | None = None,
+    prototype_rows_done: int | None = None,
+    cluster_count: int | None = None,
+    last_checkpoint_at: str | None = None,
+    checkpoint_path: str | None = None,
+    last_error: str | None = None,
+) -> None:
+    update_parts = ["last_heartbeat_at = NOW()"]
+    params: dict[str, Any] = {
+        "bundle_run_id": int(bundle_run_id or 0),
+        "snapshot_id": str(snapshot_id),
+    }
+    if current_phase:
+        update_parts.append("current_phase = :current_phase")
+        params["current_phase"] = str(current_phase)
+    if status:
+        if status not in SNAPSHOT_STATUSES:
+            raise ValueError(f"unsupported snapshot status: {status}")
+        update_parts.append("status = :status")
+        params["status"] = str(status)
+    if event_record_count is not None:
+        update_parts.append("event_record_count = :event_record_count")
+        params["event_record_count"] = int(event_record_count)
+    if prototype_count is not None:
+        update_parts.append("prototype_count = :prototype_count")
+        params["prototype_count"] = int(prototype_count)
+    if event_memory_ms is not None:
+        update_parts.append("event_memory_ms = :event_memory_ms")
+        params["event_memory_ms"] = int(event_memory_ms)
+    if transform_ms is not None:
+        update_parts.append("transform_ms = :transform_ms")
+        params["transform_ms"] = int(transform_ms)
+    if prototype_ms is not None:
+        update_parts.append("prototype_ms = :prototype_ms")
+        params["prototype_ms"] = int(prototype_ms)
+    if artifact_write_ms is not None:
+        update_parts.append("artifact_write_ms = :artifact_write_ms")
+        params["artifact_write_ms"] = int(artifact_write_ms)
+    if artifact_rows_total is not None:
+        update_parts.append("artifact_rows_total = :artifact_rows_total")
+        params["artifact_rows_total"] = int(artifact_rows_total)
+    if artifact_rows_done is not None:
+        update_parts.append("artifact_rows_done = :artifact_rows_done")
+        params["artifact_rows_done"] = int(artifact_rows_done)
+    if artifact_part_count is not None:
+        update_parts.append("artifact_part_count = :artifact_part_count")
+        params["artifact_part_count"] = int(artifact_part_count)
+    if artifact_bytes_written is not None:
+        update_parts.append("artifact_bytes_written = :artifact_bytes_written")
+        params["artifact_bytes_written"] = int(artifact_bytes_written)
+    if current_symbol is not None:
+        update_parts.append("current_symbol = NULLIF(:current_symbol, '')")
+        params["current_symbol"] = str(current_symbol)
+    if current_event_date is not None:
+        update_parts.append("current_event_date = NULLIF(:current_event_date, '')::date")
+        params["current_event_date"] = str(current_event_date)
+    if symbols_done is not None:
+        update_parts.append("symbols_done = :symbols_done")
+        params["symbols_done"] = int(symbols_done)
+    if symbols_total is not None:
+        update_parts.append("symbols_total = :symbols_total")
+        params["symbols_total"] = int(symbols_total)
+    if raw_event_row_count is not None:
+        update_parts.append("raw_event_row_count = :raw_event_row_count")
+        params["raw_event_row_count"] = int(raw_event_row_count)
+    if pending_record_count is not None:
+        update_parts.append("pending_record_count = :pending_record_count")
+        params["pending_record_count"] = int(pending_record_count)
+    if event_candidate_total is not None:
+        update_parts.append("event_candidate_total = :event_candidate_total")
+        params["event_candidate_total"] = int(event_candidate_total)
+    if event_candidate_done is not None:
+        update_parts.append("event_candidate_done = :event_candidate_done")
+        params["event_candidate_done"] = int(event_candidate_done)
+    if last_event_checkpoint_at is not None:
+        update_parts.append("last_event_checkpoint_at = CAST(:last_event_checkpoint_at AS timestamptz)")
+        params["last_event_checkpoint_at"] = str(last_event_checkpoint_at)
+    if event_checkpoint_path is not None:
+        update_parts.append("event_checkpoint_path = NULLIF(:event_checkpoint_path, '')")
+        params["event_checkpoint_path"] = str(event_checkpoint_path)
+    if prototype_rows_total is not None:
+        update_parts.append("prototype_rows_total = :prototype_rows_total")
+        params["prototype_rows_total"] = int(prototype_rows_total)
+    if prototype_rows_done is not None:
+        update_parts.append("prototype_rows_done = :prototype_rows_done")
+        params["prototype_rows_done"] = int(prototype_rows_done)
+    if cluster_count is not None:
+        update_parts.append("cluster_count = :cluster_count")
+        params["cluster_count"] = int(cluster_count)
+    if last_checkpoint_at is not None:
+        update_parts.append("last_checkpoint_at = CAST(:last_checkpoint_at AS timestamptz)")
+        params["last_checkpoint_at"] = str(last_checkpoint_at)
+    if checkpoint_path is not None:
+        update_parts.append("checkpoint_path = NULLIF(:checkpoint_path, '')")
+        params["checkpoint_path"] = str(checkpoint_path)
+    if last_error is not None:
+        update_parts.append("last_error = :last_error")
+        params["last_error"] = str(last_error)
+    with session_factory() as session:
+        session.execute(
+            text(
+                f"""
+                UPDATE bt_result.calibration_snapshot_run
+                   SET {", ".join(update_parts)}
+                 WHERE bundle_run_id = :bundle_run_id
+                   AND snapshot_id = :snapshot_id
+                """
+            ),
+            params,
+        )
+        session.commit()
+
+
+def complete_snapshot_run(
+    *,
+    session_factory: sessionmaker[Session],
+    bundle_run_id: int,
+    snapshot_id: str,
+    artifact_path: str,
+    event_record_count: int,
+    prototype_count: int,
+    event_memory_ms: int = 0,
+    transform_ms: int = 0,
+    prototype_ms: int = 0,
+    artifact_write_ms: int = 0,
+    artifact_rows_total: int = 0,
+    artifact_rows_done: int = 0,
+    artifact_part_count: int = 0,
+    artifact_bytes_written: int = 0,
+    event_candidate_total: int = 0,
+    event_candidate_done: int = 0,
+    prototype_rows_total: int = 0,
+    prototype_rows_done: int = 0,
+    cluster_count: int = 0,
+    checkpoint_path: str = "",
+    event_checkpoint_path: str = "",
+) -> None:
+    with session_factory() as session:
+        session.execute(
+            text(
+                """
+                UPDATE bt_result.calibration_snapshot_run
+                   SET status = 'ok',
+                       current_phase = 'complete',
+                       artifact_path = :artifact_path,
+                       event_record_count = :event_record_count,
+                       prototype_count = :prototype_count,
+                       event_candidate_total = :event_candidate_total,
+                       event_candidate_done = :event_candidate_done,
+                       prototype_rows_total = :prototype_rows_total,
+                       prototype_rows_done = :prototype_rows_done,
+                       cluster_count = :cluster_count,
+                       event_memory_ms = :event_memory_ms,
+                       transform_ms = :transform_ms,
+                       prototype_ms = :prototype_ms,
+                       artifact_write_ms = :artifact_write_ms,
+                       artifact_rows_total = :artifact_rows_total,
+                       artifact_rows_done = :artifact_rows_done,
+                       artifact_part_count = :artifact_part_count,
+                       artifact_bytes_written = :artifact_bytes_written,
+                       checkpoint_path = NULLIF(:checkpoint_path, ''),
+                       event_checkpoint_path = NULLIF(:event_checkpoint_path, ''),
+                       last_checkpoint_at = NOW(),
+                       finished_at = NOW(),
+                       last_error = NULL,
+                       last_heartbeat_at = NOW()
+                 WHERE bundle_run_id = :bundle_run_id
+                   AND snapshot_id = :snapshot_id
+                """
+            ),
+            {
+                "bundle_run_id": int(bundle_run_id or 0),
+                "snapshot_id": str(snapshot_id),
+                "artifact_path": str(artifact_path),
+                "event_record_count": int(event_record_count),
+                "prototype_count": int(prototype_count),
+                "event_candidate_total": int(event_candidate_total),
+                "event_candidate_done": int(event_candidate_done),
+                "prototype_rows_total": int(prototype_rows_total),
+                "prototype_rows_done": int(prototype_rows_done),
+                "cluster_count": int(cluster_count),
+                "event_memory_ms": int(event_memory_ms),
+                "transform_ms": int(transform_ms),
+                "prototype_ms": int(prototype_ms),
+                "artifact_write_ms": int(artifact_write_ms),
+                "artifact_rows_total": int(artifact_rows_total),
+                "artifact_rows_done": int(artifact_rows_done),
+                "artifact_part_count": int(artifact_part_count),
+                "artifact_bytes_written": int(artifact_bytes_written),
+                "checkpoint_path": str(checkpoint_path or ""),
+                "event_checkpoint_path": str(event_checkpoint_path or ""),
+            },
+        )
+        session.commit()
+
+
+def fail_snapshot_run(
+    *,
+    session_factory: sessionmaker[Session],
+    bundle_run_id: int,
+    snapshot_id: str,
+    last_error: str,
+    current_phase: str = "",
+    checkpoint_path: str = "",
+    event_checkpoint_path: str = "",
+) -> None:
+    with session_factory() as session:
+        session.execute(
+            text(
+                """
+                UPDATE bt_result.calibration_snapshot_run
+                   SET status = 'failed',
+                       current_phase = COALESCE(NULLIF(:current_phase, ''), current_phase),
+                       finished_at = NOW(),
+                       checkpoint_path = COALESCE(NULLIF(:checkpoint_path, ''), checkpoint_path),
+                       event_checkpoint_path = COALESCE(NULLIF(:event_checkpoint_path, ''), event_checkpoint_path),
+                       last_error = :last_error,
+                       last_heartbeat_at = NOW()
+                 WHERE bundle_run_id = :bundle_run_id
+                   AND snapshot_id = :snapshot_id
+                """
+            ),
+            {
+                "bundle_run_id": int(bundle_run_id or 0),
+                "snapshot_id": str(snapshot_id),
+                "current_phase": str(current_phase or ""),
+                "checkpoint_path": str(checkpoint_path or ""),
+                "event_checkpoint_path": str(event_checkpoint_path or ""),
+                "last_error": str(last_error),
+            },
+        )
+        session.commit()
 
 
 def load_materialized_seed_rows(*, session_factory: sessionmaker[Session], bundle_run_id: int, policy_scope: str) -> list[dict[str, Any]]:
@@ -876,115 +1997,470 @@ def materialize_query_feature_cache(
     symbols: Sequence[str],
     research_spec: ResearchExperimentSpec | None = None,
     metadata: Mapping[str, Any] | None = None,
+    symbol_chunk_size: int = 10,
+    date_window_months: int = 1,
+    subwindow_days: int = 0,
+    worker_count: int = 4,
+    lookback_buffer_days: int = 220,
+    forward_buffer_days: int = 10,
+    progress_path: str = "",
 ) -> dict[str, Any]:
     spec = _spec_or_default(research_spec)
-    loader = LocalPostgresLoader(create_backtest_session_factory())
-    load_started = time.perf_counter()
-    context = loader.load_research_context(
-        start_date=start_date,
-        end_date=end_date,
-        symbols=symbols,
-        research_spec=spec,
-    )
-    load_ms = int((time.perf_counter() - load_started) * 1000)
-    query_started = time.perf_counter()
-    cache_rows = build_query_feature_cache_rows(
-        symbols=symbols,
-        bars_by_symbol=context["bars_by_symbol"],
-        macro_history_by_date=context["macro_history_by_date"],
-        sector_map=context["sector_map"],
-        session_metadata_by_symbol=context["session_metadata_by_symbol"],
-        macro_series_history=context["macro_series_history"],
-        spec=spec,
-        start_date=start_date,
-        end_date=end_date,
-        metadata=metadata,
-    )
-    query_feature_ms = int((time.perf_counter() - query_started) * 1000)
-    query_rows = list(cache_rows["query_rows"])
-    replay_rows = list(cache_rows["replay_rows"])
-    with write_session_factory() as session:
-        session.execute(
-            text(
-                """
-                DELETE FROM bt_result.calibration_query_feature_row
-                 WHERE bundle_run_id = :bundle_run_id
-                   AND symbol = ANY(:symbols)
-                   AND decision_date BETWEEN CAST(:start_date AS date) AND CAST(:end_date AS date)
-                """
-            ),
-            {
+    del market
+    symbol_list = [str(symbol) for symbol in symbols if symbol]
+    chunk_size = max(1, int(symbol_chunk_size or 10))
+    subwindow_size_days = max(0, int(subwindow_days or 0))
+    month_windows = _month_windows(start_date=start_date, end_date=end_date, window_months=max(1, int(date_window_months or 1)))
+    progress_target = Path(progress_path) if str(progress_path or "").strip() else None
+    existing_chunks = {int(row.get("chunk_id") or 0): row for row in list_query_chunk_runs(session_factory=write_session_factory, bundle_run_id=bundle_run_id)}
+    progress_lock = threading.Lock()
+    total_query_rows = 0
+    total_replay_rows = 0
+    total_decision_dates: set[str] = set()
+    load_total_ms = 0
+    feature_total_ms = 0
+    db_write_total_ms = 0
+    chunk_jobs: list[dict[str, Any]] = []
+    chunk_id = 0
+    for symbol_start in range(0, len(symbol_list), chunk_size):
+        chunk_symbols = symbol_list[symbol_start : symbol_start + chunk_size]
+        for window_start, window_end in month_windows:
+            chunk_id += 1
+            chunk_jobs.append(
+                {
+                    "chunk_id": chunk_id,
+                    "symbols": list(chunk_symbols),
+                    "window_start": window_start,
+                    "window_end": window_end,
+                }
+            )
+
+    def _write_progress(*, status: str, current_chunk_id: int = 0, current_symbols: Sequence[str] | None = None, current_window_start: str = "", current_window_end: str = "", last_error: str = "") -> None:
+        if progress_target is None:
+            return
+        with progress_lock:
+            rows = list_query_chunk_runs(session_factory=write_session_factory, bundle_run_id=bundle_run_id)
+            payload = {
+                "status": status,
                 "bundle_run_id": bundle_run_id,
-                "symbols": [str(symbol) for symbol in symbols],
-                "start_date": start_date,
-                "end_date": end_date,
-            },
+                "current_step": "build-query-feature-cache",
+                "updated_at": _utcnow_iso(),
+                "total_chunks": len(chunk_jobs),
+                "completed_chunks": sum(1 for row in rows if str(row.get("status") or "") in {"ok", "reused"}),
+                "failed_chunks": sum(1 for row in rows if str(row.get("status") or "") == "failed"),
+                "query_row_count": sum(
+                    _to_int(row.get("query_row_count"))
+                    for row in rows
+                    if str(row.get("status") or "") in {"ok", "reused", "running"}
+                ),
+                "replay_bar_count": sum(
+                    _to_int(row.get("replay_bar_count"))
+                    for row in rows
+                    if str(row.get("status") or "") in {"ok", "reused", "running"}
+                ),
+                "current_chunk_id": current_chunk_id,
+                "current_symbols": list(current_symbols or []),
+                "current_window_start": current_window_start,
+                "current_window_end": current_window_end,
+                "last_error": last_error,
+            }
+            progress_target.parent.mkdir(parents=True, exist_ok=True)
+            progress_target.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+    touch_bundle_run(
+        session_factory=write_session_factory,
+        bundle_run_id=bundle_run_id,
+        current_step="build-query-feature-cache",
+        pid=os.getpid(),
+        status="running",
+        last_error="",
+    )
+    _write_progress(status="running")
+
+    def _run_query_chunk(job: Mapping[str, Any]) -> dict[str, Any]:
+        local_session_factory = create_backtest_write_session_factory()
+        loader = LocalPostgresLoader(create_backtest_session_factory())
+        local_chunk_id = int(job["chunk_id"])
+        local_symbols = list(job["symbols"])
+        window_start = str(job["window_start"])
+        window_end = str(job["window_end"])
+        existing = existing_chunks.get(local_chunk_id) or {}
+        if str(existing.get("status") or "") in {"ok", "reused"}:
+            with local_session_factory() as session:
+                sql, params = _query_chunk_rows(
+                    bundle_run_id=bundle_run_id,
+                    chunk_id=local_chunk_id,
+                    status="reused",
+                    window_start=window_start,
+                    window_end=window_end,
+                    symbols=local_symbols,
+                    elapsed_ms=_to_int(existing.get("elapsed_ms")),
+                    load_ms=_to_int(existing.get("load_ms")),
+                    feature_build_ms=_to_int(existing.get("feature_build_ms")),
+                    db_write_ms=_to_int(existing.get("db_write_ms")),
+                    decision_date_count=_to_int(existing.get("decision_date_count")),
+                    query_row_count=_to_int(existing.get("query_row_count")),
+                    replay_bar_count=_to_int(existing.get("replay_bar_count")),
+                    last_error=None,
+                )
+                session.execute(text(sql), params)
+                session.commit()
+            return {
+                "status": "reused",
+                "chunk_id": local_chunk_id,
+                "window_start": window_start,
+                "window_end": window_end,
+                "symbols": local_symbols,
+                "decision_date_count": _to_int(existing.get("decision_date_count")),
+                "query_row_count": _to_int(existing.get("query_row_count")),
+                "replay_bar_count": _to_int(existing.get("replay_bar_count")),
+                "load_ms": _to_int(existing.get("load_ms")),
+                "feature_build_ms": _to_int(existing.get("feature_build_ms")),
+                "db_write_ms": _to_int(existing.get("db_write_ms")),
+            }
+        with local_session_factory() as session:
+            sql, params = _query_chunk_rows(
+                bundle_run_id=bundle_run_id,
+                chunk_id=local_chunk_id,
+                status="running",
+                window_start=window_start,
+                window_end=window_end,
+                symbols=local_symbols,
+                started_at=True,
+                last_error=None,
+            )
+            session.execute(text(sql), params)
+            session.commit()
+        touch_bundle_run(
+            session_factory=local_session_factory,
+            bundle_run_id=bundle_run_id,
+            current_step="build-query-feature-cache",
+            pid=os.getpid(),
+            status="running",
+            last_error="",
         )
-        session.execute(
-            text(
-                """
-                DELETE FROM bt_result.calibration_replay_bar
-                 WHERE bundle_run_id = :bundle_run_id
-                   AND symbol = ANY(:symbols)
-                   AND decision_date BETWEEN CAST(:start_date AS date) AND CAST(:end_date AS date)
-                """
-            ),
-            {
-                "bundle_run_id": bundle_run_id,
-                "symbols": [str(symbol) for symbol in symbols],
-                "start_date": start_date,
-                "end_date": end_date,
-            },
+        chunk_started = time.perf_counter()
+        load_start_date, load_end_date = _query_chunk_range(
+            bundle_start=start_date,
+            bundle_end=end_date,
+            window_start=window_start,
+            window_end=window_end,
+            lookback_days=lookback_buffer_days,
+            forward_days=forward_buffer_days,
         )
-        if query_rows:
+        load_started = time.perf_counter()
+        def _load_progress(stage: str, details: Mapping[str, Any] | None = None) -> None:
+            current_load_ms = int((time.perf_counter() - load_started) * 1000)
+            with local_session_factory() as session:
+                sql, params = _query_chunk_rows(
+                    bundle_run_id=bundle_run_id,
+                    chunk_id=local_chunk_id,
+                    status="running",
+                    window_start=window_start,
+                    window_end=window_end,
+                    symbols=local_symbols,
+                    elapsed_ms=int((time.perf_counter() - chunk_started) * 1000),
+                    load_ms=current_load_ms,
+                    decision_date_count=0,
+                    query_row_count=0,
+                    replay_bar_count=0,
+                    last_error=None,
+                )
+                session.execute(text(sql), params)
+                session.commit()
+            touch_bundle_run(
+                session_factory=local_session_factory,
+                bundle_run_id=bundle_run_id,
+                current_step="build-query-feature-cache",
+                pid=os.getpid(),
+                status="running",
+                last_error="",
+            )
+            _write_progress(
+                status="running",
+                current_chunk_id=local_chunk_id,
+                current_symbols=local_symbols,
+                current_window_start=window_start,
+                current_window_end=window_end,
+                last_error=f"{stage} {dict(details or {})}".strip(),
+            )
+        context = loader.load_research_context(
+            start_date=load_start_date,
+            end_date=load_end_date,
+            symbols=local_symbols,
+            research_spec=spec,
+            progress_callback=_load_progress,
+        )
+        load_ms = int((time.perf_counter() - load_started) * 1000)
+        subwindows = _date_subwindows(
+            start_date=window_start,
+            end_date=window_end,
+            window_days=subwindow_size_days or ((_calendar_date(window_end) - _calendar_date(window_start)).days + 1),
+        )
+        feature_build_ms = 0
+        db_write_ms = 0
+        total_query_rows_local = 0
+        total_replay_rows_local = 0
+        decision_dates: set[str] = set()
+        with local_session_factory() as session:
             session.execute(
                 text(
                     """
-                    INSERT INTO bt_result.calibration_query_feature_row(
-                        bundle_run_id, decision_date, symbol, execution_date, t1_open,
-                        regime_code, sector_code, feature_anchor_ts_utc, macro_asof_ts_utc,
-                        raw_features_json, transformed_features_json, embedding_json, query_meta_json
-                    )
-                    VALUES (
-                        :bundle_run_id, CAST(:decision_date AS date), :symbol, CAST(:execution_date AS date), :t1_open,
-                        :regime_code, :sector_code, CAST(:feature_anchor_ts_utc AS timestamptz), CAST(:macro_asof_ts_utc AS timestamptz),
-                        :raw_features_json, :transformed_features_json, :embedding_json, :query_meta_json
-                    )
+                    DELETE FROM bt_result.calibration_query_feature_row
+                     WHERE bundle_run_id = :bundle_run_id
+                       AND symbol = ANY(:symbols)
+                       AND decision_date BETWEEN CAST(:start_date AS date) AND CAST(:end_date AS date)
                     """
                 ),
-                [{"bundle_run_id": bundle_run_id, **row} for row in query_rows],
+                {
+                    "bundle_run_id": bundle_run_id,
+                    "symbols": local_symbols,
+                    "start_date": window_start,
+                    "end_date": window_end,
+                },
             )
-        if replay_rows:
             session.execute(
                 text(
                     """
-                    INSERT INTO bt_result.calibration_replay_bar(
-                        bundle_run_id, decision_date, symbol, side, bar_n, session_date, open, high, low, close
-                    )
-                    VALUES (
-                        :bundle_run_id, CAST(:decision_date AS date), :symbol, :side, :bar_n, CAST(:session_date AS date), :open, :high, :low, :close
-                    )
-                    ON CONFLICT (bundle_run_id, decision_date, symbol, side, bar_n) DO UPDATE
-                        SET session_date = EXCLUDED.session_date,
-                            open = EXCLUDED.open,
-                            high = EXCLUDED.high,
-                            low = EXCLUDED.low,
-                            close = EXCLUDED.close
+                    DELETE FROM bt_result.calibration_replay_bar
+                     WHERE bundle_run_id = :bundle_run_id
+                       AND symbol = ANY(:symbols)
+                       AND decision_date BETWEEN CAST(:start_date AS date) AND CAST(:end_date AS date)
                     """
                 ),
-                [{"bundle_run_id": bundle_run_id, **row} for row in replay_rows],
+                {
+                    "bundle_run_id": bundle_run_id,
+                    "symbols": local_symbols,
+                    "start_date": window_start,
+                    "end_date": window_end,
+                },
             )
-        session.commit()
+            session.commit()
+        for subwindow_start, subwindow_end in subwindows:
+            feature_started = time.perf_counter()
+            payload = build_query_feature_cache_rows(
+                symbols=local_symbols,
+                bars_by_symbol=context["bars_by_symbol"],
+                macro_history_by_date=context["macro_history_by_date"],
+                sector_map=context["sector_map"],
+                session_metadata_by_symbol=context["session_metadata_by_symbol"],
+                macro_series_history=context["macro_series_history"],
+                spec=spec,
+                start_date=subwindow_start,
+                end_date=subwindow_end,
+                metadata=metadata,
+            )
+            feature_build_ms += int((time.perf_counter() - feature_started) * 1000)
+            query_rows = list(payload["query_rows"])
+            replay_rows = list(payload["replay_rows"])
+            total_query_rows_local += len(query_rows)
+            total_replay_rows_local += len(replay_rows)
+            decision_dates.update(str(row["decision_date"]) for row in query_rows)
+            db_write_started = time.perf_counter()
+            with local_session_factory() as session:
+                if query_rows:
+                    session.execute(
+                        text(
+                            """
+                            INSERT INTO bt_result.calibration_query_feature_row(
+                                bundle_run_id, decision_date, symbol, execution_date, t1_open,
+                                regime_code, sector_code, feature_anchor_ts_utc, macro_asof_ts_utc,
+                                raw_features_json, transformed_features_json, embedding_json, query_meta_json
+                            )
+                            VALUES (
+                                :bundle_run_id, CAST(:decision_date AS date), :symbol, CAST(:execution_date AS date), :t1_open,
+                                :regime_code, :sector_code, CAST(:feature_anchor_ts_utc AS timestamptz), CAST(:macro_asof_ts_utc AS timestamptz),
+                                :raw_features_json, :transformed_features_json, :embedding_json, :query_meta_json
+                            )
+                            """
+                        ),
+                        [{"bundle_run_id": bundle_run_id, **row} for row in query_rows],
+                    )
+                if replay_rows:
+                    session.execute(
+                        text(
+                            """
+                            INSERT INTO bt_result.calibration_replay_bar(
+                                bundle_run_id, decision_date, symbol, side, bar_n, session_date, open, high, low, close
+                            )
+                            VALUES (
+                                :bundle_run_id, CAST(:decision_date AS date), :symbol, :side, :bar_n, CAST(:session_date AS date), :open, :high, :low, :close
+                            )
+                            ON CONFLICT (bundle_run_id, decision_date, symbol, side, bar_n) DO UPDATE
+                                SET session_date = EXCLUDED.session_date,
+                                    open = EXCLUDED.open,
+                                    high = EXCLUDED.high,
+                                    low = EXCLUDED.low,
+                                    close = EXCLUDED.close
+                            """
+                        ),
+                        [{"bundle_run_id": bundle_run_id, **row} for row in replay_rows],
+                    )
+                db_write_ms += int((time.perf_counter() - db_write_started) * 1000)
+                sql, params = _query_chunk_rows(
+                    bundle_run_id=bundle_run_id,
+                    chunk_id=local_chunk_id,
+                    status="running",
+                    window_start=window_start,
+                    window_end=window_end,
+                    symbols=local_symbols,
+                    elapsed_ms=int((time.perf_counter() - chunk_started) * 1000),
+                    load_ms=load_ms,
+                    feature_build_ms=feature_build_ms,
+                    db_write_ms=db_write_ms,
+                    decision_date_count=len(decision_dates),
+                    query_row_count=total_query_rows_local,
+                    replay_bar_count=total_replay_rows_local,
+                    last_error=None,
+                )
+                session.execute(text(sql), params)
+                session.commit()
+            touch_bundle_run(
+                session_factory=local_session_factory,
+                bundle_run_id=bundle_run_id,
+                current_step="build-query-feature-cache",
+                pid=os.getpid(),
+                status="running",
+                last_error="",
+            )
+            _write_progress(
+                status="running",
+                current_chunk_id=local_chunk_id,
+                current_symbols=local_symbols,
+                current_window_start=subwindow_start,
+                current_window_end=subwindow_end,
+            )
+        with local_session_factory() as session:
+            sql, params = _query_chunk_rows(
+                bundle_run_id=bundle_run_id,
+                chunk_id=local_chunk_id,
+                status="ok",
+                window_start=window_start,
+                window_end=window_end,
+                symbols=local_symbols,
+                finished=True,
+                elapsed_ms=int((time.perf_counter() - chunk_started) * 1000),
+                load_ms=load_ms,
+                feature_build_ms=feature_build_ms,
+                db_write_ms=db_write_ms,
+                decision_date_count=len(decision_dates),
+                query_row_count=total_query_rows_local,
+                replay_bar_count=total_replay_rows_local,
+                last_error=None,
+            )
+            session.execute(text(sql), params)
+            session.commit()
+        return {
+            "status": "ok",
+            "chunk_id": local_chunk_id,
+            "window_start": window_start,
+            "window_end": window_end,
+            "symbols": local_symbols,
+            "decision_date_count": len(decision_dates),
+            "query_row_count": total_query_rows_local,
+            "replay_bar_count": total_replay_rows_local,
+            "load_ms": load_ms,
+            "feature_build_ms": feature_build_ms,
+            "db_write_ms": db_write_ms,
+        }
+
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, int(worker_count or 4))) as executor:
+            futures = {executor.submit(_run_query_chunk, job): job for job in chunk_jobs}
+            for future in as_completed(futures):
+                job = futures[future]
+                try:
+                    chunk_result = future.result()
+                except Exception as exc:
+                    with write_session_factory() as session:
+                        sql, params = _query_chunk_rows(
+                            bundle_run_id=bundle_run_id,
+                            chunk_id=int(job["chunk_id"]),
+                            status="failed",
+                            window_start=str(job["window_start"]),
+                            window_end=str(job["window_end"]),
+                            symbols=list(job["symbols"]),
+                            finished=True,
+                            last_error=str(exc),
+                        )
+                        session.execute(text(sql), params)
+                        session.commit()
+                    touch_bundle_run(
+                        session_factory=write_session_factory,
+                        bundle_run_id=bundle_run_id,
+                        current_step="build-query-feature-cache",
+                        pid=os.getpid(),
+                        status="running",
+                        last_error=str(exc),
+                    )
+                    _write_progress(
+                        status="running",
+                        current_chunk_id=int(job["chunk_id"]),
+                        current_symbols=list(job["symbols"]),
+                        current_window_start=str(job["window_start"]),
+                        current_window_end=str(job["window_end"]),
+                        last_error=str(exc),
+                    )
+                    raise
+                total_query_rows += int(chunk_result["query_row_count"])
+                total_replay_rows += int(chunk_result["replay_bar_count"])
+                total_decision_dates.update(
+                    row["decision_date"]
+                    for row in _load_cached_query_rows(
+                        session_factory=write_session_factory,
+                        bundle_run_id=bundle_run_id,
+                        symbols=chunk_result["symbols"],
+                        start_date=chunk_result["window_start"],
+                        end_date=chunk_result["window_end"],
+                    )[0]
+                )
+                load_total_ms += int(chunk_result.get("load_ms") or 0)
+                feature_total_ms += int(chunk_result.get("feature_build_ms") or 0)
+                db_write_total_ms += int(chunk_result.get("db_write_ms") or 0)
+                touch_bundle_run(
+                    session_factory=write_session_factory,
+                    bundle_run_id=bundle_run_id,
+                    current_step="build-query-feature-cache",
+                    pid=os.getpid(),
+                    status="running",
+                    last_error="",
+                )
+                _write_progress(
+                    status="running",
+                    current_chunk_id=int(chunk_result["chunk_id"]),
+                    current_symbols=list(chunk_result["symbols"]),
+                    current_window_start=str(chunk_result["window_start"]),
+                    current_window_end=str(chunk_result["window_end"]),
+                )
+    except Exception:
+        mark_bundle_run_failed(
+            session_factory=write_session_factory,
+            bundle_run_id=bundle_run_id,
+            last_error="build-query-feature-cache failed",
+        )
+        _write_progress(status="failed", last_error="build-query-feature-cache failed")
+        raise
+
+    touch_bundle_run(
+        session_factory=write_session_factory,
+        bundle_run_id=bundle_run_id,
+        current_step="build-query-feature-cache",
+        pid=os.getpid(),
+        status="running",
+        last_error="",
+    )
+    _write_progress(status="ok")
     return {
         "status": "ok",
         "bundle_run_id": bundle_run_id,
-        "market": market,
-        "symbol_count": len(list(symbols)),
-        "decision_date_count": int(cache_rows["decision_date_count"]),
-        "query_row_count": len(query_rows),
-        "replay_bar_count": len(replay_rows),
-        "load_ms": load_ms,
-        "query_feature_ms": query_feature_ms,
+        "symbol_count": len(symbol_list),
+        "decision_date_count": len(total_decision_dates),
+        "query_row_count": total_query_rows,
+        "replay_bar_count": total_replay_rows,
+        "load_ms": load_total_ms,
+        "query_feature_ms": feature_total_ms,
+        "db_write_ms": db_write_total_ms,
+        "query_chunk_count": len(chunk_jobs),
     }
 
 
@@ -1006,6 +2482,14 @@ def materialize_train_snapshots(
     spec = _spec_or_default(research_spec)
     cadence = str(snapshot_cadence or "daily").strip().lower() or "daily"
     resolved_model_version = _resolve_model_version(cadence, model_version)
+    touch_bundle_run(
+        session_factory=write_session_factory,
+        bundle_run_id=bundle_run_id,
+        current_step="build-train-snapshots",
+        pid=os.getpid(),
+        status="running",
+        last_error="",
+    )
     decision_dates = _load_cached_decision_dates(
         session_factory=write_session_factory,
         bundle_run_id=bundle_run_id,
@@ -1019,20 +2503,32 @@ def materialize_train_snapshots(
             "run build-query-feature-cache first"
         )
     loader = LocalPostgresLoader(create_backtest_session_factory())
+    def _context_progress(phase: str, payload: Mapping[str, Any]) -> None:
+        touch_bundle_run(
+            session_factory=write_session_factory,
+            bundle_run_id=bundle_run_id,
+            current_step="build-train-snapshots",
+            pid=os.getpid(),
+            status="running",
+            last_error="",
+        )
     context = loader.load_research_context(
         start_date=start_date,
         end_date=end_date,
         symbols=symbols,
         research_spec=spec,
+        progress_callback=_context_progress,
     )
     snapshot_dates = _snapshot_dates(decision_dates, cadence)
     artifact_store = JsonResearchArtifactStore(output_dir)
     run_id = f"{bundle_key or f'bundle-{bundle_run_id}'}__snapshots"
     created = 0
     reused = 0
+    fast_path_recent_snapshots: list[dict[str, Any]] = []
     for snapshot_date in snapshot_dates:
         snapshot_id = f"{run_id}:{snapshot_date}:{spec.spec_hash()}"
         snapshot_name = f"train_snapshot_{snapshot_date.replace('-', '')}"
+        checkpoint_paths = _snapshot_checkpoint_paths(output_dir=output_dir, run_id=run_id, snapshot_date=snapshot_date)
         with write_session_factory() as session:
             existing = session.execute(
                 text(
@@ -1046,41 +2542,184 @@ def materialize_train_snapshots(
                 {"bundle_run_id": bundle_run_id, "snapshot_id": snapshot_id},
             ).mappings().first()
             if existing and str(existing.get("status") or "") == "ok" and str(existing.get("artifact_path") or "").strip():
-                if Path(str(existing["artifact_path"])).exists():
+                if _train_snapshot_artifact_is_reusable(str(existing["artifact_path"])):
                     reused += 1
+                    touch_bundle_run(
+                        session_factory=write_session_factory,
+                        bundle_run_id=bundle_run_id,
+                        current_step="build-train-snapshots",
+                        pid=os.getpid(),
+                        status="running",
+                        last_error="",
+                    )
                     continue
-            session.execute(
-                text(
-                    """
-                    INSERT INTO bt_result.calibration_snapshot_run(
-                        bundle_run_id, snapshot_id, snapshot_date, train_start, train_end, spec_hash,
-                        memory_version, model_version, snapshot_cadence, status, started_at
-                    )
-                    VALUES (
-                        :bundle_run_id, :snapshot_id, CAST(:snapshot_date AS date), CAST(:train_start AS date), CAST(:train_end AS date), :spec_hash,
-                        :memory_version, :model_version, :snapshot_cadence, 'running', NOW()
-                    )
-                    ON CONFLICT (bundle_run_id, snapshot_id) DO UPDATE
-                        SET status = 'running',
-                            started_at = NOW(),
-                            finished_at = NULL,
-                            last_error = NULL,
-                            artifact_path = NULL
-                    """
-                ),
-                {
-                    "bundle_run_id": bundle_run_id,
-                    "snapshot_id": snapshot_id,
-                    "snapshot_date": snapshot_date,
-                    "train_start": start_date,
-                    "train_end": snapshot_date,
-                    "spec_hash": spec.spec_hash(),
-                    "memory_version": spec.memory_version,
-                    "model_version": resolved_model_version,
-                    "snapshot_cadence": cadence,
-                },
+            resume_event_memory_from_checkpoint = bool(
+                Path(checkpoint_paths["event_input_path"]).exists()
             )
-            session.commit()
+            resume_prototype_from_checkpoint = bool(
+                Path(checkpoint_paths["prototype_checkpoint_path"]).exists()
+            )
+            begin_snapshot_run(
+                session_factory=write_session_factory,
+                bundle_run_id=bundle_run_id,
+                snapshot_id=snapshot_id,
+                snapshot_date=snapshot_date,
+                train_start=start_date,
+                train_end=snapshot_date,
+                spec_hash=spec.spec_hash(),
+                memory_version=spec.memory_version,
+                model_version=resolved_model_version,
+                snapshot_cadence=cadence,
+                current_phase="event_candidate_prep",
+                checkpoint_path=checkpoint_paths["prototype_checkpoint_path"],
+                event_checkpoint_path=checkpoint_paths["event_checkpoint_path"],
+            )
+        last_snapshot_phase = "event_candidate_prep"
+
+        def _snapshot_progress(payload: Mapping[str, Any]) -> None:
+            nonlocal last_snapshot_phase
+            current_phase = str(payload.get("phase") or last_snapshot_phase or "event_memory")
+            last_snapshot_phase = current_phase
+            touch_snapshot_run(
+                session_factory=write_session_factory,
+                bundle_run_id=bundle_run_id,
+                snapshot_id=snapshot_id,
+                current_phase=current_phase,
+                status="running",
+                event_record_count=(
+                    _to_int(payload.get("event_record_count"))
+                    if payload.get("event_record_count") is not None
+                    else None
+                ),
+                prototype_count=(
+                    _to_int(payload.get("prototype_count"))
+                    if payload.get("prototype_count") is not None
+                    else None
+                ),
+                event_memory_ms=(
+                    _to_int(payload.get("event_memory_ms"))
+                    if payload.get("event_memory_ms") is not None
+                    else None
+                ),
+                transform_ms=(
+                    _to_int(payload.get("transform_ms"))
+                    if payload.get("transform_ms") is not None
+                    else None
+                ),
+                prototype_ms=(
+                    _to_int(payload.get("prototype_ms"))
+                    if payload.get("prototype_ms") is not None
+                    else None
+                ),
+                artifact_write_ms=(
+                    _to_int(payload.get("artifact_write_ms"))
+                    if payload.get("artifact_write_ms") is not None
+                    else None
+                ),
+                artifact_rows_total=(
+                    _to_int(payload.get("artifact_rows_total"))
+                    if payload.get("artifact_rows_total") is not None
+                    else None
+                ),
+                artifact_rows_done=(
+                    _to_int(payload.get("artifact_rows_done"))
+                    if payload.get("artifact_rows_done") is not None
+                    else None
+                ),
+                artifact_part_count=(
+                    _to_int(payload.get("artifact_part_count"))
+                    if payload.get("artifact_part_count") is not None
+                    else None
+                ),
+                artifact_bytes_written=(
+                    _to_int(payload.get("artifact_bytes_written"))
+                    if payload.get("artifact_bytes_written") is not None
+                    else None
+                ),
+                current_symbol=(
+                    str(payload.get("current_symbol") or "")
+                    if payload.get("current_symbol") is not None
+                    else None
+                ),
+                current_event_date=(
+                    str(payload.get("current_event_date") or "")
+                    if payload.get("current_event_date") is not None
+                    else None
+                ),
+                symbols_done=(
+                    _to_int(payload.get("symbols_done"))
+                    if payload.get("symbols_done") is not None
+                    else None
+                ),
+                symbols_total=(
+                    _to_int(payload.get("symbols_total"))
+                    if payload.get("symbols_total") is not None
+                    else None
+                ),
+                raw_event_row_count=(
+                    _to_int(payload.get("raw_event_row_count"))
+                    if payload.get("raw_event_row_count") is not None
+                    else None
+                ),
+                pending_record_count=(
+                    _to_int(payload.get("pending_record_count"))
+                    if payload.get("pending_record_count") is not None
+                    else None
+                ),
+                event_candidate_total=(
+                    _to_int(payload.get("event_candidate_total"))
+                    if payload.get("event_candidate_total") is not None
+                    else None
+                ),
+                event_candidate_done=(
+                    _to_int(payload.get("event_candidate_done"))
+                    if payload.get("event_candidate_done") is not None
+                    else None
+                ),
+                last_event_checkpoint_at=(
+                    str(payload.get("last_event_checkpoint_at") or "")
+                    if payload.get("last_event_checkpoint_at") is not None and str(payload.get("last_event_checkpoint_at") or "").strip()
+                    else None
+                ),
+                event_checkpoint_path=(
+                    str(payload.get("event_checkpoint_path") or "")
+                    if payload.get("event_checkpoint_path") is not None
+                    else None
+                ),
+                prototype_rows_total=(
+                    _to_int(payload.get("prototype_rows_total"))
+                    if payload.get("prototype_rows_total") is not None
+                    else None
+                ),
+                prototype_rows_done=(
+                    _to_int(payload.get("prototype_rows_done"))
+                    if payload.get("prototype_rows_done") is not None
+                    else None
+                ),
+                cluster_count=(
+                    _to_int(payload.get("cluster_count"))
+                    if payload.get("cluster_count") is not None
+                    else None
+                ),
+                last_checkpoint_at=(
+                    str(payload.get("last_checkpoint_at") or "")
+                    if payload.get("last_checkpoint_at") is not None and str(payload.get("last_checkpoint_at") or "").strip()
+                    else None
+                ),
+                checkpoint_path=(
+                    str(payload.get("checkpoint_path") or "")
+                    if payload.get("checkpoint_path") is not None
+                    else None
+                ),
+            )
+            touch_bundle_run(
+                session_factory=write_session_factory,
+                bundle_run_id=bundle_run_id,
+                current_step="build-train-snapshots",
+                pid=os.getpid(),
+                status="running",
+                last_error="",
+            )
         try:
             train_artifact = fit_train_artifacts(
                 run_id=run_id,
@@ -1099,8 +2738,36 @@ def materialize_train_snapshots(
                 metadata=dict(metadata or {}),
                 session_metadata_by_symbol=context["session_metadata_by_symbol"],
                 macro_series_history=context["macro_series_history"],
+                progress_callback=_snapshot_progress,
+                use_proxy_aggregate_cache=True,
+                use_event_memory_fast_path=True,
+                event_input_path=checkpoint_paths["event_input_path"],
+                event_checkpoint_path=checkpoint_paths["event_checkpoint_path"],
+                resume_event_memory_from_checkpoint=resume_event_memory_from_checkpoint,
+                prototype_input_path=None,
+                prototype_checkpoint_path=checkpoint_paths["prototype_checkpoint_path"],
+                resume_prototype_from_checkpoint=resume_prototype_from_checkpoint,
+                comparison_block_size=2048,
             )
             snapshot_payload = _json_safe_snapshot_payload(train_artifact)
+            phase_timings_ms = dict(train_artifact.get("phase_timings_ms") or {})
+            _snapshot_progress(
+                {
+                    "phase": "artifact_write",
+                    "status": "running",
+                    "event_record_count": snapshot_payload.get("event_record_count"),
+                    "prototype_count": snapshot_payload.get("prototype_count"),
+                    "event_memory_ms": phase_timings_ms.get("event_memory"),
+                    "transform_ms": phase_timings_ms.get("transform"),
+                    "prototype_ms": phase_timings_ms.get("prototype"),
+                    "artifact_write_ms": phase_timings_ms.get("artifact_write"),
+                    "artifact_rows_total": snapshot_payload.get("prototype_count"),
+                    "artifact_rows_done": snapshot_payload.get("prototype_count"),
+                    "artifact_part_count": 0,
+                    "artifact_bytes_written": 0,
+                }
+            )
+            artifact_write_started = time.perf_counter()
             artifact_path = artifact_store.save_train_snapshot(
                 run_id=run_id,
                 name=snapshot_name,
@@ -1108,51 +2775,120 @@ def materialize_train_snapshots(
                 memory_version=spec.memory_version,
                 payload=snapshot_payload,
             )
-            with write_session_factory() as session:
-                session.execute(
-                    text(
-                        """
-                        UPDATE bt_result.calibration_snapshot_run
-                           SET status = 'ok',
-                               artifact_path = :artifact_path,
-                               event_record_count = :event_record_count,
-                               prototype_count = :prototype_count,
-                               finished_at = NOW()
-                         WHERE bundle_run_id = :bundle_run_id
-                           AND snapshot_id = :snapshot_id
-                        """
-                    ),
-                    {
-                        "bundle_run_id": bundle_run_id,
-                        "snapshot_id": snapshot_id,
-                        "artifact_path": artifact_path,
-                        "event_record_count": _to_int(snapshot_payload.get("event_record_count")),
-                        "prototype_count": _to_int(snapshot_payload.get("prototype_count")),
-                    },
+            train_snapshot_artifact_write_ms = int((time.perf_counter() - artifact_write_started) * 1000)
+            artifact_write_ms = int(_to_int(phase_timings_ms.get("artifact_write")) + train_snapshot_artifact_write_ms)
+            prototype_manifest_path = Path(str(train_artifact.get("prototype_snapshot_manifest_path") or ""))
+            prototype_parts_dir = prototype_manifest_path.parent / "parts" if prototype_manifest_path.exists() else None
+            artifact_part_count = len(list(prototype_parts_dir.glob("*.parquet"))) if prototype_parts_dir and prototype_parts_dir.exists() else 0
+            artifact_bytes_written = int(
+                sum(
+                    path.stat().st_size
+                    for path in [prototype_manifest_path, artifact_path and Path(artifact_path)]
+                    if path and Path(path).exists()
                 )
-                session.commit()
+                + (
+                    sum(path.stat().st_size for path in prototype_parts_dir.glob("*.parquet"))
+                    if prototype_parts_dir and prototype_parts_dir.exists()
+                    else 0
+                )
+            )
+            complete_snapshot_run(
+                session_factory=write_session_factory,
+                bundle_run_id=bundle_run_id,
+                snapshot_id=snapshot_id,
+                artifact_path=artifact_path,
+                event_record_count=_to_int(snapshot_payload.get("event_record_count")),
+                prototype_count=_to_int(snapshot_payload.get("prototype_count")),
+                event_memory_ms=_to_int(phase_timings_ms.get("event_memory")),
+                transform_ms=_to_int(phase_timings_ms.get("transform")),
+                prototype_ms=_to_int(phase_timings_ms.get("prototype")),
+                artifact_write_ms=artifact_write_ms,
+                artifact_rows_total=_to_int(snapshot_payload.get("prototype_count")),
+                artifact_rows_done=_to_int(snapshot_payload.get("prototype_count")),
+                artifact_part_count=artifact_part_count,
+                artifact_bytes_written=artifact_bytes_written,
+                event_candidate_total=_to_int(snapshot_payload.get("event_record_count")),
+                event_candidate_done=_to_int(snapshot_payload.get("event_record_count")),
+                prototype_rows_total=_to_int(snapshot_payload.get("event_record_count")),
+                prototype_rows_done=_to_int(snapshot_payload.get("event_record_count")),
+                cluster_count=_to_int(snapshot_payload.get("prototype_count")),
+                checkpoint_path="",
+                event_checkpoint_path="",
+            )
+            _clear_snapshot_checkpoint_files(checkpoint_paths=checkpoint_paths)
+            touch_bundle_run(
+                session_factory=write_session_factory,
+                bundle_run_id=bundle_run_id,
+                current_step="build-train-snapshots",
+                pid=os.getpid(),
+                status="running",
+                last_error="",
+            )
             created += 1
-        except Exception as exc:
-            with write_session_factory() as session:
-                session.execute(
-                    text(
-                        """
-                        UPDATE bt_result.calibration_snapshot_run
-                           SET status = 'failed',
-                               finished_at = NOW(),
-                               last_error = :last_error
-                         WHERE bundle_run_id = :bundle_run_id
-                           AND snapshot_id = :snapshot_id
-                        """
-                    ),
-                    {
-                        "bundle_run_id": bundle_run_id,
-                        "snapshot_id": snapshot_id,
-                        "last_error": str(exc),
-                    },
+            snapshot_elapsed_seconds = max(
+                1.0,
+                (
+                    _to_float(phase_timings_ms.get("event_memory"))
+                    + _to_float(phase_timings_ms.get("transform"))
+                    + _to_float(phase_timings_ms.get("prototype"))
+                    + float(artifact_write_ms)
                 )
-                session.commit()
+                / 1000.0,
+            )
+            fast_path_recent_snapshots.append(
+                {
+                    "event_memory_ms": _to_int(phase_timings_ms.get("event_memory")),
+                    "transform_ms": _to_int(phase_timings_ms.get("transform")),
+                    "prototype_ms": _to_int(phase_timings_ms.get("prototype")),
+                    "artifact_write_ms": int(artifact_write_ms),
+                    "event_candidate_total": _to_int(snapshot_payload.get("event_record_count")),
+                }
+            )
+            if created == 1:
+                remaining_snapshot_count = max(0, len(snapshot_dates) - reused - created)
+                remaining_eta_seconds = _estimate_remaining_snapshot_eta_seconds(
+                    remaining_snapshot_count=remaining_snapshot_count,
+                    created_snapshot_seconds=snapshot_elapsed_seconds,
+                    created_event_candidate_rows=_to_int(snapshot_payload.get("event_record_count")),
+                    recent_snapshot_rows=fast_path_recent_snapshots[-2:],
+                )
+                if remaining_eta_seconds > 8 * 60 * 60:
+                    last_error = "eta_gate_exceeded_after_event_memory_fast_path"
+                    mark_bundle_run_failed(
+                        session_factory=write_session_factory,
+                        bundle_run_id=bundle_run_id,
+                        last_error=last_error,
+                    )
+                    raise RuntimeError(last_error)
+        except Exception as exc:
+            if str(exc) == "eta_gate_exceeded_after_event_memory_fast_path":
+                raise
+            fail_snapshot_run(
+                session_factory=write_session_factory,
+                bundle_run_id=bundle_run_id,
+                snapshot_id=snapshot_id,
+                last_error=str(exc),
+                current_phase=last_snapshot_phase,
+                checkpoint_path=checkpoint_paths["prototype_checkpoint_path"],
+                event_checkpoint_path=checkpoint_paths["event_checkpoint_path"],
+            )
+            touch_bundle_run(
+                session_factory=write_session_factory,
+                bundle_run_id=bundle_run_id,
+                current_step="build-train-snapshots",
+                pid=os.getpid(),
+                status="running",
+                last_error=str(exc),
+            )
             raise
+    touch_bundle_run(
+        session_factory=write_session_factory,
+        bundle_run_id=bundle_run_id,
+        current_step="build-train-snapshots",
+        pid=os.getpid(),
+        status="running",
+        last_error="",
+    )
     return {
         "status": "ok",
         "bundle_run_id": bundle_run_id,
@@ -1391,9 +3127,6 @@ def materialize_calibration_chunk(
         }
     try:
         with _forbidden_bundle_calls_guard():
-            snapshot_load_started = time.perf_counter()
-            _load_snapshot_cache(snapshot_rows)
-            snapshot_load_ms = int((time.perf_counter() - snapshot_load_started) * 1000)
             query_feature_started = time.perf_counter()
             _query_feature_rows_by_key(query_rows)
             query_feature_ms = int((time.perf_counter() - query_feature_started) * 1000)
@@ -1405,6 +3138,7 @@ def materialize_calibration_chunk(
                 scenario_id=scenario_id,
                 policy_scope=policy_scope,
             )
+            snapshot_load_ms = _to_int((seed_payloads_result.get("telemetry") or {}).get("snapshot_load_ms"))
             score_ms = int((time.perf_counter() - score_started) * 1000)
             seed_payloads = list(seed_payloads_result["seed_payloads"])
             db_write_started = time.perf_counter()
