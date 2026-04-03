@@ -181,7 +181,7 @@ def test_train_snapshot_payload_roundtrip_is_lossless(tmp_path):
         "as_of_date": "2026-01-10",
         "memory_version": "v1",
         "prototype_snapshot_name": "prototype_snapshot",
-        "prototype_snapshot_format": "prototype_snapshot_v3",
+        "prototype_snapshot_format": "prototype_snapshot_v4",
         "prototype_snapshot_manifest_path": "",
         "event_record_count": 11,
         "prototype_count": 3,
@@ -197,7 +197,7 @@ def test_train_snapshot_payload_roundtrip_is_lossless(tmp_path):
         "session_metadata_by_symbol": {},
         "macro_series_history": [],
         "snapshot_ids": {},
-        "artifact_kind": "train_snapshot_v3",
+        "artifact_kind": "train_snapshot_v4",
     }
     path = store.save_train_snapshot(
         run_id="bundle_snapshots",
@@ -259,7 +259,7 @@ def test_train_snapshot_loader_hydrates_prototypes_from_snapshot_manifest(tmp_pa
         "as_of_date": "2026-01-10",
         "memory_version": "v1",
         "prototype_snapshot_name": "prototype_snapshot",
-        "prototype_snapshot_format": "prototype_snapshot_v3",
+        "prototype_snapshot_format": "prototype_snapshot_v4",
         "prototype_snapshot_manifest_path": manifest_path,
         "event_record_count": 11,
         "prototype_count": 1,
@@ -275,7 +275,7 @@ def test_train_snapshot_loader_hydrates_prototypes_from_snapshot_manifest(tmp_pa
         "session_metadata_by_symbol": {},
         "macro_series_history": [],
         "snapshot_ids": {},
-        "artifact_kind": "train_snapshot_v3",
+        "artifact_kind": "train_snapshot_v4",
     }
     path = store.save_train_snapshot(
         run_id="bundle_snapshots",
@@ -308,7 +308,7 @@ def test_train_snapshot_artifact_reuse_rejects_legacy_shared_prototype_name(tmp_
     valid_path.write_text(
         json.dumps(
             {
-                "artifact_kind": "train_snapshot_v3",
+                "artifact_kind": "train_snapshot_v4",
                 "prototype_snapshot_name": "prototype_snapshot_20260110",
                 "prototype_snapshot_manifest_path": str(valid_manifest),
             }
@@ -429,7 +429,7 @@ def test_signal_panel_rows_from_cache_loads_snapshot_payloads_lazily_per_snapsho
             for _ in range(len(kwargs["query_embeddings"]))
         ],
     )
-    monkeypatch.setattr(calibration_cache, "build_decision_surface", lambda **kwargs: surface)
+    monkeypatch.setattr(calibration_cache, "build_decision_surface_from_ranked_candidates", lambda **kwargs: surface)
     monkeypatch.setattr(calibration_cache, "_side_diag", lambda *args, **kwargs: {"regime_alignment": 1.0, "abstain_reasons": []})
     monkeypatch.setattr(calibration_cache, "_chosen_side_payload", lambda **kwargs: {"side": "BUY"})
 
@@ -1981,7 +1981,7 @@ def test_materialize_train_snapshots_records_phase_heartbeat_updates(tmp_path, m
             "embargo": 0,
             "memory_version": "v1",
             "prototype_snapshot_name": "prototype_snapshot",
-            "prototype_snapshot_format": "prototype_snapshot_v3",
+            "prototype_snapshot_format": "prototype_snapshot_v4",
             "prototype_snapshot_manifest_path": "",
             "max_train_date": "2026-01-04",
             "max_outcome_end_date": "2026-01-04",
@@ -2113,7 +2113,7 @@ def test_materialize_train_snapshots_stops_when_eta_gate_exceeded(tmp_path, monk
             "embargo": 0,
             "memory_version": "v1",
             "prototype_snapshot_name": "prototype_snapshot",
-            "prototype_snapshot_format": "prototype_snapshot_v3",
+            "prototype_snapshot_format": "prototype_snapshot_v4",
             "prototype_snapshot_manifest_path": "",
             "max_train_date": "2026-01-04",
             "max_outcome_end_date": "2026-01-04",

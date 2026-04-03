@@ -1540,7 +1540,7 @@ def _finalize_numpy_memmap_atomic(memmap: np.memmap | None, tmp_path: Path, reso
 
 
 def _event_raw_cache_dir(*, output_dir: str, run_id: str) -> Path:
-    return Path(output_dir) / run_id / "event_raw_cache_v1"
+    return Path(output_dir) / run_id / "event_raw_cache_v2"
 
 
 def _event_raw_cache_manifest_path(*, output_dir: str, run_id: str) -> Path:
@@ -1559,7 +1559,7 @@ def _event_cache_storage_row(
     regime_inputs_summary: Mapping[str, Any],
     macro_history_length: int,
     macro_series_present_count: int,
-    raw_features: Mapping[str, float],
+    present_feature_keys: Sequence[str],
     shape_keys: Sequence[str],
     ctx_keys: Sequence[str],
     raw_regime_context_features: Mapping[str, float],
@@ -1590,7 +1590,7 @@ def _event_cache_storage_row(
         "regime_inputs_summary_json": _json_dumps(dict(regime_inputs_summary or {})),
         "macro_history_length": int(macro_history_length or 0),
         "macro_series_present_count": int(macro_series_present_count or 0),
-        "raw_features_json": _json_dumps(dict(raw_features or {})),
+        "present_feature_keys_json": _json_dumps(list(present_feature_keys or [])),
         "shape_keys_json": _json_dumps(list(shape_keys or [])),
         "ctx_keys_json": _json_dumps(list(ctx_keys or [])),
         "raw_regime_context_features_json": _json_dumps(dict(raw_regime_context_features or {})),
@@ -1612,6 +1612,19 @@ def _event_cache_storage_row(
     }
 
 
+def _event_cache_stage_row(
+    *,
+    raw_features: Mapping[str, float],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    payload = _event_cache_storage_row(
+        present_feature_keys=sorted(str(key) for key in dict(raw_features or {}).keys()),
+        **kwargs,
+    )
+    payload["raw_features_json"] = _json_dumps(dict(raw_features or {}))
+    return payload
+
+
 def _event_cache_row_from_storage(raw: Mapping[str, Any]) -> dict[str, Any]:
     payload = dict(raw)
     payload["event_ordinal"] = int(payload.get("event_ordinal") or 0)
@@ -1620,7 +1633,7 @@ def _event_cache_row_from_storage(raw: Mapping[str, Any]) -> dict[str, Any]:
     payload["liquidity_score"] = float(payload.get("liquidity_score") or 0.0)
     payload["event_quality_score"] = float(payload.get("event_quality_score") or 0.0)
     payload["regime_inputs_summary"] = _json_loads(payload.get("regime_inputs_summary_json"), {})
-    payload["raw_features"] = _json_loads(payload.get("raw_features_json"), {})
+    payload["present_feature_keys"] = _json_loads(payload.get("present_feature_keys_json"), [])
     payload["shape_keys"] = _json_loads(payload.get("shape_keys_json"), [])
     payload["ctx_keys"] = _json_loads(payload.get("ctx_keys_json"), [])
     payload["raw_regime_context_features"] = _json_loads(payload.get("raw_regime_context_features_json"), {})
@@ -1831,7 +1844,7 @@ def build_event_raw_cache(
                     status="running",
                 )
                 last_progress_at = now
-            yield _event_cache_storage_row(
+            yield _event_cache_stage_row(
                 event_ordinal=event_ordinal,
                 symbol=symbol,
                 feature_end_date=feature_end_date,
@@ -1866,8 +1879,8 @@ def build_event_raw_cache(
                 event_quality_score=float(candidate["event"].quality_score),
             )
 
-    events_path = cache_dir / "events.parquet"
-    event_rows_written, _ = _append_parquet_batches(events_path, _iter_event_rows(), batch_size=500)
+    stage_events_path = cache_dir / "events_stage.parquet"
+    event_rows_written, _ = _append_parquet_batches(stage_events_path, _iter_event_rows(), batch_size=500)
     feature_keys = tuple(sorted(feature_key_set))
     feature_index = {key: idx for idx, key in enumerate(feature_keys)}
     raw_features_path = cache_dir / "raw_features.f64.npy"
@@ -1882,10 +1895,10 @@ def build_event_raw_cache(
         dtype=np.int8,
         shape=(row_count, len(feature_keys)),
     )
-    event_file = pq.ParquetFile(events_path)
+    stage_event_file = pq.ParquetFile(stage_events_path)
     rows_filled = 0
     last_matrix_progress_at = perf_counter()
-    for batch in event_file.iter_batches(columns=["event_ordinal", "raw_features_json"], batch_size=1000):
+    for batch in stage_event_file.iter_batches(columns=["event_ordinal", "raw_features_json"], batch_size=1000):
         batch_payload = batch.to_pydict()
         ordinals = list(batch_payload.get("event_ordinal") or [])
         raw_json_rows = list(batch_payload.get("raw_features_json") or [])
@@ -1901,6 +1914,26 @@ def build_event_raw_cache(
         if rows_filled == row_count or rows_filled % 5000 == 0 or (now - last_matrix_progress_at) >= 10.0:
             _emit_cache_progress(done=rows_filled, status="running")
             last_matrix_progress_at = now
+    del stage_event_file
+    events_path = cache_dir / "events.parquet"
+
+    def _iter_final_event_rows() -> Iterable[dict[str, Any]]:
+        final_file = pq.ParquetFile(stage_events_path)
+        try:
+            for batch in final_file.iter_batches(batch_size=1000):
+                batch_payload = batch.to_pydict()
+                row_count_in_batch = len(list(batch_payload.get("event_ordinal") or []))
+                for row_index in range(row_count_in_batch):
+                    row_payload = {
+                        key: values[row_index]
+                        for key, values in batch_payload.items()
+                        if key != "raw_features_json"
+                    }
+                    yield row_payload
+        finally:
+            del final_file
+
+    _, _ = _append_parquet_batches(events_path, _iter_final_event_rows(), batch_size=1000)
     raw_matrix_path_str = _finalize_numpy_memmap_atomic(raw_matrix, raw_tmp_path, raw_final_path)
     present_matrix_path_str = _finalize_numpy_memmap_atomic(present_matrix, present_tmp_path, present_final_path)
     raw_matrix = np.load(raw_matrix_path_str, mmap_mode="r")
@@ -1953,9 +1986,10 @@ def build_event_raw_cache(
     del raw_matrix
     del present_matrix
     Path(present_matrix_path_str).unlink(missing_ok=True)
+    stage_events_path.unlink(missing_ok=True)
     manifest = {
-        "format_version": "event_raw_cache_v1",
-        "schema_version": "event_raw_cache_row_v1",
+        "format_version": "event_raw_cache_v2",
+        "schema_version": "event_raw_cache_row_v2",
         "spec_hash": spec.spec_hash(),
         "memory_version": str(spec.memory_version),
         "max_decision_date": str(decision_date),
@@ -1972,7 +2006,7 @@ def build_event_raw_cache(
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     _emit_cache_progress(done=int(event_rows_written), status="ok")
     return EventRawCacheHandle(
-        format_version="event_raw_cache_v1",
+        format_version="event_raw_cache_v2",
         manifest_path=str(manifest_path),
         events_path=str(events_path),
         raw_features_path=str(raw_matrix_path_str),
@@ -1999,7 +2033,7 @@ def load_event_raw_cache(
     if not resolved.exists():
         return None
     payload = json.loads(resolved.read_text(encoding="utf-8"))
-    if str(payload.get("format_version") or "") != "event_raw_cache_v1":
+    if str(payload.get("format_version") or "") != "event_raw_cache_v2":
         return None
     if str(payload.get("spec_hash") or "") != spec.spec_hash():
         return None
@@ -2009,7 +2043,7 @@ def load_event_raw_cache(
         return None
     cache_dir = resolved.parent
     return EventRawCacheHandle(
-        format_version="event_raw_cache_v1",
+        format_version="event_raw_cache_v2",
         manifest_path=str(resolved),
         events_path=str(cache_dir / str(payload.get("events_file") or "events.parquet")),
         raw_features_path=str(cache_dir / str(payload.get("raw_features_file") or "raw_features.f64.npy")),
@@ -2038,11 +2072,9 @@ def _feature_transform_from_prefix_stats(
             feature_keys=[],
             version=FEATURE_TRANSFORM_VERSION,
         )
-    prefix_sum = event_cache_handle.load_prefix_sum(mmap_mode="r")
     prefix_present_count = event_cache_handle.load_prefix_present_count(mmap_mode="r")
     prefix_event_ids = event_cache_handle.load_prefix_event_ids(mmap_mode="r")
     raw_features = event_cache_handle.load_raw_features(mmap_mode="r")
-    sums = np.asarray(prefix_sum[count - 1], dtype=np.float64)
     present = np.asarray(prefix_present_count[count - 1], dtype=np.int64)
     eligible_row_ids = np.asarray(prefix_event_ids[:count], dtype=np.int64)
     resolved_feature_keys = [
@@ -3251,6 +3283,9 @@ def _event_memory_from_raw_cache(
         con.close()
     eligible_event_rows = [_event_cache_row_from_storage(row) for row in event_frame.to_dict(orient="records")]
     eligible_event_count = len(eligible_event_rows)
+    raw_feature_matrix = event_cache_handle.load_raw_features(mmap_mode="r")
+    feature_keys = list(event_cache_handle.feature_keys)
+    feature_index = event_cache_handle.feature_index
     scaler_started = perf_counter()
     transform = _feature_transform_from_prefix_stats(
         event_cache_handle=event_cache_handle,
@@ -3288,7 +3323,14 @@ def _event_memory_from_raw_cache(
     progress_every = max(1, min(250, eligible_event_count or 1))
     last_progress_at = perf_counter()
     for row_index, cached_row in enumerate(eligible_event_rows, start=1):
-        raw_features = dict(cached_row.get("raw_features") or {})
+        event_ordinal = int(cached_row.get("event_ordinal") or 0)
+        present_feature_keys = [str(item) for item in list(cached_row.get("present_feature_keys") or [])]
+        raw_row = np.asarray(raw_feature_matrix[event_ordinal], dtype=np.float64) if feature_keys else np.zeros((0,), dtype=np.float64)
+        raw_features = {
+            key: float(raw_row[feature_index[key]])
+            for key in present_feature_keys
+            if key in feature_index
+        }
         transformed_features, embedding = transform.apply(raw_features)
         transform_missing_keys_filled_zero = sorted(key for key in transform.feature_keys if key not in raw_features)
         transformed_zero_feature_keys = sorted(
@@ -3750,7 +3792,7 @@ def fit_train_artifacts(*, run_id: str, artifact_store: JsonResearchArtifactStor
         "embargo": embargo,
         "memory_version": spec.memory_version,
         "prototype_snapshot_name": prototype_snapshot_name,
-        "prototype_snapshot_format": "prototype_snapshot_v3",
+        "prototype_snapshot_format": "prototype_snapshot_v4",
         "prototype_snapshot_manifest_path": prototype_manifest_path,
         "max_train_date": max_train_date,
         "max_outcome_end_date": max_outcome_end,

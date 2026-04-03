@@ -27,6 +27,7 @@ from backtest_app.historical_data.features import FeatureScaler, FeatureTransfor
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
 from backtest_app.historical_data.models import HistoricalBar
 from backtest_app.research.artifacts import (
+    PROTOTYPE_CORE_RETRIEVAL_COLUMNS,
     JsonResearchArtifactStore,
     PrototypeSnapshotHandle,
     load_prototype_subset,
@@ -39,13 +40,16 @@ from backtest_app.research.pipeline import (
     _side_diag,
     build_event_raw_cache,
     build_query_feature_payload_asof,
-    build_decision_surface,
     build_event_memory_asof,
     fit_train_artifacts,
     generate_similarity_candidates_rolling,
 )
 from backtest_app.research.pre_optuna import build_pre_optuna_evidence
-from backtest_app.research.scoring import CalibrationModel, exact_block_prototype_topk
+from backtest_app.research.scoring import (
+    CalibrationModel,
+    build_decision_surface_from_ranked_candidates,
+    exact_block_prototype_topk,
+)
 from backtest_app.research_runtime import engine as research_engine
 from backtest_app.research_runtime.frozen_seed import (
     CALIBRATION_UNIVERSE_SEED_PROFILE,
@@ -60,9 +64,9 @@ SNAPSHOT_STATUSES = {"pending", "running", "ok", "failed"}
 QUERY_CHUNK_STATUSES = {"pending", "running", "reused", "ok", "failed"}
 DAILY_REUSE_MODEL_VERSION = "daily_reuse_v1"
 MONTHLY_SNAPSHOT_MODEL_VERSION = "monthly_snapshot_v1"
-TRAIN_SNAPSHOT_ARTIFACT_KIND = "train_snapshot_v3"
-STALE_SNAPSHOT_CONTRACT_ERROR = "stale_artifact_contract_v3"
-STALE_BUNDLE_CONTRACT_ERROR = "stale_bundle_contract_v2"
+TRAIN_SNAPSHOT_ARTIFACT_KIND = "train_snapshot_v4"
+STALE_SNAPSHOT_CONTRACT_ERROR = "stale_artifact_contract_v4"
+STALE_BUNDLE_CONTRACT_ERROR = "stale_bundle_contract_v3"
 DEFAULT_MODEL_VERSION_BY_CADENCE = {
     "daily": DAILY_REUSE_MODEL_VERSION,
     "monthly": MONTHLY_SNAPSHOT_MODEL_VERSION,
@@ -480,7 +484,7 @@ def _json_safe_snapshot_payload(train_artifact: Mapping[str, Any]) -> dict[str, 
         "embargo": _to_int(train_artifact.get("embargo")),
         "memory_version": str(train_artifact.get("memory_version") or ""),
         "prototype_snapshot_name": str(train_artifact.get("prototype_snapshot_name") or "prototype_snapshot"),
-        "prototype_snapshot_format": str(train_artifact.get("prototype_snapshot_format") or "prototype_snapshot_v2"),
+        "prototype_snapshot_format": str(train_artifact.get("prototype_snapshot_format") or "prototype_snapshot_v4"),
         "prototype_snapshot_manifest_path": str(train_artifact.get("prototype_snapshot_manifest_path") or ""),
         "max_train_date": train_artifact.get("max_train_date"),
         "max_outcome_end_date": train_artifact.get("max_outcome_end_date"),
@@ -532,7 +536,7 @@ def _snapshot_artifact_store(path: str) -> tuple[JsonResearchArtifactStore, str]
 
 
 def _snapshot_core_rows_from_handle(handle: PrototypeSnapshotHandle) -> list[dict[str, Any]]:
-    frame = handle.load_core_frame()
+    frame = handle.load_core_frame(columns=PROTOTYPE_CORE_RETRIEVAL_COLUMNS)
     if frame.empty:
         return []
     rows: list[dict[str, Any]] = []
@@ -583,7 +587,7 @@ def _snapshot_runtime_state(row: Mapping[str, Any]) -> dict[str, Any]:
         name=prototype_name,
         manifest_path=prototype_manifest_path,
     )
-    if handle is None or handle.format_version != "prototype_snapshot_v3":
+    if handle is None or handle.format_version not in {"prototype_snapshot_v3", "prototype_snapshot_v4"}:
         legacy_payload = _load_train_snapshot_payload(artifact_path, hydrate_prototypes=True)
         prototypes = list(legacy_payload.get("prototypes") or [])
         core_rows = [
@@ -1361,21 +1365,42 @@ def _signal_panel_rows_from_cache(
                     )
                     member_lazy_load_ms += int((time.perf_counter() - member_load_started) * 1000)
                     subset_cache[subset_key] = prototype_pool
-                surface = build_decision_surface(
+                prototype_by_id = {
+                    str(prototype.prototype_id): prototype
+                    for prototype in prototype_pool
+                }
+                buy_candidates = [
+                    prototype_by_id[prototype_id]
+                    for prototype_id in (
+                        str(core_rows[idx].get("prototype_id") or "")
+                        for idx in list((topk.get("BUY") or {}).get("top_indices") or [])
+                        if 0 <= int(idx) < len(core_rows)
+                    )
+                    if prototype_id in prototype_by_id
+                ]
+                sell_candidates = [
+                    prototype_by_id[prototype_id]
+                    for prototype_id in (
+                        str(core_rows[idx].get("prototype_id") or "")
+                        for idx in list((topk.get("SELL") or {}).get("top_indices") or [])
+                        if 0 <= int(idx) < len(core_rows)
+                    )
+                    if prototype_id in prototype_by_id
+                ]
+                surface = build_decision_surface_from_ranked_candidates(
                     query_embedding=embedding,
-                    prototype_pool=prototype_pool,
+                    buy_candidates=buy_candidates,
+                    sell_candidates=sell_candidates,
                     regime_code=regime_code,
                     sector_code=sector_code,
                     ev_config=ev_cfg,
-                    candidate_index=None,
                     calibration=calibration,
                     query_date=decision_date,
-                )
-                surface = _patched_surface(
-                    surface,
-                    buy_result=dict(topk.get("BUY") or {}),
-                    sell_result=dict(topk.get("SELL") or {}),
                     prototype_pool_size=len(core_rows),
+                    buy_pre_truncation_candidate_count=_to_int((topk.get("BUY") or {}).get("pre_truncation_candidate_count")),
+                    sell_pre_truncation_candidate_count=_to_int((topk.get("SELL") or {}).get("pre_truncation_candidate_count")),
+                    buy_positive_weight_candidate_count=_to_int((topk.get("BUY") or {}).get("positive_weight_candidate_count")),
+                    sell_positive_weight_candidate_count=_to_int((topk.get("SELL") or {}).get("positive_weight_candidate_count")),
                 )
                 buy_side_diag = _side_diag(surface.buy, surface, "BUY")
                 sell_side_diag = _side_diag(surface.sell, surface, "SELL")

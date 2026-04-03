@@ -5,6 +5,8 @@ from math import log10, sqrt
 from statistics import mean, pstdev
 from typing import Dict, Iterable, List, Mapping, Sequence
 
+import numpy as np
+
 from .models import HistoricalBar
 
 FEATURE_VERSION = "multiscale_manual_v2"
@@ -64,6 +66,52 @@ class FeatureTransform:
             scaler=FeatureScaler.from_payload(body.get("scaler") if isinstance(body.get("scaler"), Mapping) else {}),
             feature_keys=[str(key) for key in list(body.get("feature_keys") or [])],
             version=str(body.get("version") or FEATURE_TRANSFORM_VERSION),
+        )
+
+    @classmethod
+    def from_prefix_stats(
+        cls,
+        *,
+        feature_keys: Sequence[str],
+        row_count: int,
+        prefix_sum: Sequence[float],
+        prefix_sumsq: Sequence[float],
+        prefix_present_count: Sequence[int] | None = None,
+        version: str = FEATURE_TRANSFORM_VERSION,
+    ) -> "FeatureTransform":
+        count = int(row_count or 0)
+        if count <= 0:
+            return cls(
+                scaler=FeatureScaler(means={}, stds={}),
+                feature_keys=[],
+                version=version,
+            )
+        sums = np.asarray(prefix_sum, dtype=np.float64)
+        sumsq = np.asarray(prefix_sumsq, dtype=np.float64)
+        present = (
+            np.asarray(prefix_present_count, dtype=np.int64)
+            if prefix_present_count is not None
+            else np.ones((len(feature_keys),), dtype=np.int64)
+        )
+        means: Dict[str, float] = {}
+        stds: Dict[str, float] = {}
+        resolved_feature_keys: List[str] = []
+        denominator = float(count)
+        for idx, key in enumerate(feature_keys):
+            if idx >= len(sums) or idx >= len(sumsq) or idx >= len(present):
+                continue
+            if int(present[idx]) <= 0:
+                continue
+            resolved_feature_keys.append(str(key))
+            mu = float(sums[idx] / denominator)
+            variance = float((sumsq[idx] / denominator) - (mu * mu))
+            sigma = 1.0 if count <= 1 else max(1e-8, float(np.sqrt(max(variance, 0.0))))
+            means[str(key)] = mu
+            stds[str(key)] = sigma
+        return cls(
+            scaler=FeatureScaler(means=means, stds=stds),
+            feature_keys=resolved_feature_keys,
+            version=version,
         )
 
     def transform_raw_features(self, raw_features: Mapping[str, float]) -> Dict[str, float]:

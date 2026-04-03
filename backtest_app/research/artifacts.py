@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 
 PROTOTYPE_SNAPSHOT_FORMAT_V2 = "prototype_snapshot_v2"
 PROTOTYPE_SNAPSHOT_FORMAT_V3 = "prototype_snapshot_v3"
+PROTOTYPE_SNAPSHOT_FORMAT_V4 = "prototype_snapshot_v4"
 PROTOTYPE_JSON_TEXT_FIELDS = (
     "embedding",
     "shape_vector",
@@ -22,7 +23,6 @@ PROTOTYPE_JSON_TEXT_FIELDS = (
     "metadata",
 )
 PROTOTYPE_CORE_JSON_TEXT_FIELDS = (
-    "embedding",
     "shape_vector",
     "ctx_vector",
     "side_stats",
@@ -32,6 +32,38 @@ PROTOTYPE_MEMBER_JSON_TEXT_FIELDS = (
     "side_outcomes",
     "raw_features",
     "transformed_features",
+)
+PROTOTYPE_CORE_RETRIEVAL_COLUMNS = (
+    "prototype_row_index",
+    "prototype_id",
+    "anchor_code",
+    "member_count",
+    "representative_symbol",
+    "representative_date",
+    "representative_hash",
+    "vector_version",
+    "feature_version",
+    "embedding_model",
+    "vector_dim",
+    "anchor_quality",
+    "regime_code",
+    "sector_code",
+    "liquidity_score",
+    "support_count",
+    "decayed_support",
+    "freshness_days",
+    "exchange_code",
+    "country_code",
+    "exchange_tz",
+    "session_date_local",
+    "session_close_ts_utc",
+    "feature_anchor_ts_utc",
+    "side_stats",
+)
+PROTOTYPE_CORE_HYDRATE_COLUMNS = PROTOTYPE_CORE_RETRIEVAL_COLUMNS + (
+    "shape_vector",
+    "ctx_vector",
+    "metadata",
 )
 
 
@@ -49,10 +81,37 @@ class PrototypeSnapshotHandle:
     members_path: str
     member_embeddings_path: str
 
-    def load_core_frame(self) -> pd.DataFrame:
+    def load_core_frame(
+        self,
+        *,
+        columns: Sequence[str] | None = None,
+        prototype_ids: Sequence[str] | None = None,
+    ) -> pd.DataFrame:
         if not self.core_path or not Path(self.core_path).exists():
             return pd.DataFrame()
-        return pd.read_parquet(self.core_path)
+        parquet_columns = list(columns) if columns else None
+        if not prototype_ids:
+            return pd.read_parquet(self.core_path, columns=parquet_columns)
+        wanted = [str(item) for item in prototype_ids if item]
+        if not wanted:
+            return pd.DataFrame()
+        try:
+            import duckdb
+        except ImportError:
+            frame = pd.read_parquet(self.core_path, columns=parquet_columns)
+            return frame[frame["prototype_id"].astype(str).isin(set(wanted))].reset_index(drop=True)
+        con = duckdb.connect()
+        try:
+            placeholders = ", ".join(["?"] * len(wanted))
+            select_clause = (
+                ", ".join(str(column) for column in parquet_columns)
+                if parquet_columns
+                else "*"
+            )
+            sql = f"SELECT {select_clause} FROM read_parquet(?) WHERE prototype_id IN ({placeholders})"
+            return con.execute(sql, [self.core_path, *wanted]).fetch_df()
+        finally:
+            con.close()
 
     def load_core_embeddings(self, *, mmap_mode: str = "r") -> np.ndarray:
         if not self.core_embeddings_path or not Path(self.core_embeddings_path).exists():
@@ -149,9 +208,9 @@ def _prototype_payload_from_row(raw: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _prototype_core_row(raw: Any, row_index: int) -> dict[str, Any]:
+def _prototype_core_row(raw: Any, row_index: int, *, include_embedding_json: bool = True) -> dict[str, Any]:
     payload = dict(raw if isinstance(raw, Mapping) else getattr(raw, "__dict__", {}) or {})
-    return {
+    row = {
         "prototype_row_index": int(row_index),
         "prototype_id": str(payload.get("prototype_id") or ""),
         "anchor_code": str(payload.get("anchor_code") or ""),
@@ -176,12 +235,14 @@ def _prototype_core_row(raw: Any, row_index: int) -> dict[str, Any]:
         "session_date_local": payload.get("session_date_local"),
         "session_close_ts_utc": payload.get("session_close_ts_utc"),
         "feature_anchor_ts_utc": payload.get("feature_anchor_ts_utc"),
-        "embedding": _json_text(list(payload.get("embedding") or [])),
         "shape_vector": _json_text(list(payload.get("shape_vector") or [])),
         "ctx_vector": _json_text(list(payload.get("ctx_vector") or [])),
         "side_stats": _json_text(dict(payload.get("side_stats") or {})),
         "metadata": _json_text(dict(payload.get("metadata") or {})),
     }
+    if include_embedding_json:
+        row["embedding"] = _json_text(list(payload.get("embedding") or []))
+    return row
 
 
 def _prototype_core_payload_from_row(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -327,10 +388,10 @@ def open_prototype_snapshot_handle(
         return None
     manifest = json.loads(resolved_manifest.read_text(encoding="utf-8"))
     format_version = str(manifest.get("format_version") or "")
-    if format_version not in {PROTOTYPE_SNAPSHOT_FORMAT_V2, PROTOTYPE_SNAPSHOT_FORMAT_V3}:
+    if format_version not in {PROTOTYPE_SNAPSHOT_FORMAT_V2, PROTOTYPE_SNAPSHOT_FORMAT_V3, PROTOTYPE_SNAPSHOT_FORMAT_V4}:
         return None
     snapshot_dir = resolved_manifest.parent
-    if format_version == PROTOTYPE_SNAPSHOT_FORMAT_V3:
+    if format_version in {PROTOTYPE_SNAPSHOT_FORMAT_V3, PROTOTYPE_SNAPSHOT_FORMAT_V4}:
         return PrototypeSnapshotHandle(
             format_version=format_version,
             manifest_path=str(resolved_manifest),
@@ -375,7 +436,7 @@ def load_prototype_subset(
         name=name,
         manifest_path=manifest_path,
     )
-    if handle is None or handle.format_version != PROTOTYPE_SNAPSHOT_FORMAT_V3:
+    if handle is None or handle.format_version not in {PROTOTYPE_SNAPSHOT_FORMAT_V3, PROTOTYPE_SNAPSHOT_FORMAT_V4}:
         payload = artifact_store.load_prototype_snapshot(run_id=run_id, name=name)
         prototypes = [dict(item) for item in list((payload or {}).get("prototypes") or [])]
         order = {prototype_id: index for index, prototype_id in enumerate(wanted)}
@@ -384,9 +445,13 @@ def load_prototype_subset(
             key=lambda item: order[str(item.get("prototype_id") or "")],
         )
     order = {prototype_id: index for index, prototype_id in enumerate(wanted)}
-    core_frame = handle.load_core_frame()
+    core_frame = handle.load_core_frame(
+        columns=PROTOTYPE_CORE_HYDRATE_COLUMNS,
+        prototype_ids=wanted,
+    )
     if core_frame.empty:
         return []
+    core_embeddings = handle.load_core_embeddings(mmap_mode="r")
     core_rows = [
         _prototype_core_payload_from_row(row)
         for row in core_frame[core_frame["prototype_id"].astype(str).isin(set(wanted))].to_dict(orient="records")
@@ -430,7 +495,13 @@ def load_prototype_subset(
         payload = {
             "prototype_id": prototype_id,
             "anchor_code": str(core_row.get("anchor_code") or ""),
-            "embedding": list(core_row.get("embedding") or []),
+            "embedding": [
+                float(value)
+                for value in np.asarray(
+                    core_embeddings[int(core_row.get("prototype_row_index") or 0)],
+                    dtype=np.float64,
+                ).tolist()
+            ] if getattr(core_embeddings, "size", 0) else list(core_row.get("embedding") or []),
             "member_count": int(core_row.get("member_count") or len(grouped)),
             "representative_symbol": core_row.get("representative_symbol"),
             "representative_date": core_row.get("representative_date"),
@@ -532,7 +603,7 @@ class JsonResearchArtifactStore:
 
         def _core_rows() -> Iterable[dict[str, Any]]:
             for row_index, prototype in enumerate(prototypes):
-                yield _prototype_core_row(prototype, row_index)
+                yield _prototype_core_row(prototype, row_index, include_embedding_json=False)
 
         core_path = snapshot_dir / "core.parquet"
         core_rows_written, _ = _append_parquet_batches(core_path, _core_rows())
@@ -577,8 +648,8 @@ class JsonResearchArtifactStore:
         _write_numpy_atomic(member_embeddings_path, _normalized_matrix(member_embedding_rows))
         bytes_written += int(member_embeddings_path.stat().st_size) if member_embeddings_path.exists() else 0
         manifest = {
-            "format_version": PROTOTYPE_SNAPSHOT_FORMAT_V3,
-            "schema_version": "state_prototype_v3",
+            "format_version": PROTOTYPE_SNAPSHOT_FORMAT_V4,
+            "schema_version": "state_prototype_v4",
             "as_of_date": str(as_of_date),
             "memory_version": str(memory_version),
             "spec_hash": str(payload.get("spec_hash") or ""),
@@ -624,7 +695,7 @@ class JsonResearchArtifactStore:
     def load_prototype_snapshot(self, *, run_id: str, name: str = "prototype_snapshot") -> dict | None:
         handle = self.open_prototype_snapshot_handle(run_id=run_id, name=name)
         if handle is not None:
-            if handle.format_version == PROTOTYPE_SNAPSHOT_FORMAT_V3:
+            if handle.format_version in {PROTOTYPE_SNAPSHOT_FORMAT_V3, PROTOTYPE_SNAPSHOT_FORMAT_V4}:
                 core_frame = handle.load_core_frame()
                 prototype_ids = [str(item) for item in core_frame.get("prototype_id", pd.Series(dtype=str)).tolist()]
                 prototypes = load_prototype_subset(
@@ -640,7 +711,7 @@ class JsonResearchArtifactStore:
                     "spec_hash": handle.spec_hash,
                     "snapshot_id": handle.snapshot_id,
                     "prototype_count": handle.prototype_count,
-                    "prototype_snapshot_format": PROTOTYPE_SNAPSHOT_FORMAT_V3,
+                    "prototype_snapshot_format": handle.format_version,
                     "prototype_snapshot_manifest_path": handle.manifest_path,
                     "prototypes": prototypes,
                 }
