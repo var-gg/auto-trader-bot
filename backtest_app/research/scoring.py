@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
 
@@ -322,6 +322,42 @@ def _prototype_candidate_rows(
         )
     rows.sort(key=lambda row: row["prototype_weight"], reverse=True)
     return ranked, rows
+
+
+def _prototype_candidate_rows_from_ranked(
+    *,
+    side: str,
+    query_embedding: list[float],
+    ranked_candidates: Iterable[StatePrototype],
+    regime_code: Optional[str],
+    sector_code: Optional[str],
+    cfg: EVConfig,
+) -> list[dict]:
+    rows: list[dict] = []
+    for candidate in ranked_candidates:
+        side_stats = _side_row(candidate, side)
+        if not side_stats:
+            continue
+        similarity = max(0.0, _cos(query_embedding, candidate.embedding))
+        regime_alignment = 1.0 if regime_code and candidate.regime_code == regime_code else 0.0
+        sector_alignment = 1.0 if sector_code and candidate.sector_code == sector_code else 0.0
+        freshness_score = 1.0 / (1.0 + max(0.0, float(side_stats.get("freshness_days", candidate.freshness_days or 0.0))) / 30.0)
+        support_score = min(1.0, float(side_stats.get("decayed_support", candidate.decayed_support or 0.0)) / 5.0)
+        kernel = np.exp(cfg.kernel_temperature * (similarity - 1.0)) if cfg.use_kernel_weighting else similarity
+        weight = float(kernel * (0.45 + 0.30 * support_score + 0.25 * freshness_score) * (0.40 + 0.60 * max(regime_alignment, sector_alignment)))
+        rows.append(
+            {
+                "candidate": candidate,
+                "similarity": similarity,
+                "prototype_weight": weight,
+                "regime_alignment": regime_alignment,
+                "sector_alignment": sector_alignment,
+                "support_score": support_score,
+                "freshness_score": freshness_score,
+                "side_stats": side_stats,
+            }
+        )
+    return rows
 
 
 def exact_block_prototype_topk(
@@ -793,6 +829,166 @@ def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iter
         abstain_reasons=reasons,
         diagnostics={
             "prototype_pool_size": len(prototype_pool_rows),
+            "shared_neighbor_pool": True,
+            "buy_summary": buy.utility,
+            "sell_summary": sell.utility,
+            "gate_ablation": {
+                "diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate,
+                "diagnostic_disable_ess_gate": cfg.diagnostic_disable_ess_gate,
+                "diagnostic_lower_bound_formula": cfg.diagnostic_lower_bound_formula,
+                "diagnostic_feasible_side_chooser": cfg.diagnostic_feasible_side_chooser,
+            },
+            "side_gate_eval": {"buy_pass": buy_pass, "sell_pass": sell_pass, "buy_reasons": buy_reasons, "sell_reasons": sell_reasons},
+            "decision_rule": {
+                "winner": better,
+                "abstain_margin": cfg.abstain_margin,
+                "buy_sell_ev_gap": buy_edge,
+                "sell_buy_ev_gap": sell_edge,
+                "chosen_lower_bound": chosen.lower_bound_return if better in {"BUY", "SELL"} else None,
+                "chosen_interval_width": interval_width,
+                "chosen_effective_sample_size": chosen.effective_sample_size if better in {"BUY", "SELL"} else None,
+                "chosen_uncertainty": chosen.uncertainty if better in {"BUY", "SELL"} else None,
+                "diagnostic_disable_lower_bound_gate": cfg.diagnostic_disable_lower_bound_gate,
+                "diagnostic_disable_ess_gate": cfg.diagnostic_disable_ess_gate,
+                "diagnostic_lower_bound_formula": cfg.diagnostic_lower_bound_formula,
+                "diagnostic_feasible_side_chooser": cfg.diagnostic_feasible_side_chooser,
+                "why": why,
+                "why_summary": f"{why}: p_target={chosen.utility.get('p_target_first', 0.0):.2f}, p_stop={chosen.utility.get('p_stop_first', 0.0):.2f}, p_flat={chosen.utility.get('p_flat', 0.0):.2f}, p_ambiguous={chosen.utility.get('p_ambiguous', 0.0):.2f}, p_no_trade={chosen.utility.get('p_no_trade', 0.0):.2f}",
+            },
+        },
+    )
+
+
+def build_decision_surface_from_ranked_candidates(
+    *,
+    query_embedding: list[float],
+    buy_candidates: Sequence[StatePrototype],
+    sell_candidates: Sequence[StatePrototype],
+    regime_code: Optional[str],
+    sector_code: Optional[str],
+    ev_config: EVConfig | None = None,
+    calibration: CalibrationModel | None = None,
+    query_date: str | None = None,
+    prototype_pool_size: int,
+    buy_pre_truncation_candidate_count: int,
+    sell_pre_truncation_candidate_count: int,
+    buy_positive_weight_candidate_count: int,
+    sell_positive_weight_candidate_count: int,
+) -> DecisionSurface:
+    cfg = ev_config or EVConfig()
+    calibration = calibration or CalibrationModel(method="identity")
+    buy = estimate_distribution(
+        side="BUY",
+        query_embedding=query_embedding,
+        candidates=buy_candidates,
+        regime_code=regime_code,
+        sector_code=sector_code,
+        ev_config=cfg,
+        candidate_index=None,
+        calibration=calibration,
+        query_date=query_date,
+    )
+    sell = estimate_distribution(
+        side="SELL",
+        query_embedding=query_embedding,
+        candidates=sell_candidates,
+        regime_code=regime_code,
+        sector_code=sector_code,
+        ev_config=cfg,
+        candidate_index=None,
+        calibration=calibration,
+        query_date=query_date,
+    )
+    buy_utility = dict(buy.utility or {})
+    buy_utility.update(
+        {
+            "prototype_pool_size": int(prototype_pool_size),
+            "pre_truncation_candidate_count": int(buy_pre_truncation_candidate_count),
+            "positive_weight_candidate_count": int(buy_positive_weight_candidate_count),
+        }
+    )
+    sell_utility = dict(sell.utility or {})
+    sell_utility.update(
+        {
+            "prototype_pool_size": int(prototype_pool_size),
+            "pre_truncation_candidate_count": int(sell_pre_truncation_candidate_count),
+            "positive_weight_candidate_count": int(sell_positive_weight_candidate_count),
+        }
+    )
+    buy = replace(
+        buy,
+        prototype_pool_size=int(prototype_pool_size),
+        pre_truncation_candidate_count=int(buy_pre_truncation_candidate_count),
+        positive_weight_candidate_count=int(buy_positive_weight_candidate_count),
+        utility=buy_utility,
+    )
+    sell = replace(
+        sell,
+        prototype_pool_size=int(prototype_pool_size),
+        pre_truncation_candidate_count=int(sell_pre_truncation_candidate_count),
+        positive_weight_candidate_count=int(sell_positive_weight_candidate_count),
+        utility=sell_utility,
+    )
+
+    def _side_reasons(dist: DistributionEstimate) -> tuple[list[str], float]:
+        side_reasons = []
+        side_interval_width = dist.q90_return - dist.q10_return
+        if dist.effective_sample_size < cfg.min_effective_sample_size and not cfg.diagnostic_disable_ess_gate:
+            side_reasons.append("low_ess")
+        if dist.uncertainty > cfg.max_uncertainty:
+            side_reasons.append("high_uncertainty")
+        if side_interval_width > cfg.max_return_interval_width:
+            side_reasons.append("wide_interval")
+        if dist.regime_alignment < cfg.min_regime_alignment:
+            side_reasons.append("regime_mismatch")
+        if dist.lower_bound_return <= 0.0 and not cfg.diagnostic_disable_lower_bound_gate:
+            side_reasons.append("lower_bound_non_positive")
+        if float(dist.utility.get("fallback_raw_ev", 0.0)) < cfg.min_expected_utility:
+            side_reasons.append("low_ev")
+        if float(dist.utility.get("p_ambiguous", 0.0)) >= 0.30:
+            side_reasons.append("high_ambiguous_share")
+        if float(dist.utility.get("p_no_trade", 0.0)) >= 0.30:
+            side_reasons.append("high_no_trade_share")
+        return side_reasons, side_interval_width
+
+    buy_reasons, buy_interval_width = _side_reasons(buy)
+    sell_reasons, sell_interval_width = _side_reasons(sell)
+    buy_pass = not buy_reasons
+    sell_pass = not sell_reasons
+    buy_edge = float(buy.expected_net_return - sell.expected_net_return)
+    sell_edge = float(sell.expected_net_return - buy.expected_net_return)
+    if cfg.diagnostic_feasible_side_chooser:
+        if buy_pass and sell_pass:
+            better = "BUY" if buy.expected_net_return >= sell.expected_net_return else "SELL"
+        elif buy_pass:
+            better = "BUY"
+        elif sell_pass:
+            better = "SELL"
+        else:
+            better = "ABSTAIN"
+    else:
+        better = "BUY" if buy.expected_net_return >= sell.expected_net_return else "SELL"
+    chosen = buy if better == "BUY" else sell
+    interval_width = chosen.q90_return - chosen.q10_return if better in {"BUY", "SELL"} else max(buy_interval_width, sell_interval_width)
+    reasons = []
+    if cfg.diagnostic_feasible_side_chooser:
+        if better == "ABSTAIN":
+            reasons.append("no_feasible_side")
+            reasons.extend(sorted(set(buy_reasons + sell_reasons)))
+    else:
+        reasons.extend(buy_reasons if better == "BUY" else sell_reasons)
+        if max(buy_edge, sell_edge) < cfg.abstain_margin:
+            reasons.append("decision_margin_too_small")
+    abstain = bool(reasons)
+    why = better if not abstain else "ABSTAIN"
+    return DecisionSurface(
+        buy=buy,
+        sell=sell,
+        chosen_side="ABSTAIN" if abstain else better,
+        abstain=abstain,
+        abstain_reasons=reasons,
+        diagnostics={
+            "prototype_pool_size": int(prototype_pool_size),
             "shared_neighbor_pool": True,
             "buy_summary": buy.utility,
             "sell_summary": sell.utility,
