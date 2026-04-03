@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from dataclasses import replace
 import json
 import math
 import os
+import shutil
 import time
 import threading
 from collections import defaultdict
@@ -14,6 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from unittest.mock import patch
 
+import numpy as np
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -23,13 +26,18 @@ from backtest_app.db.local_write_session import create_backtest_write_session_fa
 from backtest_app.historical_data.features import FeatureScaler, FeatureTransform
 from backtest_app.historical_data.local_postgres_loader import LocalPostgresLoader
 from backtest_app.historical_data.models import HistoricalBar
-from backtest_app.research.artifacts import JsonResearchArtifactStore
-from backtest_app.research.models import StatePrototype
+from backtest_app.research.artifacts import (
+    JsonResearchArtifactStore,
+    PrototypeSnapshotHandle,
+    load_prototype_subset,
+)
+from backtest_app.research.models import DecisionSurface, DistributionEstimate, StatePrototype
 from backtest_app.research.pipeline import (
     ProxySeriesResult,
     _chosen_side_payload,
     _ev_config_from_metadata,
     _side_diag,
+    build_event_raw_cache,
     build_query_feature_payload_asof,
     build_decision_surface,
     build_event_memory_asof,
@@ -37,8 +45,7 @@ from backtest_app.research.pipeline import (
     generate_similarity_candidates_rolling,
 )
 from backtest_app.research.pre_optuna import build_pre_optuna_evidence
-from backtest_app.research.scoring import CalibrationModel
-from backtest_app.research.repository import ExactCosineCandidateIndex
+from backtest_app.research.scoring import CalibrationModel, exact_block_prototype_topk
 from backtest_app.research_runtime import engine as research_engine
 from backtest_app.research_runtime.frozen_seed import (
     CALIBRATION_UNIVERSE_SEED_PROFILE,
@@ -53,6 +60,9 @@ SNAPSHOT_STATUSES = {"pending", "running", "ok", "failed"}
 QUERY_CHUNK_STATUSES = {"pending", "running", "reused", "ok", "failed"}
 DAILY_REUSE_MODEL_VERSION = "daily_reuse_v1"
 MONTHLY_SNAPSHOT_MODEL_VERSION = "monthly_snapshot_v1"
+TRAIN_SNAPSHOT_ARTIFACT_KIND = "train_snapshot_v3"
+STALE_SNAPSHOT_CONTRACT_ERROR = "stale_artifact_contract_v3"
+STALE_BUNDLE_CONTRACT_ERROR = "stale_bundle_contract_v2"
 DEFAULT_MODEL_VERSION_BY_CADENCE = {
     "daily": DAILY_REUSE_MODEL_VERSION,
     "monthly": MONTHLY_SNAPSHOT_MODEL_VERSION,
@@ -482,14 +492,24 @@ def _json_safe_snapshot_payload(train_artifact: Mapping[str, Any]) -> dict[str, 
         "quote_policy_calibration": dict(train_artifact.get("quote_policy_calibration") or {}),
         "metadata": dict(train_artifact.get("metadata") or {}),
         "session_metadata_by_symbol": dict(train_artifact.get("session_metadata_by_symbol") or {}),
+        "event_cache_format": str(train_artifact.get("event_cache_format") or ""),
+        "event_cache_manifest_path": str(train_artifact.get("event_cache_manifest_path") or ""),
         "snapshot_ids": dict(train_artifact.get("snapshot_ids") or {}),
-        "artifact_kind": "train_snapshot_v1",
+        "artifact_kind": TRAIN_SNAPSHOT_ARTIFACT_KIND,
     }
 
 
-def _load_train_snapshot_payload(path: str) -> dict[str, Any]:
+def _load_train_snapshot_payload(path: str, *, hydrate_prototypes: bool = True) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
+    out = {
+        **payload,
+        "scaler": FeatureScaler.from_payload(payload.get("scaler") if isinstance(payload.get("scaler"), Mapping) else {}),
+        "transform": FeatureTransform.from_payload(payload.get("transform") if isinstance(payload.get("transform"), Mapping) else {}),
+    }
+    if not hydrate_prototypes:
+        out["prototypes"] = []
+        return out
     prototypes: list[StatePrototype] = []
     if payload.get("prototypes"):
         prototypes = [StatePrototype(**prototype) for prototype in list(payload.get("prototypes") or [])]
@@ -502,11 +522,111 @@ def _load_train_snapshot_payload(path: str) -> dict[str, Any]:
             name=str(payload.get("prototype_snapshot_name") or "prototype_snapshot"),
         ) or {}
         prototypes = [StatePrototype(**prototype) for prototype in list(prototype_snapshot.get("prototypes") or [])]
+    out["prototypes"] = prototypes
+    return out
+
+
+def _snapshot_artifact_store(path: str) -> tuple[JsonResearchArtifactStore, str]:
+    train_snapshot_path = Path(path)
+    return JsonResearchArtifactStore(str(train_snapshot_path.parent.parent)), train_snapshot_path.parent.name
+
+
+def _snapshot_core_rows_from_handle(handle: PrototypeSnapshotHandle) -> list[dict[str, Any]]:
+    frame = handle.load_core_frame()
+    if frame.empty:
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw in frame.to_dict(orient="records"):
+        rows.append(
+            {
+                "prototype_row_index": _to_int(raw.get("prototype_row_index")),
+                "prototype_id": str(raw.get("prototype_id") or ""),
+                "anchor_code": str(raw.get("anchor_code") or ""),
+                "member_count": _to_int(raw.get("member_count")),
+                "representative_symbol": raw.get("representative_symbol"),
+                "representative_date": raw.get("representative_date"),
+                "representative_hash": raw.get("representative_hash"),
+                "vector_version": raw.get("vector_version"),
+                "feature_version": raw.get("feature_version"),
+                "embedding_model": raw.get("embedding_model"),
+                "vector_dim": _to_int(raw.get("vector_dim")),
+                "anchor_quality": _to_float(raw.get("anchor_quality")),
+                "regime_code": raw.get("regime_code"),
+                "sector_code": raw.get("sector_code"),
+                "liquidity_score": _to_float(raw.get("liquidity_score")),
+                "support_count": _to_int(raw.get("support_count")),
+                "decayed_support": _to_float(raw.get("decayed_support")),
+                "freshness_days": _to_float(raw.get("freshness_days")),
+                "exchange_code": raw.get("exchange_code"),
+                "country_code": raw.get("country_code"),
+                "exchange_tz": raw.get("exchange_tz"),
+                "session_date_local": raw.get("session_date_local"),
+                "session_close_ts_utc": raw.get("session_close_ts_utc"),
+                "feature_anchor_ts_utc": raw.get("feature_anchor_ts_utc"),
+                "side_stats": dict(_json_loads(raw.get("side_stats"), {})),
+            }
+        )
+    return rows
+
+
+def _snapshot_runtime_state(row: Mapping[str, Any]) -> dict[str, Any]:
+    artifact_path = str(row.get("artifact_path") or "")
+    if not artifact_path:
+        return {}
+    started = time.perf_counter()
+    payload = _load_train_snapshot_payload(artifact_path, hydrate_prototypes=False)
+    store, run_id = _snapshot_artifact_store(artifact_path)
+    prototype_name = str(payload.get("prototype_snapshot_name") or "prototype_snapshot")
+    prototype_manifest_path = str(payload.get("prototype_snapshot_manifest_path") or "")
+    handle = store.open_prototype_snapshot_handle(
+        run_id=run_id,
+        name=prototype_name,
+        manifest_path=prototype_manifest_path,
+    )
+    if handle is None or handle.format_version != "prototype_snapshot_v3":
+        legacy_payload = _load_train_snapshot_payload(artifact_path, hydrate_prototypes=True)
+        prototypes = list(legacy_payload.get("prototypes") or [])
+        core_rows = [
+            {
+                "prototype_id": prototype.prototype_id,
+                "regime_code": prototype.regime_code,
+                "sector_code": prototype.sector_code,
+                "side_stats": dict(prototype.side_stats or {}),
+                "decayed_support": _to_float(prototype.decayed_support),
+                "freshness_days": _to_float(prototype.freshness_days),
+                "embedding": list(prototype.embedding or []),
+            }
+            for prototype in prototypes
+        ]
+        core_embeddings = np.asarray([list(prototype.embedding or []) for prototype in prototypes], dtype=np.float64)
+        if core_embeddings.size:
+            norms = np.linalg.norm(core_embeddings, axis=1, keepdims=True)
+            norms = np.where(norms <= 1e-12, 1.0, norms)
+            core_embeddings = core_embeddings / norms
+        return {
+            "payload": payload,
+            "artifact_store": store,
+            "run_id": run_id,
+            "prototype_snapshot_name": prototype_name,
+            "prototype_snapshot_manifest_path": prototype_manifest_path,
+            "handle": None,
+            "core_rows": core_rows,
+            "core_embeddings": core_embeddings,
+            "legacy_prototypes": prototypes,
+            "snapshot_core_load_ms": int((time.perf_counter() - started) * 1000),
+        }
+    core_rows = _snapshot_core_rows_from_handle(handle)
     return {
-        **payload,
-        "scaler": FeatureScaler.from_payload(payload.get("scaler") if isinstance(payload.get("scaler"), Mapping) else {}),
-        "transform": FeatureTransform.from_payload(payload.get("transform") if isinstance(payload.get("transform"), Mapping) else {}),
-        "prototypes": prototypes,
+        "payload": payload,
+        "artifact_store": store,
+        "run_id": run_id,
+        "prototype_snapshot_name": prototype_name,
+        "prototype_snapshot_manifest_path": prototype_manifest_path,
+        "handle": handle,
+        "core_rows": core_rows,
+        "core_embeddings": handle.load_core_embeddings(mmap_mode="r"),
+        "legacy_prototypes": [],
+        "snapshot_core_load_ms": int((time.perf_counter() - started) * 1000),
     }
 
 
@@ -519,7 +639,8 @@ def _train_snapshot_artifact_is_reusable(path: str) -> bool:
             payload = json.load(handle)
     except Exception:
         return False
-    if str(payload.get("artifact_kind") or "train_snapshot_v1") != "train_snapshot_v1":
+    artifact_kind = str(payload.get("artifact_kind") or "train_snapshot_v1")
+    if artifact_kind != TRAIN_SNAPSHOT_ARTIFACT_KIND:
         return False
     prototype_manifest_path = str(payload.get("prototype_snapshot_manifest_path") or "").strip()
     prototype_snapshot_name = str(payload.get("prototype_snapshot_name") or "").strip()
@@ -532,6 +653,78 @@ def _train_snapshot_artifact_is_reusable(path: str) -> bool:
     if prototype_snapshot_name == "prototype_snapshot":
         return False
     return False
+
+
+def _clear_materialized_stage_dirs(*, output_dir: str) -> None:
+    root = Path(output_dir)
+    run_root = root.parent if root.name == "train_snapshots" else root
+    for target in (run_root / "train_snapshots", run_root / "bundle", run_root / "study_cache"):
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+
+
+def _invalidate_materialized_contracts_if_needed(
+    *,
+    session_factory: sessionmaker[Session],
+    bundle_run_id: int,
+    output_dir: str,
+) -> bool:
+    with session_factory() as session:
+        snapshot_result = session.execute(
+            text(
+                """
+                SELECT artifact_path
+                  FROM bt_result.calibration_snapshot_run
+                 WHERE bundle_run_id = :bundle_run_id
+                """
+            ),
+            {"bundle_run_id": bundle_run_id},
+        ).mappings()
+        if hasattr(snapshot_result, "all"):
+            snapshot_rows = [dict(row) for row in snapshot_result.all()]
+        else:
+            first_row = snapshot_result.first()
+            snapshot_rows = [] if first_row is None else [dict(first_row)]
+        needs_invalidation = any(
+            str(row.get("artifact_path") or "").strip()
+            and not _train_snapshot_artifact_is_reusable(str(row.get("artifact_path") or ""))
+            for row in snapshot_rows
+        )
+        if not needs_invalidation:
+            return False
+        session.execute(
+            text(
+                """
+                UPDATE bt_result.calibration_snapshot_run
+                   SET status = 'failed',
+                       finished_at = COALESCE(finished_at, NOW()),
+                       last_error = :last_error
+                 WHERE bundle_run_id = :bundle_run_id
+                """
+            ),
+            {
+                "bundle_run_id": bundle_run_id,
+                "last_error": STALE_SNAPSHOT_CONTRACT_ERROR,
+            },
+        )
+        session.execute(
+            text(
+                """
+                UPDATE bt_result.calibration_chunk_run
+                   SET status = 'failed',
+                       finished_at = COALESCE(finished_at, NOW()),
+                       last_error = :last_error
+                 WHERE bundle_run_id = :bundle_run_id
+                """
+            ),
+            {
+                "bundle_run_id": bundle_run_id,
+                "last_error": STALE_BUNDLE_CONTRACT_ERROR,
+            },
+        )
+        session.commit()
+    _clear_materialized_stage_dirs(output_dir=output_dir)
+    return True
 
 
 def _eligible_query_rows_for_symbol(
@@ -897,7 +1090,7 @@ def _load_snapshot_payload_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
     artifact_path = str(row.get("artifact_path") or "")
     if not artifact_path:
         return {}
-    return _load_train_snapshot_payload(artifact_path)
+    return _load_train_snapshot_payload(artifact_path, hydrate_prototypes=False)
 
 
 def _select_snapshot_row(snapshot_rows: Sequence[Mapping[str, Any]], decision_date: str) -> dict[str, Any] | None:
@@ -906,6 +1099,137 @@ def _select_snapshot_row(snapshot_rows: Sequence[Mapping[str, Any]], decision_da
         return None
     eligible.sort(key=lambda row: (str(row.get("snapshot_date") or ""), int(row.get("id") or 0)))
     return eligible[-1]
+
+
+def _query_feature_block(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    transform: FeatureTransform,
+) -> dict[str, Any]:
+    feature_keys = list(transform.feature_keys or [])
+    feature_index = {key: idx for idx, key in enumerate(feature_keys)}
+    raw_rows: list[dict[str, Any]] = []
+    query_metas: list[dict[str, Any]] = []
+    matrix = np.zeros((len(rows), len(feature_keys)), dtype=np.float64)
+    parse_started = time.perf_counter()
+    for row_index, row in enumerate(rows):
+        raw_features = dict(_json_loads(row.get("raw_features_json"), {}))
+        query_meta = dict(_json_loads(row.get("query_meta_json"), {}))
+        raw_rows.append(raw_features)
+        query_metas.append(query_meta)
+        for key, value in raw_features.items():
+            feature_idx = feature_index.get(str(key))
+            if feature_idx is None:
+                continue
+            matrix[row_index, feature_idx] = _to_float(value)
+    query_parse_ms = int((time.perf_counter() - parse_started) * 1000)
+    means = np.asarray([_to_float(transform.scaler.means.get(key), 0.0) for key in feature_keys], dtype=np.float64)
+    stds = np.asarray([_to_float(transform.scaler.stds.get(key), 1.0) for key in feature_keys], dtype=np.float64)
+    stds = np.where(np.abs(stds) <= 1e-12, 1.0, stds)
+    transform_started = time.perf_counter()
+    transformed = (matrix - means) / stds if len(feature_keys) else matrix
+    query_transform_ms = int((time.perf_counter() - transform_started) * 1000)
+    return {
+        "raw_rows": raw_rows,
+        "query_metas": query_metas,
+        "transformed_matrix": transformed,
+        "query_parse_ms": query_parse_ms,
+        "query_transform_ms": query_transform_ms,
+        "feature_keys": feature_keys,
+    }
+
+
+def _ordered_union_prototype_indices(*, similarities: np.ndarray, buy_indices: Sequence[int], sell_indices: Sequence[int]) -> list[int]:
+    seen: set[int] = set()
+    out: list[int] = []
+    for idx in list(buy_indices) + list(sell_indices):
+        raw_idx = int(idx)
+        if raw_idx in seen:
+            continue
+        seen.add(raw_idx)
+        out.append(raw_idx)
+    out.sort(key=lambda raw_idx: (-float(similarities[raw_idx]), raw_idx))
+    return out
+
+
+def _patched_distribution(
+    dist: DistributionEstimate,
+    *,
+    prototype_pool_size: int,
+    pre_truncation_candidate_count: int,
+    positive_weight_candidate_count: int,
+) -> DistributionEstimate:
+    if not isinstance(dist, DistributionEstimate):
+        return dist
+    utility = dict(dist.utility or {})
+    utility.update(
+        {
+            "prototype_pool_size": int(prototype_pool_size),
+            "pre_truncation_candidate_count": int(pre_truncation_candidate_count),
+            "positive_weight_candidate_count": int(positive_weight_candidate_count),
+        }
+    )
+    return replace(
+        dist,
+        prototype_pool_size=int(prototype_pool_size),
+        pre_truncation_candidate_count=int(pre_truncation_candidate_count),
+        positive_weight_candidate_count=int(positive_weight_candidate_count),
+        utility=utility,
+    )
+
+
+def _patched_surface(
+    surface: DecisionSurface,
+    *,
+    buy_result: Mapping[str, Any],
+    sell_result: Mapping[str, Any],
+    prototype_pool_size: int,
+) -> DecisionSurface:
+    if not isinstance(surface, DecisionSurface):
+        return surface
+    buy = _patched_distribution(
+        surface.buy,
+        prototype_pool_size=prototype_pool_size,
+        pre_truncation_candidate_count=_to_int(buy_result.get("pre_truncation_candidate_count")),
+        positive_weight_candidate_count=_to_int(buy_result.get("positive_weight_candidate_count")),
+    )
+    sell = _patched_distribution(
+        surface.sell,
+        prototype_pool_size=prototype_pool_size,
+        pre_truncation_candidate_count=_to_int(sell_result.get("pre_truncation_candidate_count")),
+        positive_weight_candidate_count=_to_int(sell_result.get("positive_weight_candidate_count")),
+    )
+    diagnostics = dict(surface.diagnostics or {})
+    diagnostics["prototype_pool_size"] = int(prototype_pool_size)
+    return replace(surface, buy=buy, sell=sell, diagnostics=diagnostics)
+
+
+def _load_subset_prototype_pool(
+    *,
+    runtime_state: Mapping[str, Any],
+    prototype_indices: Sequence[int],
+) -> list[StatePrototype]:
+    if not prototype_indices:
+        return []
+    legacy_prototypes = list(runtime_state.get("legacy_prototypes") or [])
+    if legacy_prototypes:
+        return [legacy_prototypes[idx] for idx in prototype_indices if 0 <= int(idx) < len(legacy_prototypes)]
+    core_rows = list(runtime_state.get("core_rows") or [])
+    prototype_ids = [
+        str(core_rows[idx].get("prototype_id") or "")
+        for idx in prototype_indices
+        if 0 <= int(idx) < len(core_rows)
+    ]
+    if not prototype_ids:
+        return []
+    subset_payloads = load_prototype_subset(
+        artifact_store=runtime_state["artifact_store"],
+        run_id=str(runtime_state.get("run_id") or ""),
+        name=str(runtime_state.get("prototype_snapshot_name") or "prototype_snapshot"),
+        prototype_ids=prototype_ids,
+        manifest_path=str(runtime_state.get("prototype_snapshot_manifest_path") or ""),
+    )
+    return [StatePrototype(**payload) for payload in subset_payloads]
 
 
 def _signal_panel_rows_from_cache(
@@ -920,8 +1244,14 @@ def _signal_panel_rows_from_cache(
     raw_event_row_count = 0
     prototype_count = 0
     snapshot_load_ms = 0
+    snapshot_core_load_ms = 0
+    query_parse_ms = 0
+    query_transform_ms = 0
+    prototype_score_ms = 0
+    member_lazy_load_ms = 0
+    query_block_count = 0
     loaded_snapshot_id = ""
-    loaded_snapshot_payload: dict[str, Any] = {}
+    loaded_snapshot_state: dict[str, Any] = {}
     for decision_date in sorted(by_date):
         snapshot_row = _select_snapshot_row(snapshot_rows, decision_date)
         if not snapshot_row:
@@ -929,17 +1259,24 @@ def _signal_panel_rows_from_cache(
         snapshot_id = str(snapshot_row.get("snapshot_id") or "")
         if snapshot_id != loaded_snapshot_id:
             snapshot_load_started = time.perf_counter()
-            loaded_snapshot_payload = _load_snapshot_payload_for_row(snapshot_row)
+            loaded_snapshot_state = _snapshot_runtime_state(snapshot_row)
             snapshot_load_ms += int((time.perf_counter() - snapshot_load_started) * 1000)
-            loaded_snapshot_id = snapshot_id if loaded_snapshot_payload else ""
-        snapshot_payload = dict(loaded_snapshot_payload or {})
+            snapshot_core_load_ms += int(loaded_snapshot_state.get("snapshot_core_load_ms") or 0)
+            loaded_snapshot_id = snapshot_id if loaded_snapshot_state else ""
+        snapshot_state = dict(loaded_snapshot_state or {})
+        snapshot_payload = dict(snapshot_state.get("payload") or {})
         if not snapshot_payload:
             continue
         transform = snapshot_payload.get("transform")
         if not isinstance(transform, FeatureTransform):
             continue
-        prototype_pool = list(snapshot_payload.get("prototypes") or [])
-        if not prototype_pool:
+        core_rows = list(snapshot_state.get("core_rows") or [])
+        core_embedding_payload = snapshot_state.get("core_embeddings")
+        core_embeddings = np.asarray(
+            core_embedding_payload if core_embedding_payload is not None else np.zeros((0, 0), dtype=np.float64),
+            dtype=np.float64,
+        )
+        if not core_rows:
             continue
         metadata = dict(snapshot_payload.get("metadata") or {})
         quote_policy_calibration = dict(snapshot_payload.get("quote_policy_calibration") or {})
@@ -955,79 +1292,153 @@ def _signal_panel_rows_from_cache(
             intercept=float(calibration_payload.get("intercept", 0.0)),
         )
         raw_event_row_count += _to_int(snapshot_payload.get("event_record_count"))
-        prototype_count += len(prototype_pool)
-        for query_row in by_date[decision_date]:
-            raw_features = dict(_json_loads(query_row.get("raw_features_json"), {}))
-            transformed_features, embedding = transform.apply(raw_features)
-            query_meta = dict(_json_loads(query_row.get("query_meta_json"), {}))
-            regime_code = str(query_meta.get("regime_code") or query_row.get("regime_code") or "UNKNOWN")
-            sector_code = str(query_meta.get("sector_code") or query_row.get("sector_code") or "UNKNOWN")
-            surface = build_decision_surface(
-                query_embedding=embedding,
-                prototype_pool=prototype_pool,
-                regime_code=regime_code,
-                sector_code=sector_code,
-                ev_config=ev_cfg,
-                candidate_index=ExactCosineCandidateIndex(),
-                calibration=calibration,
-                query_date=decision_date,
+        prototype_count += len(core_rows)
+        prototype_regime_codes = [str(row.get("regime_code") or "") for row in core_rows]
+        prototype_sector_codes = [str(row.get("sector_code") or "") for row in core_rows]
+        prototype_side_stats = [dict(row.get("side_stats") or {}) for row in core_rows]
+        prototype_decayed_support = [_to_float(row.get("decayed_support")) for row in core_rows]
+        prototype_freshness_days = [_to_float(row.get("freshness_days")) for row in core_rows]
+        subset_cache: dict[tuple[int, ...], list[StatePrototype]] = {}
+        date_rows = list(by_date[decision_date])
+        block_size = 256
+        for offset in range(0, len(date_rows), block_size):
+            block_rows = date_rows[offset : offset + block_size]
+            query_block_count += 1
+            query_block = _query_feature_block(block_rows, transform=transform)
+            query_parse_ms += int(query_block["query_parse_ms"])
+            query_transform_ms += int(query_block["query_transform_ms"])
+            transformed_matrix = np.asarray(query_block["transformed_matrix"], dtype=np.float64)
+            query_metas = list(query_block["query_metas"])
+            raw_rows = list(query_block["raw_rows"])
+            score_started = time.perf_counter()
+            topk_results = exact_block_prototype_topk(
+                query_embeddings=transformed_matrix,
+                prototype_embeddings=core_embeddings,
+                query_regime_codes=[
+                    str((meta.get("regime_code") if isinstance(meta, Mapping) else None) or row.get("regime_code") or "UNKNOWN")
+                    for meta, row in zip(query_metas, block_rows)
+                ],
+                query_sector_codes=[
+                    str((meta.get("sector_code") if isinstance(meta, Mapping) else None) or row.get("sector_code") or "UNKNOWN")
+                    for meta, row in zip(query_metas, block_rows)
+                ],
+                prototype_regime_codes=prototype_regime_codes,
+                prototype_sector_codes=prototype_sector_codes,
+                prototype_side_stats=prototype_side_stats,
+                prototype_decayed_support=prototype_decayed_support,
+                prototype_freshness_days=prototype_freshness_days,
+                cfg=ev_cfg,
             )
-            buy_side_diag = _side_diag(surface.buy, surface, "BUY")
-            sell_side_diag = _side_diag(surface.sell, surface, "SELL")
-            chosen_payload = _chosen_side_payload(
-                surface=surface,
-                buy_side_diag=buy_side_diag,
-                sell_side_diag=sell_side_diag,
-            )
-            panel_rows.append(
-                {
-                    "decision_date": decision_date,
-                    "symbol": query_row.get("symbol"),
-                    "query": {
-                        "regime_code": regime_code,
-                        "sector_code": sector_code,
-                        "exchange_code": query_meta.get("exchange_code"),
-                        "country_code": query_meta.get("country_code"),
-                        "exchange_tz": query_meta.get("exchange_tz"),
-                        "session_date_local": query_meta.get("session_date_local"),
-                        "session_close_ts_utc": query_meta.get("session_close_ts_utc"),
-                        "feature_anchor_ts_utc": query_meta.get("feature_anchor_ts_utc"),
-                        "macro_asof_ts_utc": query_meta.get("macro_asof_ts_utc"),
-                    },
-                    "decision_surface": {
-                        "chosen_side": surface.chosen_side,
-                        "abstain": surface.abstain,
-                        "abstain_reasons": list(surface.abstain_reasons),
-                        "chosen_lower_bound": (surface.diagnostics.get("decision_rule") or {}).get("chosen_lower_bound"),
-                        "chosen_interval_width": (surface.diagnostics.get("decision_rule") or {}).get("chosen_interval_width"),
-                        "chosen_effective_sample_size": (surface.diagnostics.get("decision_rule") or {}).get("chosen_effective_sample_size"),
-                        "chosen_uncertainty": (surface.diagnostics.get("decision_rule") or {}).get("chosen_uncertainty"),
-                        "decision_rule": surface.diagnostics.get("decision_rule"),
-                        "chosen_payload": chosen_payload,
-                    },
-                    "chosen_side_payload": chosen_payload,
-                    "scorer_diagnostics": {"buy": buy_side_diag, "sell": sell_side_diag},
-                    "ev": {
-                        "buy": {
-                            "regime_alignment": buy_side_diag.get("regime_alignment"),
-                            "abstain_reasons": list(buy_side_diag.get("abstain_reasons") or []),
-                        },
-                        "sell": {
-                            "regime_alignment": sell_side_diag.get("regime_alignment"),
-                            "abstain_reasons": list(sell_side_diag.get("abstain_reasons") or []),
-                        },
-                    },
-                    "missingness": {},
-                    "_snapshot_id": snapshot_id,
-                    "_raw_features": raw_features,
-                    "_transformed_features": transformed_features,
-                    "_embedding": embedding,
+            prototype_score_ms += int((time.perf_counter() - score_started) * 1000)
+            for row_index, query_row in enumerate(block_rows):
+                query_meta = dict(query_metas[row_index] or {})
+                raw_features = dict(raw_rows[row_index] or {})
+                embedding = [float(value) for value in transformed_matrix[row_index].tolist()]
+                transformed_features = {
+                    key: float(transformed_matrix[row_index, feature_idx])
+                    for feature_idx, key in enumerate(query_block["feature_keys"])
                 }
-            )
+                regime_code = str(query_meta.get("regime_code") or query_row.get("regime_code") or "UNKNOWN")
+                sector_code = str(query_meta.get("sector_code") or query_row.get("sector_code") or "UNKNOWN")
+                topk = dict(topk_results[row_index] or {})
+                similarity_payload = topk.get("similarities")
+                similarities = np.asarray(
+                    similarity_payload if similarity_payload is not None else np.zeros((0,), dtype=float),
+                    dtype=float,
+                )
+                union_indices = _ordered_union_prototype_indices(
+                    similarities=similarities,
+                    buy_indices=list((topk.get("BUY") or {}).get("top_indices") or []),
+                    sell_indices=list((topk.get("SELL") or {}).get("top_indices") or []),
+                )
+                subset_key = tuple(union_indices)
+                prototype_pool = subset_cache.get(subset_key)
+                if prototype_pool is None:
+                    member_load_started = time.perf_counter()
+                    prototype_pool = _load_subset_prototype_pool(
+                        runtime_state=snapshot_state,
+                        prototype_indices=union_indices,
+                    )
+                    member_lazy_load_ms += int((time.perf_counter() - member_load_started) * 1000)
+                    subset_cache[subset_key] = prototype_pool
+                surface = build_decision_surface(
+                    query_embedding=embedding,
+                    prototype_pool=prototype_pool,
+                    regime_code=regime_code,
+                    sector_code=sector_code,
+                    ev_config=ev_cfg,
+                    candidate_index=None,
+                    calibration=calibration,
+                    query_date=decision_date,
+                )
+                surface = _patched_surface(
+                    surface,
+                    buy_result=dict(topk.get("BUY") or {}),
+                    sell_result=dict(topk.get("SELL") or {}),
+                    prototype_pool_size=len(core_rows),
+                )
+                buy_side_diag = _side_diag(surface.buy, surface, "BUY")
+                sell_side_diag = _side_diag(surface.sell, surface, "SELL")
+                chosen_payload = _chosen_side_payload(
+                    surface=surface,
+                    buy_side_diag=buy_side_diag,
+                    sell_side_diag=sell_side_diag,
+                )
+                panel_rows.append(
+                    {
+                        "decision_date": decision_date,
+                        "symbol": query_row.get("symbol"),
+                        "query": {
+                            "regime_code": regime_code,
+                            "sector_code": sector_code,
+                            "exchange_code": query_meta.get("exchange_code"),
+                            "country_code": query_meta.get("country_code"),
+                            "exchange_tz": query_meta.get("exchange_tz"),
+                            "session_date_local": query_meta.get("session_date_local"),
+                            "session_close_ts_utc": query_meta.get("session_close_ts_utc"),
+                            "feature_anchor_ts_utc": query_meta.get("feature_anchor_ts_utc"),
+                            "macro_asof_ts_utc": query_meta.get("macro_asof_ts_utc"),
+                        },
+                        "decision_surface": {
+                            "chosen_side": surface.chosen_side,
+                            "abstain": surface.abstain,
+                            "abstain_reasons": list(surface.abstain_reasons),
+                            "chosen_lower_bound": (surface.diagnostics.get("decision_rule") or {}).get("chosen_lower_bound"),
+                            "chosen_interval_width": (surface.diagnostics.get("decision_rule") or {}).get("chosen_interval_width"),
+                            "chosen_effective_sample_size": (surface.diagnostics.get("decision_rule") or {}).get("chosen_effective_sample_size"),
+                            "chosen_uncertainty": (surface.diagnostics.get("decision_rule") or {}).get("chosen_uncertainty"),
+                            "decision_rule": surface.diagnostics.get("decision_rule"),
+                            "chosen_payload": chosen_payload,
+                        },
+                        "chosen_side_payload": chosen_payload,
+                        "scorer_diagnostics": {"buy": buy_side_diag, "sell": sell_side_diag},
+                        "ev": {
+                            "buy": {
+                                "regime_alignment": buy_side_diag.get("regime_alignment"),
+                                "abstain_reasons": list(buy_side_diag.get("abstain_reasons") or []),
+                            },
+                            "sell": {
+                                "regime_alignment": sell_side_diag.get("regime_alignment"),
+                                "abstain_reasons": list(sell_side_diag.get("abstain_reasons") or []),
+                            },
+                        },
+                        "missingness": {},
+                        "_snapshot_id": snapshot_id,
+                        "_raw_features": raw_features,
+                        "_transformed_features": transformed_features,
+                        "_embedding": embedding,
+                    }
+                )
     return panel_rows, {
         "raw_event_row_count": raw_event_row_count,
         "prototype_count": prototype_count,
         "snapshot_load_ms": snapshot_load_ms,
+        "snapshot_core_load_ms": snapshot_core_load_ms,
+        "query_parse_ms": query_parse_ms,
+        "query_transform_ms": query_transform_ms,
+        "prototype_score_ms": prototype_score_ms,
+        "member_lazy_load_ms": member_lazy_load_ms,
+        "query_block_count": query_block_count,
     }
 
 
@@ -1604,7 +2015,11 @@ def begin_snapshot_run(
                         event_record_count = 0,
                         prototype_count = 0,
                         event_memory_ms = 0,
+                        event_cache_build_ms = 0,
+                        eligible_event_count = 0,
+                        scaler_reconstruct_ms = 0,
                         transform_ms = 0,
+                        prototype_prepare_ms = 0,
                         prototype_ms = 0,
                         artifact_write_ms = 0,
                         artifact_rows_total = 0,
@@ -1641,7 +2056,11 @@ def touch_snapshot_run(
     event_record_count: int | None = None,
     prototype_count: int | None = None,
     event_memory_ms: int | None = None,
+    event_cache_build_ms: int | None = None,
+    eligible_event_count: int | None = None,
+    scaler_reconstruct_ms: int | None = None,
     transform_ms: int | None = None,
+    prototype_prepare_ms: int | None = None,
     prototype_ms: int | None = None,
     artifact_write_ms: int | None = None,
     artifact_rows_total: int | None = None,
@@ -1687,9 +2106,21 @@ def touch_snapshot_run(
     if event_memory_ms is not None:
         update_parts.append("event_memory_ms = :event_memory_ms")
         params["event_memory_ms"] = int(event_memory_ms)
+    if event_cache_build_ms is not None:
+        update_parts.append("event_cache_build_ms = :event_cache_build_ms")
+        params["event_cache_build_ms"] = int(event_cache_build_ms)
+    if eligible_event_count is not None:
+        update_parts.append("eligible_event_count = :eligible_event_count")
+        params["eligible_event_count"] = int(eligible_event_count)
+    if scaler_reconstruct_ms is not None:
+        update_parts.append("scaler_reconstruct_ms = :scaler_reconstruct_ms")
+        params["scaler_reconstruct_ms"] = int(scaler_reconstruct_ms)
     if transform_ms is not None:
         update_parts.append("transform_ms = :transform_ms")
         params["transform_ms"] = int(transform_ms)
+    if prototype_prepare_ms is not None:
+        update_parts.append("prototype_prepare_ms = :prototype_prepare_ms")
+        params["prototype_prepare_ms"] = int(prototype_prepare_ms)
     if prototype_ms is not None:
         update_parts.append("prototype_ms = :prototype_ms")
         params["prototype_ms"] = int(prototype_ms)
@@ -1780,7 +2211,11 @@ def complete_snapshot_run(
     event_record_count: int,
     prototype_count: int,
     event_memory_ms: int = 0,
+    event_cache_build_ms: int = 0,
+    eligible_event_count: int = 0,
+    scaler_reconstruct_ms: int = 0,
     transform_ms: int = 0,
+    prototype_prepare_ms: int = 0,
     prototype_ms: int = 0,
     artifact_write_ms: int = 0,
     artifact_rows_total: int = 0,
@@ -1811,7 +2246,11 @@ def complete_snapshot_run(
                        prototype_rows_done = :prototype_rows_done,
                        cluster_count = :cluster_count,
                        event_memory_ms = :event_memory_ms,
+                       event_cache_build_ms = :event_cache_build_ms,
+                       eligible_event_count = :eligible_event_count,
+                       scaler_reconstruct_ms = :scaler_reconstruct_ms,
                        transform_ms = :transform_ms,
+                       prototype_prepare_ms = :prototype_prepare_ms,
                        prototype_ms = :prototype_ms,
                        artifact_write_ms = :artifact_write_ms,
                        artifact_rows_total = :artifact_rows_total,
@@ -1840,7 +2279,11 @@ def complete_snapshot_run(
                 "prototype_rows_done": int(prototype_rows_done),
                 "cluster_count": int(cluster_count),
                 "event_memory_ms": int(event_memory_ms),
+                "event_cache_build_ms": int(event_cache_build_ms),
+                "eligible_event_count": int(eligible_event_count),
+                "scaler_reconstruct_ms": int(scaler_reconstruct_ms),
                 "transform_ms": int(transform_ms),
+                "prototype_prepare_ms": int(prototype_prepare_ms),
                 "prototype_ms": int(prototype_ms),
                 "artifact_write_ms": int(artifact_write_ms),
                 "artifact_rows_total": int(artifact_rows_total),
@@ -2482,6 +2925,11 @@ def materialize_train_snapshots(
     spec = _spec_or_default(research_spec)
     cadence = str(snapshot_cadence or "daily").strip().lower() or "daily"
     resolved_model_version = _resolve_model_version(cadence, model_version)
+    _invalidate_materialized_contracts_if_needed(
+        session_factory=write_session_factory,
+        bundle_run_id=bundle_run_id,
+        output_dir=output_dir,
+    )
     touch_bundle_run(
         session_factory=write_session_factory,
         bundle_run_id=bundle_run_id,
@@ -2522,6 +2970,32 @@ def materialize_train_snapshots(
     snapshot_dates = _snapshot_dates(decision_dates, cadence)
     artifact_store = JsonResearchArtifactStore(output_dir)
     run_id = f"{bundle_key or f'bundle-{bundle_run_id}'}__snapshots"
+    event_cache_handle = None
+    if snapshot_dates:
+        def _event_cache_progress(_payload: Mapping[str, Any]) -> None:
+            touch_bundle_run(
+                session_factory=write_session_factory,
+                bundle_run_id=bundle_run_id,
+                current_step="build-train-snapshots",
+                pid=os.getpid(),
+                status="running",
+                last_error="",
+            )
+
+        event_cache_handle = build_event_raw_cache(
+            output_dir=output_dir,
+            run_id=run_id,
+            decision_date=str(snapshot_dates[-1]),
+            spec=spec,
+            bars_by_symbol=context["bars_by_symbol"],
+            macro_history_by_date=context["macro_history_by_date"],
+            sector_map=context["sector_map"],
+            metadata=dict(metadata or {}),
+            session_metadata_by_symbol=context["session_metadata_by_symbol"],
+            macro_series_history=context["macro_series_history"],
+            use_proxy_aggregate_cache=True,
+            progress_callback=_event_cache_progress,
+        )
     created = 0
     reused = 0
     fast_path_recent_snapshots: list[dict[str, Any]] = []
@@ -2601,9 +3075,29 @@ def materialize_train_snapshots(
                     if payload.get("event_memory_ms") is not None
                     else None
                 ),
+                event_cache_build_ms=(
+                    _to_int(payload.get("event_cache_build_ms"))
+                    if payload.get("event_cache_build_ms") is not None
+                    else None
+                ),
+                eligible_event_count=(
+                    _to_int(payload.get("eligible_event_count"))
+                    if payload.get("eligible_event_count") is not None
+                    else None
+                ),
+                scaler_reconstruct_ms=(
+                    _to_int(payload.get("scaler_reconstruct_ms"))
+                    if payload.get("scaler_reconstruct_ms") is not None
+                    else None
+                ),
                 transform_ms=(
                     _to_int(payload.get("transform_ms"))
                     if payload.get("transform_ms") is not None
+                    else None
+                ),
+                prototype_prepare_ms=(
+                    _to_int(payload.get("prototype_prepare_ms"))
+                    if payload.get("prototype_prepare_ms") is not None
                     else None
                 ),
                 prototype_ms=(
@@ -2748,6 +3242,7 @@ def materialize_train_snapshots(
                 prototype_checkpoint_path=checkpoint_paths["prototype_checkpoint_path"],
                 resume_prototype_from_checkpoint=resume_prototype_from_checkpoint,
                 comparison_block_size=2048,
+                event_cache_handle=event_cache_handle,
             )
             snapshot_payload = _json_safe_snapshot_payload(train_artifact)
             phase_timings_ms = dict(train_artifact.get("phase_timings_ms") or {})
@@ -2800,7 +3295,11 @@ def materialize_train_snapshots(
                 event_record_count=_to_int(snapshot_payload.get("event_record_count")),
                 prototype_count=_to_int(snapshot_payload.get("prototype_count")),
                 event_memory_ms=_to_int(phase_timings_ms.get("event_memory")),
+                event_cache_build_ms=_to_int(train_artifact.get("event_cache_build_ms")),
+                eligible_event_count=_to_int(train_artifact.get("eligible_event_count")),
+                scaler_reconstruct_ms=_to_int(train_artifact.get("scaler_reconstruct_ms")),
                 transform_ms=_to_int(phase_timings_ms.get("transform")),
+                prototype_prepare_ms=_to_int(phase_timings_ms.get("prototype_prepare")),
                 prototype_ms=_to_int(phase_timings_ms.get("prototype")),
                 artifact_write_ms=artifact_write_ms,
                 artifact_rows_total=_to_int(snapshot_payload.get("prototype_count")),
@@ -3021,6 +3520,12 @@ def materialize_calibration_chunk(
                         load_ms = NULL,
                         query_feature_ms = NULL,
                         snapshot_load_ms = NULL,
+                        snapshot_core_load_ms = NULL,
+                        query_parse_ms = NULL,
+                        query_transform_ms = NULL,
+                        prototype_score_ms = NULL,
+                        member_lazy_load_ms = NULL,
+                        query_block_count = 0,
                         score_ms = NULL,
                         db_write_ms = NULL,
                         decision_date_count = 0,
@@ -3091,12 +3596,18 @@ def materialize_calibration_chunk(
                        SET status = 'ok',
                            finished_at = NOW(),
                            elapsed_ms = :elapsed_ms,
-                           load_ms = :load_ms,
-                           query_feature_ms = 0,
-                           snapshot_load_ms = 0,
-                           score_ms = 0,
-                           db_write_ms = 0,
-                           decision_date_count = 0,
+                               load_ms = :load_ms,
+                               query_feature_ms = 0,
+                               snapshot_load_ms = 0,
+                               snapshot_core_load_ms = 0,
+                               query_parse_ms = 0,
+                               query_transform_ms = 0,
+                               prototype_score_ms = 0,
+                               member_lazy_load_ms = 0,
+                               query_block_count = 0,
+                               score_ms = 0,
+                               db_write_ms = 0,
+                               decision_date_count = 0,
                            query_row_count = :query_row_count,
                            seed_row_count = 0,
                            replay_bar_count = :replay_bar_count,
@@ -3196,6 +3707,12 @@ def materialize_calibration_chunk(
                                load_ms = :load_ms,
                                query_feature_ms = :query_feature_ms,
                                snapshot_load_ms = :snapshot_load_ms,
+                               snapshot_core_load_ms = :snapshot_core_load_ms,
+                               query_parse_ms = :query_parse_ms,
+                               query_transform_ms = :query_transform_ms,
+                               prototype_score_ms = :prototype_score_ms,
+                               member_lazy_load_ms = :member_lazy_load_ms,
+                               query_block_count = :query_block_count,
                                score_ms = :score_ms,
                                db_write_ms = :db_write_ms,
                                decision_date_count = :decision_date_count,
@@ -3215,6 +3732,12 @@ def materialize_calibration_chunk(
                         "load_ms": load_ms,
                         "query_feature_ms": query_feature_ms,
                         "snapshot_load_ms": snapshot_load_ms,
+                        "snapshot_core_load_ms": _to_int(telemetry.get("snapshot_core_load_ms")),
+                        "query_parse_ms": _to_int(telemetry.get("query_parse_ms")),
+                        "query_transform_ms": _to_int(telemetry.get("query_transform_ms")),
+                        "prototype_score_ms": _to_int(telemetry.get("prototype_score_ms")),
+                        "member_lazy_load_ms": _to_int(telemetry.get("member_lazy_load_ms")),
+                        "query_block_count": _to_int(telemetry.get("query_block_count")),
                         "score_ms": score_ms,
                         "db_write_ms": db_write_ms,
                         "decision_date_count": len({str(row.get("decision_date") or "") for row in query_rows}),

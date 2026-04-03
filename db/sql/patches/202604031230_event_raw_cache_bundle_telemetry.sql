@@ -1,0 +1,13 @@
+ALTER TABLE bt_result.calibration_snapshot_run
+    ADD COLUMN IF NOT EXISTS event_cache_build_ms INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS eligible_event_count INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS scaler_reconstruct_ms INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS prototype_prepare_ms INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE bt_result.calibration_chunk_run
+    ADD COLUMN IF NOT EXISTS snapshot_core_load_ms INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS query_parse_ms INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS query_transform_ms INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS prototype_score_ms INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS member_lazy_load_ms INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS query_block_count INTEGER NOT NULL DEFAULT 0;
