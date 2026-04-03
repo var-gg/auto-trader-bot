@@ -121,9 +121,40 @@ class FeatureTransform:
     def embedding_from_transformed(self, transformed_features: Mapping[str, float]) -> List[float]:
         return [float(transformed_features.get(key, 0.0) or 0.0) for key in self.feature_keys]
 
+    def apply_batch(self, raw_rows: Sequence[Mapping[str, float]]) -> tuple[List[Dict[str, float]], List[List[float]]]:
+        if not raw_rows:
+            return [], []
+        feature_keys = list(self.feature_keys or [])
+        feature_index = {key: idx for idx, key in enumerate(feature_keys)}
+        raw_matrix = np.zeros((len(raw_rows), len(feature_keys)), dtype=np.float64)
+        for row_index, raw_features in enumerate(raw_rows):
+            for key, value in dict(raw_features or {}).items():
+                feature_idx = feature_index.get(str(key))
+                if feature_idx is None:
+                    continue
+                raw_matrix[row_index, feature_idx] = float(value or 0.0)
+        means = np.asarray([float(self.scaler.means.get(key, 0.0) or 0.0) for key in feature_keys], dtype=np.float64)
+        stds = np.asarray([float(self.scaler.stds.get(key, 1.0) or 1.0) for key in feature_keys], dtype=np.float64)
+        stds = np.where(np.abs(stds) <= 1e-12, 1.0, stds)
+        transformed_matrix = (raw_matrix - means) / stds if feature_keys else raw_matrix
+        transformed_rows: List[Dict[str, float]] = []
+        embeddings: List[List[float]] = []
+        for row_index in range(transformed_matrix.shape[0]):
+            row_values = transformed_matrix[row_index]
+            transformed_rows.append(
+                {
+                    key: float(row_values[feature_idx])
+                    for feature_idx, key in enumerate(feature_keys)
+                }
+            )
+            embeddings.append([float(value) for value in row_values.tolist()])
+        return transformed_rows, embeddings
+
     def apply(self, raw_features: Mapping[str, float]) -> tuple[Dict[str, float], List[float]]:
-        transformed = self.transform_raw_features(raw_features)
-        return transformed, self.embedding_from_transformed(transformed)
+        transformed_rows, embeddings = self.apply_batch([raw_features])
+        if not transformed_rows:
+            return {}, []
+        return transformed_rows[0], embeddings[0]
 
 
 @dataclass(frozen=True)

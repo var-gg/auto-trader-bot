@@ -158,6 +158,13 @@ def _json_value(raw: Any, default: Any) -> Any:
         return default
 
 
+def _normalize_snapshot_format(format: str = "json") -> str:
+    resolved = str(format or "json").strip().lower()
+    if resolved in {"", "json"}:
+        return "json"
+    raise ValueError(f"unsupported snapshot format: {format}")
+
+
 def _prototype_payload_row(raw: Any) -> dict[str, Any]:
     payload = dict(raw if isinstance(raw, Mapping) else getattr(raw, "__dict__", {}) or {})
     return {
@@ -555,13 +562,13 @@ class JsonResearchArtifactStore:
 
     def save_snapshot(self, *, run_id: str, name: str, spec: Mapping[str, Any], as_of_date: str, coverage: Mapping[str, Any], excluded_reasons: list[dict], payload: Mapping[str, Any], format: str = "json") -> str:
         envelope = {"spec": dict(spec), "spec_hash": dict(spec).get("spec_hash"), "as_of_date": as_of_date, "coverage": dict(coverage), "excluded_reasons": list(excluded_reasons), "payload": dict(payload)}
-        ext = "json" if format not in {"json", "parquet"} else format
+        ext = _normalize_snapshot_format(format)
         path = self._dir(run_id) / f"{name}.{ext}"
         path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         return str(path)
 
     def load_snapshot(self, *, run_id: str, name: str, format: str = "json") -> dict | None:
-        ext = "json" if format not in {"json", "parquet"} else format
+        ext = _normalize_snapshot_format(format)
         path = self._dir(run_id) / f"{name}.{ext}"
         if not path.exists():
             return None

@@ -7,7 +7,7 @@ from typing import Iterable, List, Optional, Sequence
 import numpy as np
 
 from .models import DecisionSurface, DistributionEstimate, StatePrototype
-from .repository import CandidateIndex
+from .repository import CandidateIndex, ExactCosineCandidateIndex
 
 
 @dataclass(frozen=True)
@@ -374,106 +374,30 @@ def exact_block_prototype_topk(
     cfg: EVConfig | None = None,
 ) -> list[dict[str, Any]]:
     resolved_cfg = cfg or EVConfig()
-    q = np.asarray(query_embeddings, dtype=float)
-    if q.ndim == 1:
-        q = q.reshape(1, -1)
-    p = np.asarray(prototype_embeddings, dtype=float)
-    if p.size == 0:
-        return [{"BUY": {"top_indices": [], "prototype_pool_size": 0, "pre_truncation_candidate_count": 0, "positive_weight_candidate_count": 0}, "SELL": {"top_indices": [], "prototype_pool_size": 0, "pre_truncation_candidate_count": 0, "positive_weight_candidate_count": 0}, "similarities": np.zeros((0,), dtype=float)} for _ in range(q.shape[0])]
-    q_norms = np.linalg.norm(q, axis=1, keepdims=True)
-    q_norms = np.where(q_norms <= 1e-12, 1.0, q_norms)
-    query_normed = q / q_norms
-    similarities = np.clip(query_normed @ p.T, 0.0, None)
-    freshness_scores = np.asarray(
-        [1.0 / (1.0 + max(0.0, float(item or 0.0)) / 30.0) for item in prototype_freshness_days],
-        dtype=float,
-    )
-    side_support_scores: dict[str, np.ndarray] = {}
-    side_available: dict[str, np.ndarray] = {}
-    for side in ("BUY", "SELL"):
-        side_stats = [dict((payload or {}).get(side) or {}) for payload in prototype_side_stats]
-        side_available[side] = np.asarray([bool(item) for item in side_stats], dtype=bool)
-        side_support_scores[side] = np.asarray(
-            [
-                min(
-                    1.0,
-                    float((item.get("decayed_support") if item else None) or (prototype_decayed_support[idx] or 0.0)) / 5.0,
-                )
-                for idx, item in enumerate(side_stats)
-            ],
-            dtype=float,
-        )
-    out: list[dict[str, Any]] = []
-    prototype_pool_size = int(p.shape[0])
-    prototype_regime_codes = [str(item or "") for item in prototype_regime_codes]
-    prototype_sector_codes = [str(item or "") for item in prototype_sector_codes]
-    original_indices = np.arange(prototype_pool_size, dtype=int)
-    for row_index in range(q.shape[0]):
-        regime_code = str(query_regime_codes[row_index] or "")
-        sector_code = str(query_sector_codes[row_index] or "")
-        side_results: dict[str, Any] = {}
-        similarity_row = np.asarray(similarities[row_index], dtype=float)
-        for side in ("BUY", "SELL"):
-            available_mask = side_available[side]
-            available_indices = np.flatnonzero(available_mask)
-            if available_indices.size == 0:
-                side_results[side] = {
-                    "top_indices": [],
-                    "prototype_pool_size": prototype_pool_size,
-                    "pre_truncation_candidate_count": 0,
-                    "positive_weight_candidate_count": 0,
-                }
-                continue
-            regime_alignment = np.asarray(
-                [1.0 if regime_code and prototype_regime_codes[idx] == regime_code else 0.0 for idx in range(prototype_pool_size)],
-                dtype=float,
-            )
-            sector_alignment = np.asarray(
-                [1.0 if sector_code and prototype_sector_codes[idx] == sector_code else 0.0 for idx in range(prototype_pool_size)],
-                dtype=float,
-            )
-            context_alignment = 0.40 + 0.60 * np.maximum(regime_alignment, sector_alignment)
-            support_scores = side_support_scores[side]
-            if resolved_cfg.use_kernel_weighting:
-                kernel = np.exp(resolved_cfg.kernel_temperature * (similarity_row - 1.0))
-            else:
-                kernel = similarity_row
-            weights = kernel * (0.45 + 0.30 * support_scores + 0.25 * freshness_scores) * context_alignment
-            positive_weight_count = int(np.count_nonzero(weights[available_indices] > 0.0))
-            top_k = min(int(resolved_cfg.prototype_retrieval_k), int(available_indices.size))
-            if top_k <= 0:
-                top_indices: list[int] = []
-            elif available_indices.size <= top_k:
-                ordered = np.lexsort(
-                    (
-                        original_indices[available_indices],
-                        -similarity_row[available_indices],
-                        -weights[available_indices],
-                    )
-                )
-                top_indices = [int(value) for value in available_indices[ordered][:top_k]]
-            else:
-                candidate_weights = weights[available_indices]
-                partition = np.argpartition(candidate_weights, -top_k)[-top_k:]
-                threshold = float(np.min(candidate_weights[partition]))
-                shortlist = available_indices[candidate_weights >= threshold]
-                ordered = np.lexsort(
-                    (
-                        original_indices[shortlist],
-                        -similarity_row[shortlist],
-                        -weights[shortlist],
-                    )
-                )
-                top_indices = [int(value) for value in shortlist[ordered][:top_k]]
-            side_results[side] = {
-                "top_indices": top_indices,
-                "prototype_pool_size": prototype_pool_size,
-                "pre_truncation_candidate_count": int(available_indices.size),
-                "positive_weight_candidate_count": positive_weight_count,
+    candidate_index = ExactCosineCandidateIndex()
+    prepared = candidate_index.prepare_matrix(
+        candidates=[
+            {
+                "prototype_id": f"prototype:{idx}",
+                "regime_code": prototype_regime_codes[idx],
+                "sector_code": prototype_sector_codes[idx],
+                "side_stats": dict(prototype_side_stats[idx] or {}),
+                "decayed_support": prototype_decayed_support[idx],
+                "freshness_days": prototype_freshness_days[idx],
             }
-        side_results["similarities"] = similarity_row
-        out.append(side_results)
-    return out
+            for idx in range(len(prototype_regime_codes))
+        ],
+        embeddings=prototype_embeddings,
+    )
+    return candidate_index.topk_scored_block(
+        query_embeddings=np.asarray(query_embeddings, dtype=float),
+        prepared=prepared,
+        query_regime_codes=query_regime_codes,
+        query_sector_codes=query_sector_codes,
+        prototype_retrieval_k=int(resolved_cfg.prototype_retrieval_k),
+        use_kernel_weighting=bool(resolved_cfg.use_kernel_weighting),
+        kernel_temperature=float(resolved_cfg.kernel_temperature),
+    )
 
 
 def _expand_member_rows(
@@ -829,7 +753,7 @@ def build_decision_surface(*, query_embedding: list[float], prototype_pool: Iter
         abstain_reasons=reasons,
         diagnostics={
             "prototype_pool_size": len(prototype_pool_rows),
-            "shared_neighbor_pool": True,
+            "shared_neighbor_pool": False,
             "buy_summary": buy.utility,
             "sell_summary": sell.utility,
             "gate_ablation": {
