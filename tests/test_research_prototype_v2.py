@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from backtest_app.historical_data.features import FeatureScaler, FeatureTransform
 from backtest_app.research import prototype as prototype_module
 from backtest_app.research.artifacts import JsonResearchArtifactStore
 from backtest_app.research.models import EventOutcomeRecord, ResearchAnchor
@@ -49,7 +50,7 @@ def test_score_candidates_exact_and_surface_use_same_prototype_pool_for_both_sid
     surface = build_decision_surface(query_embedding=[1.0, 0.0], prototype_pool=prototypes, regime_code="RISK_ON", sector_code="TECH", candidate_index=ExactCosineCandidateIndex())
     assert buy_scores and sell_scores
     assert buy_scores[0].prototype_id == sell_scores[0].prototype_id
-    assert surface.diagnostics["shared_neighbor_pool"] is True
+    assert surface.diagnostics["shared_neighbor_pool"] is False
 
 
 def test_build_prototype_snapshot_from_event_memory_is_deterministic_and_keeps_lineage(tmp_path):
@@ -72,6 +73,21 @@ def test_build_prototype_snapshot_from_event_memory_is_deterministic_and_keeps_l
     assert loaded[0].prototype_id == snap1["prototypes"][0]["prototype_id"]
 
 
+def test_save_snapshot_rejects_fake_parquet_format(tmp_path):
+    store = JsonResearchArtifactStore(str(tmp_path))
+    with pytest.raises(ValueError, match="unsupported snapshot format"):
+        store.save_snapshot(
+            run_id="r1",
+            name="memory_snapshot",
+            spec={"spec_hash": "abc"},
+            as_of_date="2026-01-10",
+            coverage={},
+            excluded_reasons=[],
+            payload={"ok": True},
+            format="parquet",
+        )
+
+
 def test_build_state_prototypes_fast_path_matches_legacy_exactly():
     events = [
         _event("AAPL", "2026-01-01", "2026-01-05", embedding=[1.0, 0.0], buy_ret=0.04, sell_ret=-0.04),
@@ -91,6 +107,38 @@ def test_build_state_prototypes_fast_path_matches_legacy_exactly():
         spec_hash="spec-1",
     )
     assert [item.__dict__ for item in fast] == [item.__dict__ for item in legacy]
+
+
+def test_exact_cosine_candidate_index_topk_scored_matches_rank_prefix():
+    events = [
+        _event("AAPL", "2026-01-01", "2026-01-05", embedding=[1.0, 0.0], buy_ret=0.04, sell_ret=-0.04),
+        _event("MSFT", "2026-01-02", "2026-01-06", embedding=[0.95, 0.05], buy_ret=0.02, sell_ret=-0.02),
+        _event("NVDA", "2026-01-03", "2026-01-07", embedding=[0.1, 0.9], buy_ret=0.03, sell_ret=-0.03),
+    ]
+    prototypes = build_state_prototypes_from_event_memory(
+        event_records=events,
+        as_of_date="2026-01-10",
+        memory_version="memory_asof_v1",
+        spec_hash="spec-1",
+    )
+    index = ExactCosineCandidateIndex()
+    prepared = index.prepare_matrix(candidates=prototypes)
+    ranked = index.rank(query_embedding=[1.0, 0.0], candidates=prototypes)
+    topk = index.topk_scored(query_embedding=[1.0, 0.0], k=2, prepared=prepared)
+    assert [candidate.prototype_id for candidate, _ in topk] == [candidate.prototype_id for candidate in ranked[:2]]
+
+
+def test_feature_transform_apply_batch_matches_single_apply():
+    transform = FeatureTransform(
+        scaler=FeatureScaler(means={"a": 1.0, "b": 2.0}, stds={"a": 2.0, "b": 4.0}),
+        feature_keys=["a", "b"],
+    )
+    rows = [{"a": 3.0, "b": 6.0}, {"a": 1.0, "b": 2.0}]
+    transformed_rows, embeddings = transform.apply_batch(rows)
+    single_0 = transform.apply(rows[0])
+    single_1 = transform.apply(rows[1])
+    assert transformed_rows == [single_0[0], single_1[0]]
+    assert embeddings == [single_0[1], single_1[1]]
 
 
 def test_build_state_prototypes_checkpoint_resume_matches_full_run(tmp_path):

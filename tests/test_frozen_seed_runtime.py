@@ -408,9 +408,9 @@ def test_signal_panel_rows_from_cache_loads_snapshot_payloads_lazily_per_snapsho
     )
     monkeypatch.setattr(calibration_cache, "_snapshot_runtime_state", _fake_snapshot_runtime_state)
     monkeypatch.setattr(
-        calibration_cache,
-        "exact_block_prototype_topk",
-        lambda **kwargs: [
+        calibration_cache.ExactCosineCandidateIndex,
+        "topk_scored_block",
+        lambda self, **kwargs: [
             {
                 "BUY": {
                     "top_indices": [0],

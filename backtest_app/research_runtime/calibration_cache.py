@@ -33,6 +33,7 @@ from backtest_app.research.artifacts import (
     load_prototype_subset,
 )
 from backtest_app.research.models import DecisionSurface, DistributionEstimate, StatePrototype
+from backtest_app.research.repository import ExactCosineCandidateIndex
 from backtest_app.research.pipeline import (
     ProxySeriesResult,
     _chosen_side_payload,
@@ -48,7 +49,6 @@ from backtest_app.research.pre_optuna import build_pre_optuna_evidence
 from backtest_app.research.scoring import (
     CalibrationModel,
     build_decision_surface_from_ranked_candidates,
-    exact_block_prototype_topk,
 )
 from backtest_app.research_runtime import engine as research_engine
 from backtest_app.research_runtime.frozen_seed import (
@@ -607,6 +607,7 @@ def _snapshot_runtime_state(row: Mapping[str, Any]) -> dict[str, Any]:
             norms = np.linalg.norm(core_embeddings, axis=1, keepdims=True)
             norms = np.where(norms <= 1e-12, 1.0, norms)
             core_embeddings = core_embeddings / norms
+        candidate_index = ExactCosineCandidateIndex()
         return {
             "payload": payload,
             "artifact_store": store,
@@ -617,9 +618,16 @@ def _snapshot_runtime_state(row: Mapping[str, Any]) -> dict[str, Any]:
             "core_rows": core_rows,
             "core_embeddings": core_embeddings,
             "legacy_prototypes": prototypes,
+            "candidate_index": candidate_index,
+            "prepared_candidate_matrix": candidate_index.prepare_matrix(
+                candidates=core_rows,
+                embeddings=core_embeddings,
+            ) if len(core_rows) else None,
             "snapshot_core_load_ms": int((time.perf_counter() - started) * 1000),
         }
     core_rows = _snapshot_core_rows_from_handle(handle)
+    core_embeddings = handle.load_core_embeddings(mmap_mode="r")
+    candidate_index = ExactCosineCandidateIndex()
     return {
         "payload": payload,
         "artifact_store": store,
@@ -628,8 +636,13 @@ def _snapshot_runtime_state(row: Mapping[str, Any]) -> dict[str, Any]:
         "prototype_snapshot_manifest_path": prototype_manifest_path,
         "handle": handle,
         "core_rows": core_rows,
-        "core_embeddings": handle.load_core_embeddings(mmap_mode="r"),
+        "core_embeddings": core_embeddings,
         "legacy_prototypes": [],
+        "candidate_index": candidate_index,
+        "prepared_candidate_matrix": candidate_index.prepare_matrix(
+            candidates=core_rows,
+            embeddings=core_embeddings,
+        ) if len(core_rows) else None,
         "snapshot_core_load_ms": int((time.perf_counter() - started) * 1000),
     }
 
@@ -1111,31 +1124,24 @@ def _query_feature_block(
     transform: FeatureTransform,
 ) -> dict[str, Any]:
     feature_keys = list(transform.feature_keys or [])
-    feature_index = {key: idx for idx, key in enumerate(feature_keys)}
     raw_rows: list[dict[str, Any]] = []
     query_metas: list[dict[str, Any]] = []
-    matrix = np.zeros((len(rows), len(feature_keys)), dtype=np.float64)
     parse_started = time.perf_counter()
-    for row_index, row in enumerate(rows):
+    for row in rows:
         raw_features = dict(_json_loads(row.get("raw_features_json"), {}))
         query_meta = dict(_json_loads(row.get("query_meta_json"), {}))
         raw_rows.append(raw_features)
         query_metas.append(query_meta)
-        for key, value in raw_features.items():
-            feature_idx = feature_index.get(str(key))
-            if feature_idx is None:
-                continue
-            matrix[row_index, feature_idx] = _to_float(value)
     query_parse_ms = int((time.perf_counter() - parse_started) * 1000)
-    means = np.asarray([_to_float(transform.scaler.means.get(key), 0.0) for key in feature_keys], dtype=np.float64)
-    stds = np.asarray([_to_float(transform.scaler.stds.get(key), 1.0) for key in feature_keys], dtype=np.float64)
-    stds = np.where(np.abs(stds) <= 1e-12, 1.0, stds)
     transform_started = time.perf_counter()
-    transformed = (matrix - means) / stds if len(feature_keys) else matrix
+    transformed_rows, embeddings = transform.apply_batch(raw_rows)
+    transformed = np.asarray(embeddings, dtype=np.float64)
     query_transform_ms = int((time.perf_counter() - transform_started) * 1000)
     return {
         "raw_rows": raw_rows,
         "query_metas": query_metas,
+        "transformed_rows": transformed_rows,
+        "embeddings": embeddings,
         "transformed_matrix": transformed,
         "query_parse_ms": query_parse_ms,
         "query_transform_ms": query_transform_ms,
@@ -1282,6 +1288,17 @@ def _signal_panel_rows_from_cache(
         )
         if not core_rows:
             continue
+        candidate_index = snapshot_state.get("candidate_index")
+        if not isinstance(candidate_index, ExactCosineCandidateIndex):
+            candidate_index = ExactCosineCandidateIndex()
+        prepared_candidate_matrix = snapshot_state.get("prepared_candidate_matrix")
+        if prepared_candidate_matrix is None:
+            prepared_candidate_matrix = candidate_index.prepare_matrix(
+                candidates=core_rows,
+                embeddings=core_embeddings,
+            )
+            snapshot_state["prepared_candidate_matrix"] = prepared_candidate_matrix
+            snapshot_state["candidate_index"] = candidate_index
         metadata = dict(snapshot_payload.get("metadata") or {})
         quote_policy_calibration = dict(snapshot_payload.get("quote_policy_calibration") or {})
         ev_cfg = _ev_config_from_metadata(
@@ -1297,11 +1314,6 @@ def _signal_panel_rows_from_cache(
         )
         raw_event_row_count += _to_int(snapshot_payload.get("event_record_count"))
         prototype_count += len(core_rows)
-        prototype_regime_codes = [str(row.get("regime_code") or "") for row in core_rows]
-        prototype_sector_codes = [str(row.get("sector_code") or "") for row in core_rows]
-        prototype_side_stats = [dict(row.get("side_stats") or {}) for row in core_rows]
-        prototype_decayed_support = [_to_float(row.get("decayed_support")) for row in core_rows]
-        prototype_freshness_days = [_to_float(row.get("freshness_days")) for row in core_rows]
         subset_cache: dict[tuple[int, ...], list[StatePrototype]] = {}
         date_rows = list(by_date[decision_date])
         block_size = 256
@@ -1312,12 +1324,14 @@ def _signal_panel_rows_from_cache(
             query_parse_ms += int(query_block["query_parse_ms"])
             query_transform_ms += int(query_block["query_transform_ms"])
             transformed_matrix = np.asarray(query_block["transformed_matrix"], dtype=np.float64)
+            transformed_rows = list(query_block.get("transformed_rows") or [])
+            embeddings = list(query_block.get("embeddings") or [])
             query_metas = list(query_block["query_metas"])
             raw_rows = list(query_block["raw_rows"])
             score_started = time.perf_counter()
-            topk_results = exact_block_prototype_topk(
+            topk_results = candidate_index.topk_scored_block(
                 query_embeddings=transformed_matrix,
-                prototype_embeddings=core_embeddings,
+                prepared=prepared_candidate_matrix,
                 query_regime_codes=[
                     str((meta.get("regime_code") if isinstance(meta, Mapping) else None) or row.get("regime_code") or "UNKNOWN")
                     for meta, row in zip(query_metas, block_rows)
@@ -1326,22 +1340,16 @@ def _signal_panel_rows_from_cache(
                     str((meta.get("sector_code") if isinstance(meta, Mapping) else None) or row.get("sector_code") or "UNKNOWN")
                     for meta, row in zip(query_metas, block_rows)
                 ],
-                prototype_regime_codes=prototype_regime_codes,
-                prototype_sector_codes=prototype_sector_codes,
-                prototype_side_stats=prototype_side_stats,
-                prototype_decayed_support=prototype_decayed_support,
-                prototype_freshness_days=prototype_freshness_days,
-                cfg=ev_cfg,
+                prototype_retrieval_k=int(ev_cfg.prototype_retrieval_k),
+                use_kernel_weighting=bool(ev_cfg.use_kernel_weighting),
+                kernel_temperature=float(ev_cfg.kernel_temperature),
             )
             prototype_score_ms += int((time.perf_counter() - score_started) * 1000)
             for row_index, query_row in enumerate(block_rows):
                 query_meta = dict(query_metas[row_index] or {})
                 raw_features = dict(raw_rows[row_index] or {})
-                embedding = [float(value) for value in transformed_matrix[row_index].tolist()]
-                transformed_features = {
-                    key: float(transformed_matrix[row_index, feature_idx])
-                    for feature_idx, key in enumerate(query_block["feature_keys"])
-                }
+                embedding = list(embeddings[row_index] or [])
+                transformed_features = dict(transformed_rows[row_index] or {})
                 regime_code = str(query_meta.get("regime_code") or query_row.get("regime_code") or "UNKNOWN")
                 sector_code = str(query_meta.get("sector_code") or query_row.get("sector_code") or "UNKNOWN")
                 topk = dict(topk_results[row_index] or {})
