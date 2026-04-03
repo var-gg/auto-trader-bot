@@ -8,6 +8,7 @@ seaborn==0.13.2
 jupyter==1.1.1
 notebook==7.4.5
 pyarrow==21.0.0
+duckdb==1.4.1
 
 # Optional analytical helpers
 scipy==1.16.2

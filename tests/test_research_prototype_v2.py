@@ -62,7 +62,11 @@ def test_build_prototype_snapshot_from_event_memory_is_deterministic_and_keeps_l
     store = JsonResearchArtifactStore(str(tmp_path))
     manifest_path = store.save_prototype_snapshot(run_id="r1", as_of_date="2026-01-10", memory_version="memory_asof_v1", payload=snap1)
     assert Path(manifest_path).exists()
-    assert (Path(manifest_path).parent / "parts").exists()
+    snapshot_dir = Path(manifest_path).parent
+    assert (snapshot_dir / "core.parquet").exists()
+    assert (snapshot_dir / "core_embeddings.f64.npy").exists()
+    assert (snapshot_dir / "members.parquet").exists()
+    assert (snapshot_dir / "member_embeddings.f64.npy").exists()
     loaded = load_prototypes_asof(artifact_store=store, run_id="r1", as_of_date="2026-01-10", memory_version="memory_asof_v1")
     assert loaded
     assert loaded[0].prototype_id == snap1["prototypes"][0]["prototype_id"]

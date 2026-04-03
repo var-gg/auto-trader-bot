@@ -359,6 +359,7 @@ def _prepare_prototype_rows(
     as_of_date: str,
     progress_callback=None,
 ) -> dict[str, Any]:
+    prepare_started = monotonic()
     eligible_events = [event for event in event_records if not event.outcome_end_date or event.outcome_end_date < as_of_date]
     total = len(eligible_events)
     rows: list[dict[str, Any]] = []
@@ -372,9 +373,14 @@ def _prepare_prototype_rows(
                 "prototype_rows_done": 0,
                 "cluster_count": 0,
                 "current_symbol": "",
+                "prototype_prepare_ms": int((monotonic() - prepare_started) * 1000),
             },
         )
-        return {"rows": [], "row_normed_matrix": np.zeros((0, 0), dtype=np.float64)}
+        return {
+            "rows": [],
+            "row_normed_matrix": np.zeros((0, 0), dtype=np.float64),
+            "prototype_prepare_ms": int((monotonic() - prepare_started) * 1000),
+        }
     progress_every = max(1, min(500, total))
     last_progress_at = monotonic()
     _prototype_progress(
@@ -418,9 +424,14 @@ def _prepare_prototype_rows(
             "prototype_rows_done": total,
             "cluster_count": 0,
             "current_symbol": "",
+            "prototype_prepare_ms": int((monotonic() - prepare_started) * 1000),
         },
     )
-    return {"rows": rows, "row_normed_matrix": row_normed_matrix}
+    return {
+        "rows": rows,
+        "row_normed_matrix": row_normed_matrix,
+        "prototype_prepare_ms": int((monotonic() - prepare_started) * 1000),
+    }
 
 
 def _prototype_rows_dir(checkpoint_path: str | Path) -> Path:
