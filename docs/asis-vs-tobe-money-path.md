@@ -114,3 +114,39 @@ Baseline: `docs/runtime-replay-corpus.md` + `tests/replay_fixtures/*`
 - backtest runtime parity is excluded from live money-path classification
 - shared/domain planning seam is not treated as active live path unless production truth points to it
 - code presence alone is not sufficient to mark a path active
+
+## Research and TOBE runtime note
+
+The active live path above is still AS-IS money truth.
+TOBE research and pre-open runtime should be interpreted separately:
+
+- AS-IS signal snapshot:
+  - top-similarity driven
+  - live order path already uses ladder-shaped order intent through `order_plan` / `order_leg`
+- TOBE research baseline:
+  - frozen member-mixture evidence
+  - `pre_optuna_packet.json`
+  - proof reference run, usually `best1`
+- TOBE Optuna calibration layer:
+  - full mirrored tradable universe + full mirrored date range
+  - `build-query-feature-cache`
+  - `build-train-snapshots`
+  - `build-calibration-bundle`
+  - local PostgreSQL materialization in `bt_result.calibration_*`
+  - `build-study-cache`
+  - `optuna_replay_seed.parquet`
+  - `source_chunks.json`
+  - `coverage_summary.json`
+  - `study_cache/manifest.json`
+- TOBE daily runtime target:
+  - frozen library bundle + tuned `policy_params.json`
+  - `preopen_signal_snapshot.parquet`
+  - snapshot-driven buy ranking plus holding-wide sell repricing
+
+Operational meaning:
+
+- TOBE is still snapshot-based at the edge
+- the change is not “live recalculates everything intraday”
+- the change is “periodic calibration materializes query features, train snapshots, replay bars, and replay-only seed rows in local research storage, then exports study caches and pre-open snapshots so the edge path stays light”
+
+Therefore live adoption should happen through snapshot-contract promotion, not by embedding research discovery loops in the active live path.

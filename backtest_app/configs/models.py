@@ -63,11 +63,19 @@ class OptunaObjectiveConfig:
     lambda_no_trade_ratio: float = 0.15
     lambda_drawdown: float = 0.20
     allowed_drawdown: float = 0.15
+    lambda_idle_cash: float = 0.10
+    lambda_concentration: float = 0.10
+    concentration_cap: float = 0.35
+    min_trade_count: int = 5
+    min_sell_fill_count: int = 3
 
 
 @dataclass(frozen=True)
 class OptunaSearchConfig:
     experiment_id: str
+    mode: str = "generic"
+    snapshot_cadence: str = "monthly"
+    model_version: str = "monthly_snapshot_v1"
     n_trials: int = 10
     seed: int = 42
     discovery_start_date: str = ""
@@ -76,6 +84,13 @@ class OptunaSearchConfig:
     holdout_end_date: str = ""
     pruner: str = "median"
     retry_failed_trials: int = 1
+    seed_artifact_root: str = ""
+    policy_scope: str = "directional_wide_only"
+    seed_profile: str = "calibration_universe_v1"
+    seed_filter: str = ""
+    objective_metric: str = "final_equity"
+    warm_start: bool = True
+    warm_start_trials: List[Dict[str, object]] = field(default_factory=list)
     search_space: Dict[str, Dict[str, object]] = field(default_factory=dict)
     constraints: OptunaConstraintConfig = field(default_factory=OptunaConstraintConfig)
     objective: OptunaObjectiveConfig = field(default_factory=OptunaObjectiveConfig)
