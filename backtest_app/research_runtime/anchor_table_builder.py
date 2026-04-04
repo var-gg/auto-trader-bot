@@ -452,16 +452,24 @@ def build_anchor_table(
 
             # Bulk insert batch via COPY
             if batch_rows:
+                # Column order: symbol(0), anchor_date(1), market(2), sector_code(3),
+                # anchor_open(4), sim_vector(5), sim_vector_version(6),
+                # candle_shape(7), return_series(8), macro_snapshot(9), tech_indicators(10),
+                # future_high(11), future_low(12), future_close(13), future_bar_count(14), is_valid(15)
+                SIM_VECTOR_COL = 5  # sim_vector is pgvector type → [x,y,z] format
                 buf = io.StringIO()
                 for row in batch_rows:
                     fields = []
-                    for val in row:
+                    for col_idx, val in enumerate(row):
                         if val is None:
                             fields.append("\\N")
                         elif isinstance(val, bool):
                             fields.append("t" if val else "f")
                         elif isinstance(val, list):
-                            fields.append("{" + ",".join(str(v) for v in val) + "}")
+                            if col_idx == SIM_VECTOR_COL:
+                                fields.append("[" + ",".join(str(v) for v in val) + "]")
+                            else:
+                                fields.append("{" + ",".join(str(v) for v in val) + "}")
                         else:
                             fields.append(str(val))
                     buf.write("\t".join(fields) + "\n")

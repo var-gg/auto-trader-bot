@@ -6,6 +6,8 @@
 |---|------|------|------|-------------|------|
 | 000 | 2026-04-04 | baseline (고정 오프셋) | done | 0.893 | Optuna 32t, trial#8 유일 feasible |
 | 001 | 2026-04-05 | 분포 기반 지정가 v1 (앵커 테이블) | **done** | **1.0796** | 64/64 feasible, FLAG C+D 채택 |
+| 002 | 2026-04-05 | KR 적재 + US/KR 비교 | done | 1.0941(통합) | US+8.5%, KR+12.3%, KR only best |
+| 003 | 2026-04-05 | 매수 후보 스코어 + 사다리 + US/KR 분리자본 | **done** | **1.0930** | 합산+9.3%, 승률59.2%, 모든 연도 양수 |
 
 ## Idea Backlog (TODO)
 
@@ -121,3 +123,60 @@
 - FLAG A,B 제거 + C,D 고정 후 나머지 파라미터만 128 trials 추가 탐색
 - 전체 test set(100%)으로 best params 검증 (현재는 20% 샘플)
 - 아키텍처: candle_shape 벡터 구성 변경 실험 (현재 4feature×10일 = 40dim)
+
+---
+
+## EXP-003: 매수 후보 스코어 + 사다리 + US/KR 분리자본
+
+### 변경 사항
+1. FLAG A,B 제거(하드코딩 OFF), C,D 고정(하드코딩 ON) — EXP-001 결론 흡수
+2. US/KR 별도 자본 (US $6,667 ≈ ₩1000만, KR ₩1000만)
+3. 복합 매수 후보 스코어: w_profit×기대수익 + w_sim×유사도 + w_ess×ESS - w_width×분포폭
+4. FLAG E: min_buy_score 게이팅
+5. FLAG F: 사다리 매수 (2~3단계, spread 0.005~0.03)
+6. kr_search_pool: KR_ONLY vs ALL
+7. yearly_returns 버그 수정: 거래평균 → equity 스냅샷 기반 포트폴리오 연간 수익률
+
+### 결과 (64t, 62/64 feasible)
+
+```
+=== Best (t4, combined +9.3%, 승률 59.2%, 667건) ===
+
+US  $6,667 → ~$7,117  +6.8%
+    연도별: 2024 +5.1%  2025 +2.4%  2026 +5.0%
+
+KR  ₩10,000,000 → ~₩11,184,000  +11.8%
+    연도별: 2024 +2.8%  2025 +2.6%  2026 +23.4%
+
+합산 ₩20,000,000 → ~₩21,860,000  +9.3%
+모든 시장, 모든 연도 양수 수익.
+```
+
+### Best 파라미터
+```json
+{
+  "top_k": 45, "min_similarity": 0.9, "temperature": 14.0,
+  "max_holding_days": 5, "max_new_buys": 6, "per_name_cap_fraction": 0.3,
+  "buy_dist_blend": 0.2, "sell_dist_blend": 0.2, "fallback_min_sell_markup": 0.008,
+  "sell_skew_floor": 0.5, "sell_skew_ceil": 2.0, "sell_unc_weight": 1.9,
+  "w_profit": 1.0, "w_sim": 2.0, "w_ess_score": 0.5, "w_width_penalty": 0.5,
+  "min_buy_score": 0.0,
+  "use_ladder_buy": true, "ladder_leg_count": 2, "ladder_spread": 0.01,
+  "kr_search_pool": "ALL"
+}
+```
+
+### FLAG/옵션 분석
+
+| FLAG | ON 평균 | OFF 평균 | 판정 |
+|------|---------|---------|------|
+| F: 사다리 매수 | **1.048 (44)** | 1.040 (18) | 약간 우위, 추가 검증 필요 |
+| KR 풀 | KR_ONLY 1.046 | ALL 1.044 | 거의 동일, best는 ALL |
+
+### 결론
+
+**흡수**: 복합 스코어(w_sim=2.0 유사도 중시), 사다리 매수, kr_search_pool=ALL
+**주요 발견**:
+- 유사도 가중(w_sim=2.0)이 기대수익보다 중요 → "확실한 유사 패턴"에 집중이 수익적
+- 모든 연도 양수는 전략 안정성 확인
+- KR 2026 +23.4%는 표본 작아서 과적합 가능성 주의
