@@ -12,8 +12,10 @@ from statistics import mean, pstdev
 from time import perf_counter
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
+import duckdb
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from backtest_app.configs.models import ResearchExperimentSpec
@@ -1547,6 +1549,16 @@ def _event_raw_cache_manifest_path(*, output_dir: str, run_id: str) -> Path:
     return _event_raw_cache_dir(output_dir=output_dir, run_id=run_id) / "manifest.json"
 
 
+def _event_payload_fields(event: EventOutcomeRecord) -> dict[str, Any]:
+    return {
+        "event_path_summary": dict(event.path_summary),
+        "event_path_label": str(event.path_label),
+        "event_side_payload": dict(getattr(event, "side_payload", {}) or {}),
+        "event_diagnostics": dict(event.diagnostics),
+        "event_quality_score": float(event.quality_score),
+    }
+
+
 def _event_cache_storage_row(
     *,
     event_ordinal: int,
@@ -1617,12 +1629,10 @@ def _event_cache_stage_row(
     raw_features: Mapping[str, float],
     **kwargs: Any,
 ) -> dict[str, Any]:
-    payload = _event_cache_storage_row(
+    return _event_cache_storage_row(
         present_feature_keys=sorted(str(key) for key in dict(raw_features or {}).keys()),
         **kwargs,
     )
-    payload["raw_features_json"] = _json_dumps(dict(raw_features or {}))
-    return payload
 
 
 def _event_cache_row_from_storage(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -1678,17 +1688,8 @@ def build_event_raw_cache(
                 child.rmdir()
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_started = perf_counter()
-    prep_result = _prepare_event_candidate_refs(
-        decision_date=decision_date,
-        spec=spec,
-        bars_by_symbol=bars_by_symbol,
-        sector_map=sector_map,
-        lookback_bars=lookback_bars,
-        session_metadata_by_symbol=session_metadata_by_symbol,
-        progress_callback=progress_callback,
-    )
-    candidate_refs = list(prep_result["candidate_refs"])
-    row_count = len(candidate_refs)
+    min_required_bars = max(lookback_bars, spec.feature_window_bars)
+    label_cfg = _label_cfg(spec)
     use_macro_level_in_similarity = _feature_flag("use_macro_level_in_similarity", metadata, default=False)
     use_dollar_volume_absolute = _feature_flag("use_dollar_volume_absolute", metadata, default=False)
     bar_anchor_dts_by_symbol = _build_bar_anchor_timestamp_cache(
@@ -1709,11 +1710,20 @@ def build_event_raw_cache(
     market_proxy_cache: Dict[tuple[str, str], ProxySeriesResult] = {}
     sector_proxy_cache: Dict[tuple[str, str], ProxySeriesResult] = {}
     feature_key_set: set[str] = set()
-    outcome_end_dates: list[str] = [""] * row_count
-    progress_every = max(1, min(1000, row_count or 1))
+    excluded_reasons: list[dict[str, Any]] = []
+    symbol_count = len(bars_by_symbol)
+    symbol_progress_every = max(1, min(25, symbol_count or 1))
+    progress_every = 1000
     last_progress_at = perf_counter()
+    stage_rows_buffer: list[dict[str, Any]] = []
+    raw_feature_rows_buffer: list[dict[str, Any]] = []
+    event_rows_written = 0
+    raw_feature_batch_index = 0
+    raw_feature_batch_dir = cache_dir / "_raw_feature_batches"
+    stage_events_path = cache_dir / "events_stage.parquet"
+    stage_writer: pq.ParquetWriter | None = None
 
-    def _emit_cache_progress(*, done: int, current_symbol: str = "", current_event_date: str = "", status: str = "running") -> None:
+    def _emit_cache_progress(*, done: int, total: int | None = None, current_symbol: str = "", current_event_date: str = "", status: str = "running") -> None:
         if progress_callback is None:
             return
         progress_callback(
@@ -1724,22 +1734,60 @@ def build_event_raw_cache(
                 "symbols_total": len(bars_by_symbol),
                 "current_symbol": current_symbol,
                 "current_event_date": current_event_date,
-                "event_candidate_total": row_count,
+                "event_candidate_total": int(total if total is not None else done),
                 "event_candidate_done": int(done),
                 "raw_event_row_count": int(done),
                 "pending_record_count": int(done),
             }
         )
 
-    def _iter_event_rows() -> Iterable[dict[str, Any]]:
-        nonlocal last_progress_at
-        for event_ordinal, candidate in enumerate(candidate_refs):
-            symbol = str(candidate["symbol"])
-            feature_end_date = str(candidate["feature_end_date"])
-            history_start_idx = int(candidate["history_start_idx"])
-            feature_end_idx = int(candidate["feature_end_idx"])
-            history_window = bars_by_symbol[symbol][history_start_idx : feature_end_idx + 1]
-            anchor_fields = dict(candidate.get("anchor_fields") or {})
+    def _flush_stage_buffers() -> None:
+        nonlocal stage_writer, event_rows_written, raw_feature_batch_index
+        if not stage_rows_buffer:
+            return
+        frame = pd.DataFrame(stage_rows_buffer)
+        table = pa.Table.from_pandas(frame, preserve_index=False)
+        if stage_writer is None:
+            stage_writer = pq.ParquetWriter(stage_events_path, table.schema)
+        stage_writer.write_table(table)
+        event_rows_written += len(stage_rows_buffer)
+        raw_feature_batch_dir.mkdir(parents=True, exist_ok=True)
+        _write_pickle_atomic(
+            raw_feature_batch_dir / f"batch_{raw_feature_batch_index:06d}.pkl",
+            list(raw_feature_rows_buffer),
+        )
+        raw_feature_batch_index += 1
+        stage_rows_buffer.clear()
+        raw_feature_rows_buffer.clear()
+
+    event_ordinal = 0
+    for lib_idx, (lib_symbol, lib_bars) in enumerate(bars_by_symbol.items(), start=1):
+        session_metadata = _resolve_session_metadata(lib_symbol, session_metadata_by_symbol)
+        if session_metadata_by_symbol and session_metadata is None:
+            excluded_reasons.append(
+                {"symbol": lib_symbol, "reason": "unknown_exchange_session", "missingness_family": "data_quality_missing"}
+            )
+            continue
+        if len(lib_bars) < min_required_bars + spec.horizon_days + 2:
+            excluded_reasons.append(
+                {"symbol": lib_symbol, "reason": "insufficient_bars", "missingness_family": "structural_missing"}
+            )
+            continue
+        lib_sector = sector_map.get(lib_symbol)
+        for j in range(min_required_bars - 1, len(lib_bars) - spec.horizon_days - 1):
+            feature_end_date = str(lib_bars[j].timestamp)[:10]
+            outcome_end_date = str(lib_bars[j + spec.horizon_days].timestamp)[:10]
+            if feature_end_date > decision_date:
+                break
+            if outcome_end_date >= decision_date:
+                break
+            history_window = lib_bars[j - spec.feature_window_bars + 1 : j + 1]
+            future_window = lib_bars[j + 1 : j + 1 + spec.horizon_days]
+            anchor_fields = _anchor_fields_for_symbol_date(
+                symbol=lib_symbol,
+                session_date_local=feature_end_date,
+                session_metadata_by_symbol=session_metadata_by_symbol,
+            )
             macro_window, latest_macro_by_series, macro_asof_ts_utc = _resolve_cached_macro_history_until_anchor(
                 macro_history_cache=macro_history_cache,
                 macro_history_by_date=macro_history_by_date,
@@ -1748,12 +1796,13 @@ def build_event_raw_cache(
                 fallback_cutoff_date=feature_end_date,
             )
             macro_payload = _latest_macro_payload(macro_window)
-            proxy_key = (symbol, feature_end_date)
+            event = build_event_outcome_record(future_window, label_cfg)
+            proxy_key = (lib_symbol, feature_end_date)
             if proxy_cache is not None:
                 market_proxy = market_proxy_cache.get(proxy_key)
                 if market_proxy is None:
                     market_proxy = _cached_market_proxy_series(
-                        symbol=symbol,
+                        symbol=lib_symbol,
                         history_window=history_window,
                         cutoff_date=feature_end_date,
                         proxy_cache=proxy_cache,
@@ -1763,7 +1812,7 @@ def build_event_raw_cache(
                 sector_proxy = sector_proxy_cache.get(proxy_key)
                 if sector_proxy is None:
                     sector_proxy = _cached_sector_proxy_series(
-                        symbol=symbol,
+                        symbol=lib_symbol,
                         history_window=history_window,
                         cutoff_date=feature_end_date,
                         sector_map=sector_map,
@@ -1775,12 +1824,12 @@ def build_event_raw_cache(
                 market_proxy = _market_proxy_series(
                     bars_by_symbol,
                     cutoff_date=feature_end_date,
-                    focus_symbol=symbol,
+                    focus_symbol=lib_symbol,
                     session_metadata_by_symbol=session_metadata_by_symbol,
                     cutoff_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
                 )
                 sector_proxy = _sector_proxy_series(
-                    symbol,
+                    lib_symbol,
                     bars_by_symbol,
                     sector_map,
                     cutoff_date=feature_end_date,
@@ -1788,19 +1837,16 @@ def build_event_raw_cache(
                     cutoff_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
                 )
             freshness_key = (
-                symbol,
-                str(
-                    candidate.get("macro_key")
-                    or _macro_cache_key(
-                        feature_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
-                        fallback_cutoff_date=feature_end_date,
-                    )
+                lib_symbol,
+                _macro_cache_key(
+                    feature_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
+                    fallback_cutoff_date=feature_end_date,
                 ),
             )
             macro_freshness = macro_freshness_cache.get(freshness_key)
             if macro_freshness is None:
                 macro_freshness = _macro_freshness_payload(
-                    symbol=symbol,
+                    symbol=lib_symbol,
                     bars_by_symbol=bars_by_symbol,
                     latest_macro_by_series=latest_macro_by_series,
                     feature_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
@@ -1811,12 +1857,12 @@ def build_event_raw_cache(
             macro_freshness_features, macro_freshness_summary = macro_freshness
             breadth_diagnostics = _breadth_diagnostics_payload(latest_macro_by_series)
             raw_payload = build_raw_multiscale_feature_payload(
-                symbol=symbol,
+                symbol=lib_symbol,
                 bars=history_window,
                 market_bars=market_proxy.bars,
                 sector_bars=sector_proxy.bars,
                 macro_history=macro_window,
-                sector_code=candidate.get("lib_sector"),
+                sector_code=lib_sector,
                 shape_horizons=list((spec.lookback_horizons if spec.lookback_horizons else [spec.horizon_days]) or []),
                 use_macro_level_in_similarity=use_macro_level_in_similarity,
                 use_dollar_volume_absolute=use_dollar_volume_absolute,
@@ -1833,54 +1879,86 @@ def build_event_raw_cache(
             regime_code = _regime_from_context_features(raw_payload.normalized_regime_context_features)
             regime_code_raw_macro = _regime_from_macro_raw(macro_payload)
             feature_key_set.update(str(key) for key in raw_payload.raw_features.keys())
-            outcome_end_dates[event_ordinal] = str(candidate["outcome_end_date"])
+            stage_rows_buffer.append(
+                _event_cache_stage_row(
+                    event_ordinal=event_ordinal,
+                    symbol=lib_symbol,
+                    feature_end_date=feature_end_date,
+                    outcome_end_date=outcome_end_date,
+                    lib_sector=lib_sector,
+                    regime_code=regime_code,
+                    regime_code_raw_macro=regime_code_raw_macro,
+                    regime_inputs_summary=regime_inputs_summary,
+                    macro_history_length=len(macro_window),
+                    macro_series_present_count=_count_present_similarity_macro_series(latest_macro_by_series),
+                    raw_features=raw_payload.raw_features,
+                    shape_keys=sorted(list(raw_payload.shape_features.keys()) + list(raw_payload.residual_features.keys())),
+                    ctx_keys=sorted(raw_payload.context_features.keys()),
+                    raw_regime_context_features=raw_payload.regime_context_features,
+                    normalized_regime_context_features=raw_payload.normalized_regime_context_features,
+                    proxy_diagnostics=raw_payload.metadata.get("proxy_diagnostics", {}),
+                    raw_zero_default_keys=raw_payload.metadata.get("raw_zero_default_keys", []),
+                    liquidity_score=max(
+                        0.0,
+                        min(1.0, compute_bar_features(history_window).get("volume_mean", 0.0) / 1_000_000.0),
+                    ),
+                    anchor_fields=anchor_fields,
+                    macro_asof_ts_utc=macro_asof_ts_utc,
+                    macro_freshness_summary=macro_freshness_summary,
+                    breadth_policy=breadth_diagnostics.get("breadth_policy"),
+                    breadth_present=bool(breadth_diagnostics.get("breadth_present")),
+                    breadth_missing_reason=breadth_diagnostics.get("breadth_missing_reason"),
+                    **_event_payload_fields(event),
+                )
+            )
+            raw_feature_rows_buffer.append(
+                {
+                    "event_ordinal": int(event_ordinal),
+                    "raw_features": {str(key): float(value or 0.0) for key, value in raw_payload.raw_features.items()},
+                }
+            )
+            event_ordinal += 1
             now = perf_counter()
-            done = event_ordinal + 1
-            if done == 1 or done == row_count or done % progress_every == 0 or (now - last_progress_at) >= 10.0:
+            if event_ordinal == 1 or event_ordinal % progress_every == 0 or (now - last_progress_at) >= 10.0:
                 _emit_cache_progress(
-                    done=done,
-                    current_symbol=symbol,
+                    done=event_ordinal,
+                    current_symbol=lib_symbol,
                     current_event_date=feature_end_date,
                     status="running",
                 )
                 last_progress_at = now
-            yield _event_cache_stage_row(
-                event_ordinal=event_ordinal,
-                symbol=symbol,
-                feature_end_date=feature_end_date,
-                outcome_end_date=str(candidate["outcome_end_date"]),
-                lib_sector=candidate.get("lib_sector"),
-                regime_code=regime_code,
-                regime_code_raw_macro=regime_code_raw_macro,
-                regime_inputs_summary=regime_inputs_summary,
-                macro_history_length=len(macro_window),
-                macro_series_present_count=_count_present_similarity_macro_series(latest_macro_by_series),
-                raw_features=raw_payload.raw_features,
-                shape_keys=sorted(list(raw_payload.shape_features.keys()) + list(raw_payload.residual_features.keys())),
-                ctx_keys=sorted(raw_payload.context_features.keys()),
-                raw_regime_context_features=raw_payload.regime_context_features,
-                normalized_regime_context_features=raw_payload.normalized_regime_context_features,
-                proxy_diagnostics=raw_payload.metadata.get("proxy_diagnostics", {}),
-                raw_zero_default_keys=raw_payload.metadata.get("raw_zero_default_keys", []),
-                liquidity_score=max(
-                    0.0,
-                    min(1.0, compute_bar_features(history_window).get("volume_mean", 0.0) / 1_000_000.0),
-                ),
-                anchor_fields=anchor_fields,
-                macro_asof_ts_utc=macro_asof_ts_utc,
-                macro_freshness_summary=macro_freshness_summary,
-                breadth_policy=breadth_diagnostics.get("breadth_policy"),
-                breadth_present=bool(breadth_diagnostics.get("breadth_present")),
-                breadth_missing_reason=breadth_diagnostics.get("breadth_missing_reason"),
-                event_path_summary=dict(candidate["event"].path_summary),
-                event_path_label=str(candidate["event"].path_label),
-                event_side_payload=dict(candidate["event"].side_payload),
-                event_diagnostics=dict(candidate["event"].diagnostics),
-                event_quality_score=float(candidate["event"].quality_score),
+            if len(stage_rows_buffer) >= 500:
+                _flush_stage_buffers()
+        now = perf_counter()
+        if (
+            lib_idx == symbol_count
+            or lib_idx == 1
+            or lib_idx % symbol_progress_every == 0
+            or (now - last_progress_at) >= 10.0
+        ):
+            _emit_cache_progress(
+                done=event_ordinal,
+                current_symbol=lib_symbol,
+                current_event_date="",
+                status="running",
             )
-
-    stage_events_path = cache_dir / "events_stage.parquet"
-    event_rows_written, _ = _append_parquet_batches(stage_events_path, _iter_event_rows(), batch_size=500)
+            last_progress_at = now
+        # Release per-symbol proxy/freshness caches after each symbol.
+        # Keys are (symbol, date) and are never reused across symbols,
+        # so holding them leaks memory linearly with symbols processed.
+        market_proxy_cache.clear()
+        sector_proxy_cache.clear()
+        macro_freshness_cache.clear()
+    _flush_stage_buffers()
+    if stage_writer is not None:
+        stage_writer.close()
+    row_count = int(event_rows_written)
+    if not stage_events_path.exists():
+        empty_table = pa.Table.from_pandas(
+            pd.DataFrame(columns=["event_ordinal", "outcome_end_date", "present_feature_keys_json"]),
+            preserve_index=False,
+        )
+        pq.write_table(empty_table, stage_events_path)
     feature_keys = tuple(sorted(feature_key_set))
     feature_index = {key: idx for idx, key in enumerate(feature_keys)}
     raw_features_path = cache_dir / "raw_features.f64.npy"
@@ -1889,61 +1967,35 @@ def build_event_raw_cache(
         dtype=np.float64,
         shape=(row_count, len(feature_keys)),
     )
-    present_matrix_path = cache_dir / "present_matrix.i1.npy"
-    present_matrix, present_tmp_path, present_final_path = _open_numpy_memmap_atomic(
-        present_matrix_path,
-        dtype=np.int8,
-        shape=(row_count, len(feature_keys)),
-    )
-    stage_event_file = pq.ParquetFile(stage_events_path)
     rows_filled = 0
     last_matrix_progress_at = perf_counter()
-    for batch in stage_event_file.iter_batches(columns=["event_ordinal", "raw_features_json"], batch_size=1000):
-        batch_payload = batch.to_pydict()
-        ordinals = list(batch_payload.get("event_ordinal") or [])
-        raw_json_rows = list(batch_payload.get("raw_features_json") or [])
-        for raw_event_ordinal, raw_json in zip(ordinals, raw_json_rows):
-            row_index = int(raw_event_ordinal)
-            raw_features = dict(_json_loads(raw_json, {}))
+    raw_batch_paths = sorted(raw_feature_batch_dir.glob("batch_*.pkl"))
+    for raw_batch_path in raw_batch_paths:
+        raw_batch_rows = list(_load_pickle_payload(raw_batch_path) or [])
+        for raw_row in raw_batch_rows:
+            row_index = int(raw_row.get("event_ordinal") or 0)
+            raw_features = dict(raw_row.get("raw_features") or {})
             for key, value in raw_features.items():
-                feature_idx = feature_index[str(key)]
+                feature_idx = feature_index.get(str(key))
+                if feature_idx is None:
+                    continue
                 raw_matrix[row_index, feature_idx] = float(value or 0.0)
-                present_matrix[row_index, feature_idx] = 1
             rows_filled += 1
         now = perf_counter()
         if rows_filled == row_count or rows_filled % 5000 == 0 or (now - last_matrix_progress_at) >= 10.0:
-            _emit_cache_progress(done=rows_filled, status="running")
+            _emit_cache_progress(done=rows_filled, total=row_count, status="running")
             last_matrix_progress_at = now
-    del stage_event_file
-    events_path = cache_dir / "events.parquet"
-
-    def _iter_final_event_rows() -> Iterable[dict[str, Any]]:
-        final_file = pq.ParquetFile(stage_events_path)
-        try:
-            for batch in final_file.iter_batches(batch_size=1000):
-                batch_payload = batch.to_pydict()
-                row_count_in_batch = len(list(batch_payload.get("event_ordinal") or []))
-                for row_index in range(row_count_in_batch):
-                    row_payload = {
-                        key: values[row_index]
-                        for key, values in batch_payload.items()
-                        if key != "raw_features_json"
-                    }
-                    yield row_payload
-        finally:
-            del final_file
-
-    _, _ = _append_parquet_batches(events_path, _iter_final_event_rows(), batch_size=1000)
     raw_matrix_path_str = _finalize_numpy_memmap_atomic(raw_matrix, raw_tmp_path, raw_final_path)
-    present_matrix_path_str = _finalize_numpy_memmap_atomic(present_matrix, present_tmp_path, present_final_path)
     raw_matrix = np.load(raw_matrix_path_str, mmap_mode="r")
-    present_matrix = np.load(present_matrix_path_str, mmap_mode="r")
-    outcome_order = sorted(range(row_count), key=lambda idx: (str(outcome_end_dates[idx] or ""), idx))
     prefix_event_ids_path = cache_dir / "prefix_event_ids.npy"
-    _write_numpy_atomic(prefix_event_ids_path, np.asarray(outcome_order, dtype=np.int64))
     prefix_sum_path = cache_dir / "prefix_sum.f64.npy"
     prefix_sumsq_path = cache_dir / "prefix_sumsq.f64.npy"
     prefix_present_count_path = cache_dir / "prefix_present_count.i64.npy"
+    prefix_event_ids, prefix_event_ids_tmp_path, prefix_event_ids_final_path = _open_numpy_memmap_atomic(
+        prefix_event_ids_path,
+        dtype=np.int64,
+        shape=(row_count,),
+    )
     prefix_sum, prefix_sum_tmp_path, prefix_sum_final_path = _open_numpy_memmap_atomic(
         prefix_sum_path,
         dtype=np.float64,
@@ -1963,19 +2015,45 @@ def build_event_raw_cache(
     running_sumsq = np.zeros((len(feature_keys),), dtype=np.float64)
     running_present = np.zeros((len(feature_keys),), dtype=np.int64)
     last_prefix_progress_at = perf_counter()
-    for prefix_index, row_index in enumerate(outcome_order, start=1):
-        row_values = np.asarray(raw_matrix[row_index], dtype=np.float64)
-        present_values = np.asarray(present_matrix[row_index], dtype=np.int64)
-        running_sum += row_values
-        running_sumsq += np.square(row_values)
-        running_present += present_values
-        prefix_sum[prefix_index - 1] = running_sum
-        prefix_sumsq[prefix_index - 1] = running_sumsq
-        prefix_present_count[prefix_index - 1] = running_present
-        now = perf_counter()
-        if prefix_index == row_count or prefix_index % 5000 == 0 or (now - last_prefix_progress_at) >= 10.0:
-            _emit_cache_progress(done=prefix_index, status="running")
-            last_prefix_progress_at = now
+    con = duckdb.connect()
+    try:
+        reader = con.execute(
+            "SELECT event_ordinal, present_feature_keys_json FROM read_parquet(?) ORDER BY outcome_end_date, event_ordinal",
+            [str(stage_events_path)],
+        ).fetch_record_batch(1000)
+        prefix_index = 0
+        while True:
+            try:
+                batch = reader.read_next_batch()
+            except StopIteration:
+                break
+            ordinals = list(batch.column(0).to_pylist()) if batch.num_columns >= 1 else []
+            present_keys_json = list(batch.column(1).to_pylist()) if batch.num_columns >= 2 else []
+            for raw_event_ordinal, raw_present_keys in zip(ordinals, present_keys_json):
+                row_index = int(raw_event_ordinal)
+                row_values = np.asarray(raw_matrix[row_index], dtype=np.float64)
+                running_sum += row_values
+                running_sumsq += np.square(row_values)
+                for key in _json_loads(raw_present_keys, []):
+                    feature_idx = feature_index.get(str(key))
+                    if feature_idx is not None:
+                        running_present[feature_idx] += 1
+                prefix_event_ids[prefix_index] = row_index
+                prefix_sum[prefix_index] = running_sum
+                prefix_sumsq[prefix_index] = running_sumsq
+                prefix_present_count[prefix_index] = running_present
+                prefix_index += 1
+                now = perf_counter()
+                if prefix_index == row_count or prefix_index % 5000 == 0 or (now - last_prefix_progress_at) >= 10.0:
+                    _emit_cache_progress(done=prefix_index, total=row_count, status="running")
+                    last_prefix_progress_at = now
+    finally:
+        con.close()
+    prefix_event_ids_path_str = _finalize_numpy_memmap_atomic(
+        prefix_event_ids,
+        prefix_event_ids_tmp_path,
+        prefix_event_ids_final_path,
+    )
     prefix_sum_path_str = _finalize_numpy_memmap_atomic(prefix_sum, prefix_sum_tmp_path, prefix_sum_final_path)
     prefix_sumsq_path_str = _finalize_numpy_memmap_atomic(prefix_sumsq, prefix_sumsq_tmp_path, prefix_sumsq_final_path)
     prefix_present_count_path_str = _finalize_numpy_memmap_atomic(
@@ -1984,9 +2062,14 @@ def build_event_raw_cache(
         prefix_present_final_path,
     )
     del raw_matrix
-    del present_matrix
-    Path(present_matrix_path_str).unlink(missing_ok=True)
-    stage_events_path.unlink(missing_ok=True)
+    events_path = cache_dir / "events.parquet"
+    if events_path.exists():
+        events_path.unlink()
+    stage_events_path.replace(events_path)
+    for raw_batch_path in raw_batch_paths:
+        raw_batch_path.unlink(missing_ok=True)
+    if raw_feature_batch_dir.exists():
+        raw_feature_batch_dir.rmdir()
     manifest = {
         "format_version": "event_raw_cache_v2",
         "schema_version": "event_raw_cache_row_v2",
@@ -2004,13 +2087,13 @@ def build_event_raw_cache(
         "build_ms": int((perf_counter() - cache_started) * 1000),
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    _emit_cache_progress(done=int(event_rows_written), status="ok")
+    _emit_cache_progress(done=int(event_rows_written), total=int(event_rows_written), status="ok")
     return EventRawCacheHandle(
         format_version="event_raw_cache_v2",
         manifest_path=str(manifest_path),
         events_path=str(events_path),
         raw_features_path=str(raw_matrix_path_str),
-        prefix_event_ids_path=str(prefix_event_ids_path),
+        prefix_event_ids_path=str(prefix_event_ids_path_str),
         prefix_sum_path=str(prefix_sum_path_str),
         prefix_sumsq_path=str(prefix_sumsq_path_str),
         prefix_present_count_path=str(prefix_present_count_path_str),
@@ -2072,23 +2155,21 @@ def _feature_transform_from_prefix_stats(
             feature_keys=[],
             version=FEATURE_TRANSFORM_VERSION,
         )
-    prefix_present_count = event_cache_handle.load_prefix_present_count(mmap_mode="r")
     prefix_event_ids = event_cache_handle.load_prefix_event_ids(mmap_mode="r")
-    raw_features = event_cache_handle.load_raw_features(mmap_mode="r")
-    present = np.asarray(prefix_present_count[count - 1], dtype=np.int64)
-    eligible_row_ids = np.asarray(prefix_event_ids[:count], dtype=np.int64)
-    resolved_feature_keys = [
-        str(event_cache_handle.feature_keys[idx])
-        for idx in range(len(event_cache_handle.feature_keys))
-        if int(present[idx]) > 0
-    ]
+    prefix_present_count = event_cache_handle.load_prefix_present_count(mmap_mode="r")
+    raw_feature_matrix = event_cache_handle.load_raw_features(mmap_mode="r")
+    eligible_event_ids = [int(value) for value in np.asarray(prefix_event_ids[:count], dtype=np.int64).tolist()]
+    present_counts = np.asarray(prefix_present_count[count - 1], dtype=np.int64)
     means: dict[str, float] = {}
     stds: dict[str, float] = {}
-    for key in resolved_feature_keys:
-        feature_idx = event_cache_handle.feature_index[key]
-        values = [float(value) for value in np.asarray(raw_features[eligible_row_ids, feature_idx], dtype=np.float64)]
-        means[key] = mean(values) if values else 0.0
-        stds[key] = max(1e-8, pstdev(values) if len(values) > 1 else 1.0)
+    resolved_feature_keys: list[str] = []
+    for feature_idx, key in enumerate(event_cache_handle.feature_keys):
+        if feature_idx >= len(present_counts) or int(present_counts[feature_idx]) <= 0:
+            continue
+        values = [float(raw_feature_matrix[event_id, feature_idx]) for event_id in eligible_event_ids]
+        resolved_feature_keys.append(str(key))
+        means[str(key)] = mean(values)
+        stds[str(key)] = max(1e-8, pstdev(values) if len(values) > 1 else 1.0)
     return FeatureTransform(
         scaler=FeatureScaler(means=means, stds=stds),
         feature_keys=resolved_feature_keys,
@@ -2437,7 +2518,7 @@ def _prepare_event_candidate_refs(
                     "feature_end_date": feature_end_date,
                     "outcome_end_date": outcome_end_date,
                     "lib_sector": lib_sector,
-                    "event": event,
+                    **_event_payload_fields(event),
                     "anchor_fields": dict(anchor_fields),
                     "macro_key": _macro_cache_key(
                         feature_anchor_ts_utc=anchor_fields.get("feature_anchor_ts_utc"),
@@ -2747,11 +2828,11 @@ def _build_event_memory_pending_records_fast(
         regime_code_raw_macro = _regime_from_macro_raw(macro_payload)
         pending_records.append(
             {
-                "event_path_summary": dict(candidate["event"].path_summary),
-                "event_path_label": str(candidate["event"].path_label),
-                "event_side_payload": dict(candidate["event"].side_payload),
-                "event_diagnostics": dict(candidate["event"].diagnostics),
-                "event_quality_score": float(candidate["event"].quality_score),
+                "event_path_summary": dict(candidate.get("event_path_summary") or {}),
+                "event_path_label": str(candidate.get("event_path_label") or ""),
+                "event_side_payload": dict(candidate.get("event_side_payload") or {}),
+                "event_diagnostics": dict(candidate.get("event_diagnostics") or {}),
+                "event_quality_score": float(candidate.get("event_quality_score") or 0.0),
                 "symbol": symbol,
                 "feature_end_date": feature_end_date,
                 "outcome_end_date": str(candidate["outcome_end_date"]),
@@ -3242,6 +3323,59 @@ def build_event_memory_asof(*, decision_date: str, spec: ResearchExperimentSpec,
     )
 
 
+class IncrementalEventCache:
+    """Placeholder — not used in current memory-constrained path."""
+    pass
+
+
+_NON_JSON_COLS = [
+    "event_ordinal", "symbol", "feature_end_date", "outcome_end_date",
+    "lib_sector", "regime_code", "regime_code_raw_macro",
+    "macro_history_length", "macro_series_present_count", "liquidity_score",
+    "macro_asof_ts_utc", "breadth_policy", "breadth_present",
+    "breadth_missing_reason", "event_path_label", "event_quality_score",
+]
+
+
+# proxy_diagnostics_json averages 157KB per row — 38k rows = 5.8GB parsed.
+# It is only used for diagnostics passthrough, not for prototype building.
+# Excluding it from the parquet read keeps peak memory manageable.
+_EXCLUDE_HEAVY_JSON_COLS = {"proxy_diagnostics_json"}
+
+
+def _read_event_cache_memory_safe(
+    *,
+    events_path: str,
+    decision_date: str,
+) -> list[dict[str, Any]]:
+    """Read event cache rows without loading the full parquet into memory.
+
+    Streams row-groups via pyarrow, skipping the 157KB-per-row
+    ``proxy_diagnostics_json`` column.  Only eligible rows (by date)
+    are parsed and kept, bounding peak memory to ~2-3 GB for 38k rows.
+    """
+    import pyarrow.parquet as _pq
+
+    cutoff = str(decision_date)
+    pf = _pq.ParquetFile(events_path)
+    all_cols = [f.name for f in pf.schema_arrow]
+    read_cols = [c for c in all_cols if c not in _EXCLUDE_HEAVY_JSON_COLS]
+
+    result: list[dict[str, Any]] = []
+    for batch in pf.iter_batches(batch_size=2000, columns=read_cols):
+        d = batch.to_pydict()
+        n = len(d.get("event_ordinal", []))
+        for i in range(n):
+            if str(d["outcome_end_date"][i] or "") >= cutoff:
+                continue
+            row = {col: d[col][i] for col in d}
+            result.append(_event_cache_row_from_storage(row))
+        del d
+
+    result.sort(key=lambda r: int(r.get("event_ordinal") or 0))
+    return result
+
+
 def _event_memory_from_raw_cache(
     *,
     decision_date: str,
@@ -3251,9 +3385,8 @@ def _event_memory_from_raw_cache(
     prototype_checkpoint_path: str | None,
     resume_prototype_from_checkpoint: bool,
     comparison_block_size: int,
+    incremental_cache: IncrementalEventCache | None = None,
 ) -> dict[str, Any]:
-    import duckdb
-
     def _emit_progress(payload: dict[str, Any]) -> None:
         if progress_callback is not None:
             progress_callback(dict(payload))
@@ -3273,15 +3406,10 @@ def _event_memory_from_raw_cache(
             "event_cache_build_ms": int(event_cache_handle.build_ms),
         }
     )
-    con = duckdb.connect()
-    try:
-        event_frame = con.execute(
-            "SELECT * FROM read_parquet(?) WHERE outcome_end_date < ? ORDER BY event_ordinal",
-            [event_cache_handle.events_path, str(decision_date)],
-        ).fetch_df()
-    finally:
-        con.close()
-    eligible_event_rows = [_event_cache_row_from_storage(row) for row in event_frame.to_dict(orient="records")]
+    eligible_event_rows = _read_event_cache_memory_safe(
+        events_path=event_cache_handle.events_path,
+        decision_date=decision_date,
+    )
     eligible_event_count = len(eligible_event_rows)
     raw_feature_matrix = event_cache_handle.load_raw_features(mmap_mode="r")
     feature_keys = list(event_cache_handle.feature_keys)
@@ -3529,7 +3657,7 @@ def _build_query_panel(*, decision_dates: list[str], spec: ResearchExperimentSpe
     return out, excluded_reasons
 
 
-def fit_train_artifacts(*, run_id: str, artifact_store: JsonResearchArtifactStore, train_end: str, test_start: str, purge: int, embargo: int, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, calibration_artifact: dict | None = None, quote_policy_calibration: dict | None = None, metadata: dict | None = None, session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None, macro_series_history: List[Dict[str, Any]] | None = None, progress_callback=None, use_proxy_aggregate_cache: bool = False, use_event_memory_fast_path: bool = False, event_input_path: str | None = None, event_checkpoint_path: str | None = None, resume_event_memory_from_checkpoint: bool = False, prototype_input_path: str | None = None, prototype_checkpoint_path: str | None = None, resume_prototype_from_checkpoint: bool = False, comparison_block_size: int = 2048, event_cache_handle: EventRawCacheHandle | None = None) -> dict:
+def fit_train_artifacts(*, run_id: str, artifact_store: JsonResearchArtifactStore, train_end: str, test_start: str, purge: int, embargo: int, spec: ResearchExperimentSpec, bars_by_symbol: Dict[str, List[HistoricalBar]], macro_history_by_date: Dict[str, Dict[str, float]], sector_map: Dict[str, str], market: str, calibration_artifact: dict | None = None, quote_policy_calibration: dict | None = None, metadata: dict | None = None, session_metadata_by_symbol: Dict[str, SymbolSessionMetadata] | None = None, macro_series_history: List[Dict[str, Any]] | None = None, progress_callback=None, use_proxy_aggregate_cache: bool = False, use_event_memory_fast_path: bool = False, event_input_path: str | None = None, event_checkpoint_path: str | None = None, resume_event_memory_from_checkpoint: bool = False, prototype_input_path: str | None = None, prototype_checkpoint_path: str | None = None, resume_prototype_from_checkpoint: bool = False, comparison_block_size: int = 2048, event_cache_handle: EventRawCacheHandle | None = None, incremental_cache: IncrementalEventCache | None = None) -> dict:
     resumed_preprototype = (
         _load_prototype_input_payload(path=prototype_input_path, decision_date=train_end, spec=spec)
         if prototype_input_path and prototype_checkpoint_path and resume_prototype_from_checkpoint
@@ -3609,6 +3737,7 @@ def fit_train_artifacts(*, run_id: str, artifact_store: JsonResearchArtifactStor
             prototype_checkpoint_path=prototype_checkpoint_path,
             resume_prototype_from_checkpoint=resume_prototype_from_checkpoint,
             comparison_block_size=comparison_block_size,
+            incremental_cache=incremental_cache,
         )
     elif resumed_preprototype is None:
         memory = build_event_memory_asof(

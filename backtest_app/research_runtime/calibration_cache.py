@@ -715,7 +715,8 @@ def _invalidate_materialized_contracts_if_needed(
                 UPDATE bt_result.calibration_snapshot_run
                    SET status = 'failed',
                        finished_at = COALESCE(finished_at, NOW()),
-                       last_error = :last_error
+                       last_error = :last_error,
+                       artifact_path = NULL
                  WHERE bundle_run_id = :bundle_run_id
                 """
             ),
@@ -3029,6 +3030,7 @@ def materialize_train_snapshots(
             use_proxy_aggregate_cache=True,
             progress_callback=_event_cache_progress,
         )
+    incremental_cache = None  # reserved for future memory-safe optimization
     created = 0
     reused = 0
     fast_path_recent_snapshots: list[dict[str, Any]] = []
@@ -3276,6 +3278,7 @@ def materialize_train_snapshots(
                 resume_prototype_from_checkpoint=resume_prototype_from_checkpoint,
                 comparison_block_size=2048,
                 event_cache_handle=event_cache_handle,
+                incremental_cache=incremental_cache,
             )
             snapshot_payload = _json_safe_snapshot_payload(train_artifact)
             phase_timings_ms = dict(train_artifact.get("phase_timings_ms") or {})
@@ -3384,7 +3387,7 @@ def materialize_train_snapshots(
                     created_event_candidate_rows=_to_int(snapshot_payload.get("event_record_count")),
                     recent_snapshot_rows=fast_path_recent_snapshots[-2:],
                 )
-                if remaining_eta_seconds > 8 * 60 * 60:
+                if remaining_eta_seconds > 24 * 60 * 60:
                     last_error = "eta_gate_exceeded_after_event_memory_fast_path"
                     mark_bundle_run_failed(
                         session_factory=write_session_factory,
