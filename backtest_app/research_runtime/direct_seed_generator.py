@@ -305,7 +305,9 @@ def _compute_distribution(
         r = np.array(returns, dtype=np.float64)
         exp_ret = float(np.dot(w, r))
         q10 = _weighted_quantile(r, w, 0.10)
+        q25 = _weighted_quantile(r, w, 0.25)
         q50 = _weighted_quantile(r, w, 0.50)
+        q75 = _weighted_quantile(r, w, 0.75)
         q90 = _weighted_quantile(r, w, 0.90)
         interval_width = max(q90 - q10, 0.0)
         n_eff = float(1.0 / np.sum(w ** 2))
@@ -315,7 +317,9 @@ def _compute_distribution(
 
         result[side] = {
             "q10_return": q10,
+            "q25_return": q25,
             "q50_return": q50,
+            "q75_return": q75,
             "q90_return": q90,
             "expected_net_return": exp_ret,
             "lower_bound": lower_bound,
@@ -449,12 +453,12 @@ def _assemble_seed_row(
         uncertainty = _to_float(metrics.get("uncertainty"))
         ess = _to_float(metrics.get("member_mixture_ess"))
 
-        # Eligibility: narrow distribution + positive lower bound + sufficient ESS
+        # Eligibility: relaxed for distribution-based pricing (EXP-001)
         optuna_eligible = (
-            interval_width < 0.08
-            and _to_float(metrics.get("lower_bound")) > 0.0
+            interval_width < 0.12
+            and _to_float(metrics.get("lower_bound")) > -0.03
             and ess >= 1.5
-            and uncertainty < 0.08
+            and uncertainty < 0.10
         )
 
         rows.append({
@@ -470,7 +474,9 @@ def _assemble_seed_row(
             "forecast_selected": False,
             "single_prototype_collapse": ess <= 1.05,
             "q10_return": q10,
+            "q25_return": _to_float(metrics.get("q25_return")),
             "q50_return": q50,
+            "q75_return": _to_float(metrics.get("q75_return")),
             "q90_return": q90,
             "lower_bound": _to_float(metrics.get("lower_bound")),
             "interval_width": interval_width,

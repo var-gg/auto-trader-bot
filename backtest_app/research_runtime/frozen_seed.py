@@ -27,7 +27,9 @@ STUDY_CACHE_COLUMNS = [
     "lower_bound",
     "q10_return",
     "q50_return",
+    "q25_return",
     "q90_return",
+    "q75_return",
     "interval_width",
     "uncertainty",
     "member_mixture_ess",
@@ -789,27 +791,40 @@ def summarize_seed_rows(
 def default_frozen_seed_search_space() -> dict[str, dict[str, Any]]:
     return {
         "execution_mode": {"type": "categorical", "choices": ["single_leg", "ladder_v1"]},
+        # --- scoring weights (unchanged) ---
         "w_lb": {"type": "float", "low": 0.0, "high": 3.0, "step": 0.25},
         "w_q50": {"type": "float", "low": 0.0, "high": 3.0, "step": 0.25},
         "w_width": {"type": "float", "low": 0.0, "high": 3.0, "step": 0.25},
         "w_uncertainty": {"type": "float", "low": 0.0, "high": 3.0, "step": 0.25},
         "w_ess": {"type": "float", "low": 0.0, "high": 2.0, "step": 0.25},
         "min_buy_score": {"type": "float", "low": -0.01, "high": 0.05, "step": 0.005},
-        "min_lower_bound": {"type": "float", "low": -0.01, "high": 0.03, "step": 0.005},
+        "min_lower_bound": {"type": "float", "low": -0.03, "high": 0.03, "step": 0.005},
         "min_member_ess": {"type": "float", "low": 1.0, "high": 8.0, "step": 0.5},
+        # --- portfolio sizing (unchanged) ---
         "max_new_buys": {"type": "int", "low": 1, "high": 6, "step": 1},
         "buy_budget_fraction": {"type": "float", "low": 0.20, "high": 1.00, "step": 0.05},
         "per_name_cap_fraction": {"type": "float", "low": 0.05, "high": 0.35, "step": 0.05},
-        "buy_entry_offset_pct": {"type": "float", "low": 0.001, "high": 0.03, "step": 0.001},
-        "sell_markup_pct": {"type": "float", "low": 0.002, "high": 0.05, "step": 0.001},
+        # --- distribution-based buy pricing ---
+        "buy_dist_blend": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.1},
+        "use_skew_adjust": {"type": "categorical", "choices": [True, False]},
+        "skew_dampener": {"type": "float", "low": 0.0, "high": 0.5, "step": 0.05},
+        "use_ess_tightening": {"type": "categorical", "choices": [True, False]},
+        "ess_cap": {"type": "float", "low": 5.0, "high": 50.0, "step": 5.0},
+        "tighten_ratio": {"type": "float", "low": 0.0, "high": 0.5, "step": 0.05},
+        # --- distribution-based sell pricing ---
+        "sell_dist_blend": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.1},
         "fallback_min_sell_markup": {"type": "float", "low": 0.001, "high": 0.01, "step": 0.001},
+        "use_sell_skew_adjust": {"type": "categorical", "choices": [True, False]},
+        "sell_skew_floor": {"type": "float", "low": 0.3, "high": 0.8, "step": 0.1},
+        "sell_skew_ceil": {"type": "float", "low": 1.2, "high": 2.0, "step": 0.1},
+        "use_uncertainty_discount": {"type": "categorical", "choices": [True, False]},
+        "sell_unc_weight": {"type": "float", "low": 0.0, "high": 2.0, "step": 0.1},
+        # --- ladder params ---
         "buy_leg_count": {"type": "int", "low": 1, "high": 3, "step": 1},
-        "buy_first_leg_offset_pct": {"type": "float", "low": 0.001, "high": 0.02, "step": 0.001},
-        "buy_last_leg_offset_pct": {"type": "float", "low": 0.002, "high": 0.04, "step": 0.001},
+        "buy_leg_spread_ratio": {"type": "float", "low": 1.0, "high": 3.0, "step": 0.25},
         "buy_leg_weight_alpha": {"type": "float", "low": 0.5, "high": 2.0, "step": 0.1},
         "sell_leg_count": {"type": "int", "low": 1, "high": 3, "step": 1},
-        "sell_first_leg_markup_pct": {"type": "float", "low": 0.002, "high": 0.03, "step": 0.001},
-        "sell_last_leg_markup_pct": {"type": "float", "low": 0.004, "high": 0.06, "step": 0.001},
+        "sell_leg_spread_ratio": {"type": "float", "low": 1.0, "high": 3.0, "step": 0.25},
         "sell_leg_weight_alpha": {"type": "float", "low": 0.5, "high": 2.0, "step": 0.1},
     }
 
@@ -822,21 +837,29 @@ def default_frozen_seed_warm_start_trials() -> list[dict[str, Any]]:
         "w_uncertainty": 0.25,
         "w_ess": 0.5,
         "min_buy_score": -0.005,
-        "min_lower_bound": -0.005,
+        "min_lower_bound": -0.01,
         "min_member_ess": 1.0,
         "max_new_buys": 3,
         "buy_budget_fraction": 0.95,
         "per_name_cap_fraction": 0.20,
-        "buy_entry_offset_pct": 0.001,
-        "sell_markup_pct": 0.002,
-        "fallback_min_sell_markup": 0.002,
+        "buy_dist_blend": 0.5,
+        "sell_dist_blend": 0.5,
+        "fallback_min_sell_markup": 0.003,
+        "use_skew_adjust": False,
+        "skew_dampener": 0.2,
+        "use_ess_tightening": False,
+        "ess_cap": 20.0,
+        "tighten_ratio": 0.3,
+        "use_sell_skew_adjust": False,
+        "sell_skew_floor": 0.5,
+        "sell_skew_ceil": 1.5,
+        "use_uncertainty_discount": False,
+        "sell_unc_weight": 0.5,
         "buy_leg_count": 1,
-        "buy_first_leg_offset_pct": 0.001,
-        "buy_last_leg_offset_pct": 0.001,
+        "buy_leg_spread_ratio": 1.5,
         "buy_leg_weight_alpha": 1.0,
         "sell_leg_count": 1,
-        "sell_first_leg_markup_pct": 0.002,
-        "sell_last_leg_markup_pct": 0.002,
+        "sell_leg_spread_ratio": 1.5,
         "sell_leg_weight_alpha": 1.0,
     }
     return [
@@ -846,46 +869,41 @@ def default_frozen_seed_warm_start_trials() -> list[dict[str, Any]]:
         },
         {
             **shared,
-            "execution_mode": "ladder_v1",
-            "buy_leg_count": 2,
-            "buy_last_leg_offset_pct": 0.006,
-            "sell_leg_count": 2,
-            "sell_last_leg_markup_pct": 0.006,
+            "execution_mode": "single_leg",
+            "use_skew_adjust": True,
+            "use_ess_tightening": True,
         },
         {
             **shared,
             "execution_mode": "single_leg",
+            "buy_dist_blend": 0.3,
+            "sell_dist_blend": 0.7,
+            "use_sell_skew_adjust": True,
+            "use_uncertainty_discount": True,
             "max_new_buys": 2,
             "buy_budget_fraction": 0.75,
         },
         {
             **shared,
-            "execution_mode": "ladder_v1",
-            "max_new_buys": 2,
-            "buy_budget_fraction": 0.75,
-            "buy_leg_count": 2,
-            "buy_last_leg_offset_pct": 0.005,
-            "sell_leg_count": 2,
-            "sell_last_leg_markup_pct": 0.005,
+            "execution_mode": "single_leg",
+            "buy_dist_blend": 0.8,
+            "sell_dist_blend": 0.3,
         },
         {
             **shared,
             "execution_mode": "single_leg",
-            "w_lb": 1.25,
-            "w_q50": 1.25,
-            "w_width": 0.50,
-            "buy_budget_fraction": 0.85,
+            "use_skew_adjust": True,
+            "use_ess_tightening": True,
+            "use_sell_skew_adjust": True,
+            "use_uncertainty_discount": True,
         },
         {
             **shared,
             "execution_mode": "ladder_v1",
-            "w_lb": 1.25,
-            "w_q50": 1.25,
-            "w_width": 0.50,
-            "buy_leg_count": 3,
-            "buy_last_leg_offset_pct": 0.008,
-            "sell_leg_count": 3,
-            "sell_last_leg_markup_pct": 0.008,
+            "buy_leg_count": 2,
+            "sell_leg_count": 2,
+            "use_skew_adjust": True,
+            "use_ess_tightening": True,
         },
     ]
 
@@ -961,6 +979,62 @@ def _interp_steps(first: float, last: float, count: int) -> list[float]:
     return [first + (last - first) * (idx / max(1, count - 1)) for idx in range(count)]
 
 
+def _distribution_buy_offset(row: Mapping[str, Any], params: Mapping[str, Any]) -> float:
+    """Compute buy entry offset from distribution stats (returns positive value to subtract from open)."""
+    q10 = _to_float(row.get("q10_return"))
+    lb = _to_float(row.get("lower_bound"))
+    q50 = _to_float(row.get("q50_return"))
+    interval_width = _to_float(row.get("interval_width"))
+    uncertainty = _to_float(row.get("uncertainty"))
+    ess = _to_float(row.get("member_mixture_ess"))
+
+    alpha = _to_float(params.get("buy_dist_blend"), 0.5)
+    raw = alpha * q10 + (1.0 - alpha) * lb
+
+    if params.get("use_skew_adjust") in (True, "true", "True"):
+        lower_spread = q50 - q10
+        dampener = _to_float(params.get("skew_dampener"), 0.2)
+        width = max(interval_width, 1e-6)
+        raw *= (1.0 + dampener * (lower_spread / width - 0.5))
+
+    if params.get("use_ess_tightening") in (True, "true", "True"):
+        ess_cap = _to_float(params.get("ess_cap"), 20.0)
+        tighten = _to_float(params.get("tighten_ratio"), 0.3)
+        confidence = min(math.log1p(max(ess, 0)) / max(math.log1p(ess_cap), 1e-6), 1.0)
+        raw *= (1.0 - confidence * tighten)
+
+    return _clip(-raw, 0.001, 0.15)
+
+
+def _distribution_sell_markup(row: Mapping[str, Any], params: Mapping[str, Any]) -> float:
+    """Compute sell markup from distribution stats."""
+    q50 = _to_float(row.get("q50_return"))
+    q90 = _to_float(row.get("q90_return"))
+    q10 = _to_float(row.get("q10_return"))
+    uncertainty = _to_float(row.get("uncertainty"))
+    fallback = _to_float(params.get("fallback_min_sell_markup"), 0.003)
+
+    beta = _to_float(params.get("sell_dist_blend"), 0.5)
+    raw = beta * max(q90, 0.0) + (1.0 - beta) * max(q50, 0.0)
+
+    if raw <= 0:
+        return fallback
+
+    if params.get("use_sell_skew_adjust") in (True, "true", "True"):
+        lower_spread = q50 - q10
+        upper_spread = q90 - q50
+        skew_ratio = upper_spread / max(lower_spread, 1e-6)
+        floor = _to_float(params.get("sell_skew_floor"), 0.5)
+        ceil = _to_float(params.get("sell_skew_ceil"), 1.5)
+        raw *= _clip(skew_ratio, floor, ceil)
+
+    if params.get("use_uncertainty_discount") in (True, "true", "True"):
+        unc_w = _to_float(params.get("sell_unc_weight"), 0.5)
+        raw -= unc_w * uncertainty
+
+    return max(raw, fallback)
+
+
 def _build_limit_legs(
     *,
     side: str,
@@ -976,28 +1050,30 @@ def _build_limit_legs(
     if mode == "ladder_v1":
         if side == "BUY":
             leg_count = _to_int(params.get("buy_leg_count"), 2)
-            first_offset = _to_float(params.get("buy_first_leg_offset_pct"), _to_float(params.get("buy_entry_offset_pct"), 0.01))
-            last_offset = max(_to_float(params.get("buy_last_leg_offset_pct"), first_offset), first_offset)
+            first_offset = _to_float(params.get("_dist_buy_offset"), 0.01)
+            spread_ratio = _to_float(params.get("buy_leg_spread_ratio"), 1.5)
+            last_offset = max(first_offset * spread_ratio, first_offset)
             alpha = _to_float(params.get("buy_leg_weight_alpha"), 1.25)
             offsets = _interp_steps(first_offset, last_offset, leg_count)
             quantities = _leg_quantities(total_quantity, leg_count, alpha)
             prices = [round_to_tick(reference_price * (1.0 - offset), market, side="BUY") for offset in offsets[: len(quantities)]]
         else:
             leg_count = _to_int(params.get("sell_leg_count"), 2)
-            first_offset = _to_float(params.get("sell_first_leg_markup_pct"), _to_float(params.get("sell_markup_pct"), 0.02))
-            last_offset = max(_to_float(params.get("sell_last_leg_markup_pct"), first_offset), first_offset)
+            first_markup = _to_float(params.get("_dist_sell_markup"), 0.02)
+            spread_ratio = _to_float(params.get("sell_leg_spread_ratio"), 1.5)
+            last_markup = max(first_markup * spread_ratio, first_markup)
             alpha = _to_float(params.get("sell_leg_weight_alpha"), 1.25)
-            offsets = _interp_steps(first_offset, last_offset, leg_count)
+            offsets = _interp_steps(first_markup, last_markup, leg_count)
             quantities = _leg_quantities(total_quantity, leg_count, alpha)
             prices = [round_to_tick(reference_price * (1.0 + offset), market, side="SELL") for offset in offsets[: len(quantities)]]
     else:
         quantities = [total_quantity]
         if side == "BUY":
-            offset = _to_float(params.get("buy_entry_offset_pct"), 0.01)
+            offset = _to_float(params.get("_dist_buy_offset"), 0.01)
             prices = [round_to_tick(reference_price * (1.0 - offset), market, side="BUY")]
         else:
-            offset = _to_float(params.get("sell_markup_pct"), 0.02)
-            prices = [round_to_tick(reference_price * (1.0 + offset), market, side="SELL")]
+            markup = _to_float(params.get("_dist_sell_markup"), 0.02)
+            prices = [round_to_tick(reference_price * (1.0 + markup), market, side="SELL")]
     return [
         LadderLeg(
             leg_id=f"{symbol.lower()}-{side.lower()}-{idx + 1}",
@@ -1048,14 +1124,15 @@ def _buy_plan_from_row(row: Mapping[str, Any], *, name_budget: float, params: Ma
     reference_price = _to_float(row.get("t1_open"))
     if reference_price <= 0 or name_budget <= 0:
         return None
-    max_price = reference_price * (1.0 - _to_float(params.get("buy_entry_offset_pct"), 0.01))
-    if str(params.get("execution_mode") or "single_leg") == "ladder_v1":
-        max_price = reference_price * (1.0 - _to_float(params.get("buy_first_leg_offset_pct"), _to_float(params.get("buy_entry_offset_pct"), 0.01)))
+    dist_offset = _distribution_buy_offset(row, params)
+    max_price = reference_price * (1.0 - dist_offset)
     max_price = max(0.01, max_price)
     total_qty = max(0, int(name_budget // max_price))
     if total_qty <= 0:
         return None
-    legs = _build_limit_legs(side="BUY", symbol=str(row.get("symbol") or ""), market=market, reference_price=reference_price, total_quantity=total_qty, params=params)
+    effective_params = dict(params)
+    effective_params["_dist_buy_offset"] = dist_offset
+    legs = _build_limit_legs(side="BUY", symbol=str(row.get("symbol") or ""), market=market, reference_price=reference_price, total_quantity=total_qty, params=effective_params)
     if not legs:
         return None
     return OrderPlan(
@@ -1075,17 +1152,7 @@ def _buy_plan_from_row(row: Mapping[str, Any], *, name_budget: float, params: Ma
 
 
 def _sell_markup(row: Mapping[str, Any], params: Mapping[str, Any]) -> float:
-    q50 = max(_to_float(row.get("q50_return")), 0.0)
-    q90 = max(_to_float(row.get("q90_return")), 0.0)
-    fallback = _to_float(params.get("fallback_min_sell_markup"), 0.003)
-    if q50 <= 0.0:
-        return fallback
-    markup = _to_float(params.get("sell_markup_pct"), 0.02)
-    if str(params.get("execution_mode") or "single_leg") == "ladder_v1":
-        markup = _to_float(params.get("sell_first_leg_markup_pct"), markup)
-    if q90 > 0.0:
-        return _clip(markup, fallback, q90)
-    return max(markup, fallback)
+    return _distribution_sell_markup(row, params)
 
 
 def _sell_plan_from_row(row: Mapping[str, Any], *, quantity: int, params: Mapping[str, Any]) -> OrderPlan | None:
@@ -1094,13 +1161,7 @@ def _sell_plan_from_row(row: Mapping[str, Any], *, quantity: int, params: Mappin
         return None
     mode = str(params.get("execution_mode") or "single_leg")
     effective_params = dict(params)
-    if mode == "single_leg":
-        effective_params["sell_markup_pct"] = _sell_markup(row, params)
-    else:
-        first = _to_float(params.get("sell_first_leg_markup_pct"), _sell_markup(row, params))
-        last = max(_to_float(params.get("sell_last_leg_markup_pct"), first), first)
-        effective_params["sell_first_leg_markup_pct"] = first
-        effective_params["sell_last_leg_markup_pct"] = max(last, first)
+    effective_params["_dist_sell_markup"] = _sell_markup(row, params)
     legs = _build_limit_legs(side="SELL", symbol=str(row.get("symbol") or ""), market=str(row.get("market") or "US"), reference_price=reference_price, total_quantity=quantity, params=effective_params)
     if not legs:
         return None

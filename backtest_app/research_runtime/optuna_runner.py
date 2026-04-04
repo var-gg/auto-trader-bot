@@ -485,10 +485,117 @@ class OptunaResearchRunner:
             "mode_comparison": mode_comparison,
         }
 
+    def _run_anchor_v1(self, *, request: RunnerRequest, cfg: OptunaSearchConfig) -> dict[str, Any]:
+        from backtest_app.research_runtime.anchor_backtest import AnchorBacktestEngine
+
+        print("[optuna-anchor] Loading anchor table...")
+        engine = AnchorBacktestEngine.from_db(market=cfg.policy_scope or None)
+        print("[optuna-anchor] Precomputing similarities...")
+        engine.precompute_similarities(n_folds=3, top_cache=200)
+
+        anchor_space = {
+            "top_k": {"type": "int", "low": 10, "high": 200, "step": 10},
+            "min_similarity": {"type": "float", "low": 0.3, "high": 0.9, "step": 0.05},
+            "temperature": {"type": "float", "low": 4.0, "high": 20.0, "step": 1.0},
+            "max_holding_days": {"type": "int", "low": 2, "high": 10, "step": 1},
+            "max_new_buys": {"type": "int", "low": 1, "high": 6, "step": 1},
+            "per_name_cap_fraction": {"type": "float", "low": 0.05, "high": 0.35, "step": 0.05},
+            "buy_dist_blend": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.1},
+            "sell_dist_blend": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.1},
+            "fallback_min_sell_markup": {"type": "float", "low": 0.001, "high": 0.01, "step": 0.001},
+            "use_skew_adjust": {"type": "categorical", "choices": [True, False]},
+            "skew_dampener": {"type": "float", "low": 0.0, "high": 0.5, "step": 0.05},
+            "use_ess_tightening": {"type": "categorical", "choices": [True, False]},
+            "ess_cap": {"type": "float", "low": 5.0, "high": 50.0, "step": 5.0},
+            "tighten_ratio": {"type": "float", "low": 0.0, "high": 0.5, "step": 0.05},
+            "use_sell_skew_adjust": {"type": "categorical", "choices": [True, False]},
+            "sell_skew_floor": {"type": "float", "low": 0.3, "high": 0.8, "step": 0.1},
+            "sell_skew_ceil": {"type": "float", "low": 1.2, "high": 2.0, "step": 0.1},
+            "use_uncertainty_discount": {"type": "categorical", "choices": [True, False]},
+            "sell_unc_weight": {"type": "float", "low": 0.0, "high": 2.0, "step": 0.1},
+        }
+
+        study = self._build_study(cfg)
+        trials: list[dict[str, Any]] = []
+        feasible_trials: list[dict[str, Any]] = []
+
+        # Warm starts
+        warm_defaults = {
+            "top_k": 50, "min_similarity": 0.5, "temperature": 12.0,
+            "max_holding_days": 5, "max_new_buys": 3, "per_name_cap_fraction": 0.20,
+            "buy_dist_blend": 0.5, "sell_dist_blend": 0.5,
+            "fallback_min_sell_markup": 0.003,
+            "use_skew_adjust": False, "skew_dampener": 0.2,
+            "use_ess_tightening": False, "ess_cap": 20.0, "tighten_ratio": 0.3,
+            "use_sell_skew_adjust": False, "sell_skew_floor": 0.5, "sell_skew_ceil": 1.5,
+            "use_uncertainty_discount": False, "sell_unc_weight": 0.5,
+        }
+        warm_starts = [
+            {**warm_defaults},
+            {**warm_defaults, "use_skew_adjust": True, "use_ess_tightening": True},
+            {**warm_defaults, "buy_dist_blend": 0.3, "sell_dist_blend": 0.7, "use_sell_skew_adjust": True, "use_uncertainty_discount": True},
+            {**warm_defaults, "buy_dist_blend": 0.8, "sell_dist_blend": 0.3, "top_k": 100},
+            {**warm_defaults, "use_skew_adjust": True, "use_ess_tightening": True, "use_sell_skew_adjust": True, "use_uncertainty_discount": True},
+        ]
+        if _optuna is not None:
+            for ws in warm_starts:
+                study.enqueue_trial(ws)
+
+        def objective(trial):
+            params = self._suggest(trial, anchor_space)
+            evaluation = engine.evaluate_params(params, initial_capital=request.config.initial_capital)
+            payload = {
+                "trial_number": getattr(trial, "number", 0),
+                "params": params,
+                "objective": evaluation["objective"],
+                "feasible": evaluation["feasible"],
+                "aggregate": evaluation["aggregate"],
+                "folds": evaluation.get("folds", []),
+                "mode": "anchor_v1",
+            }
+            payload["trial_path"] = self.store.save_blob(
+                name=f"{cfg.experiment_id}_trial_{payload['trial_number']}", payload=payload,
+            )
+            if trial is not None:
+                try:
+                    trial.set_user_attr("feasible", payload["feasible"])
+                except Exception:
+                    pass
+            trials.append(payload)
+            if payload["feasible"]:
+                feasible_trials.append(payload)
+            return float(payload["objective"])
+
+        if _optuna is not None:
+            study.optimize(objective, n_trials=cfg.n_trials)
+            study_meta = {"engine": "optuna", "n_trials": len(study.trials), "mode": "anchor_v1"}
+        else:
+            rng = random.Random(cfg.seed)
+            study_meta = {"engine": "fallback", "n_trials": cfg.n_trials, "mode": "anchor_v1"}
+            for trial_no in range(cfg.n_trials):
+                trial = _FallbackTrial(trial_no, rng)
+                objective(trial)
+
+        best = max(feasible_trials, key=lambda t: float(t["objective"]), default=None)
+        output_paths = self._write_study_outputs(
+            experiment_id=cfg.experiment_id, trials=trials, best_trial=best,
+            summary_payload={"experiment_id": cfg.experiment_id, "mode": "anchor_v1", "study": study_meta, "best_trial": best, "trial_count": len(trials), "feasible_count": len(feasible_trials)},
+        )
+
+        return {
+            "status": "ok" if best else "no_feasible_trial",
+            "best_trial": best,
+            "trials": trials,
+            "study_outputs": output_paths,
+            "mode_comparison": {},
+        }
+
     def run(self, *, request: RunnerRequest, runner_fn: Callable[..., dict], validation_fn: Callable[..., dict], data_path: str | None = None, data_source: str = "local-db", strategy_mode: str = "research_similarity_v2") -> dict:
         cfg = request.config.optuna or OptunaSearchConfig(experiment_id=request.scenario.scenario_id)
         if cfg.mode == "frozen_seed_v1":
             return self._run_frozen_seed_v1(request=request, cfg=cfg)
+        if cfg.mode == "anchor_v1":
+            return self._run_anchor_v1(request=request, cfg=cfg)
         discovery_request = RunnerRequest(scenario=replace(request.scenario, start_date=cfg.discovery_start_date or request.scenario.start_date, end_date=cfg.discovery_end_date or request.scenario.end_date), config=request.config, output_path=None)
         holdout_request_base = RunnerRequest(scenario=replace(request.scenario, start_date=cfg.holdout_start_date or request.scenario.start_date, end_date=cfg.holdout_end_date or request.scenario.end_date), config=request.config, output_path=None)
         trials: list[dict] = []
