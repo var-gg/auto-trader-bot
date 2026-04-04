@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pyarrow.parquet as pq
 import pytest
 
 from backtest_app.configs.models import BacktestConfig, BacktestScenario, OptunaObjectiveConfig, OptunaSearchConfig, ResearchExperimentSpec, RunnerRequest
@@ -752,12 +753,27 @@ def test_event_raw_cache_prefix_stats_match_legacy_snapshot_memory(tmp_path):
         resume_prototype_from_checkpoint=False,
         comparison_block_size=2048,
     )
-    assert [record.__dict__ for record in cached["event_records"]] == [record.__dict__ for record in legacy["event_records"]]
+    # proxy_diagnostics_json is excluded from the memory-safe parquet read
+    # (157KB/row average → 5.8GB for 38k rows), so cached path returns {}
+    # while legacy path has full proxy diagnostics.  Strip for comparison.
+    def _strip_proxy(records):
+        out = []
+        for r in records:
+            d = dict(r.__dict__)
+            if "path_summary" in d and isinstance(d["path_summary"], dict):
+                d["path_summary"] = {k: v for k, v in d["path_summary"].items() if k != "proxy_diagnostics"}
+            if "diagnostics" in d and isinstance(d["diagnostics"], dict):
+                d["diagnostics"] = {k: v for k, v in d["diagnostics"].items() if k not in ("proxy_diagnostics", "sector_proxy_fallback_to_self")}
+            out.append(d)
+        return out
+    assert _strip_proxy(cached["event_records"]) == _strip_proxy(legacy["event_records"])
     assert [prototype.__dict__ for prototype in cached["prototypes"]] == [prototype.__dict__ for prototype in legacy["prototypes"]]
     assert cached["coverage"] == legacy["coverage"]
     assert cached["compression_audit"] == legacy["compression_audit"]
     assert cached["transform"].to_payload() == legacy["transform"].to_payload()
     assert cached["scaler"].to_payload() == legacy["scaler"].to_payload()
+    cache_columns = set(pq.read_table(event_cache_handle.events_path).column_names)
+    assert "raw_features_json" not in cache_columns
 
 
 def test_build_event_memory_asof_event_checkpoint_resume_matches_full_run(tmp_path):
@@ -2128,7 +2144,7 @@ def test_materialize_train_snapshots_stops_when_eta_gate_exceeded(tmp_path, monk
             "session_metadata_by_symbol": {},
             "macro_series_history": [],
             "snapshot_ids": {"prototype_snapshot_id": "snap-001"},
-            "phase_timings_ms": {"event_memory": 10_000, "transform": 1_000, "prototype_prepare": 500, "prototype": 20_000_000},
+            "phase_timings_ms": {"event_memory": 10_000, "transform": 1_000, "prototype_prepare": 500, "prototype": 60_000_000},
             "event_cache_build_ms": 123,
             "eligible_event_count": 20000,
             "scaler_reconstruct_ms": 9,
